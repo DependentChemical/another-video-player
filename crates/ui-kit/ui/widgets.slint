@@ -113,6 +113,7 @@ export component FlatButton inherits Rectangle {
 export component PlayPauseButton inherits Rectangle {
     in property <bool> playing: false;
     callback clicked();
+    callback pointer-activity();
 
     width: 44px;
     height: 32px;
@@ -143,6 +144,9 @@ export component PlayPauseButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
         clicked => {
             root.clicked();
         }
@@ -153,6 +157,7 @@ export component PlayPauseButton inherits Rectangle {
 export component FullscreenButton inherits Rectangle {
     in property <bool> fullscreen: false;
     callback clicked();
+    callback pointer-activity();
 
     width: 40px;
     height: 32px;
@@ -171,6 +176,9 @@ export component FullscreenButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
         clicked => {
             root.clicked();
         }
@@ -185,9 +193,11 @@ export component FullscreenButton inherits Rectangle {
 // status light.
 export component LiveButton inherits Rectangle {
     in property <bool> at-edge: true;
+    in property <string> label: "LIVE";
     callback clicked();
+    callback pointer-activity();
 
-    width: 62px;
+    width: 82px;
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
@@ -203,7 +213,7 @@ export component LiveButton inherits Rectangle {
     Text {
         x: 22px;
         width: parent.width - 28px;
-        text: "LIVE";
+        text: root.label;
         color: root.at-edge ? Theme.danger : Theme.muted;
         font-size: 12px;
         font-weight: root.at-edge ? 700 : 400;
@@ -211,6 +221,9 @@ export component LiveButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
         clicked => {
             root.clicked();
         }
@@ -222,6 +235,7 @@ export component GearButton inherits Rectangle {
     in property <bool> active: false;
     in property <bool> enabled: true;
     callback clicked();
+    callback pointer-activity();
 
     width: 36px;
     height: 32px;
@@ -239,6 +253,9 @@ export component GearButton inherits Rectangle {
 
     touch := TouchArea {
         enabled: root.enabled;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
         clicked => {
             root.clicked();
         }
@@ -256,6 +273,7 @@ export component SeekBar inherits Rectangle {
     in property <float> maximum: 1;
     in property <bool> interactive: true;
     callback moved(float);
+    callback pointer-activity();
 
     height: 18px;
 
@@ -301,6 +319,7 @@ export component SeekBar inherits Rectangle {
         height: parent.height;
         enabled: root.interactive;
         pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
             if (event.kind == PointerEventKind.down) {
                 root.moved(root.value-at(area.mouse-x));
             }

@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, Icon } from "widgets.slint";
 
 /// One row of the source picker.
 export struct StreamItem {
@@ -152,6 +152,7 @@ export component MainWindow inherits Window {
     callback volume-requested(float);
     callback fullscreen-toggled();
     callback live-requested();
+    callback pointer-activity();
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -164,8 +165,8 @@ export component MainWindow inherits Window {
     // window the video may use.
     out property <length> top-bar-height: Theme.bar-height;
 
-    // The room the control bar needs next to the play button.
-    private property <length> live-room: root.live ? 70px : 0px;
+    in property <bool> controls-visible: true;
+    in property <bool> spinner-phase: false;
 
     private property <bool> can-apply: root.draft-video != ""
         || root.draft-audio != ""
@@ -226,7 +227,7 @@ export component MainWindow inherits Window {
         url-field := Rectangle {
             x: 96px;
             y: (parent.height - 32px) / 2;
-            width: parent.width - 96px - 140px - 12px;
+            width: parent.width - 96px - 68px;
             height: 32px;
             border-radius: 6px;
             border-width: 1px;
@@ -244,8 +245,9 @@ export component MainWindow inherits Window {
 
             url-input := TextInput {
                 x: 10px;
+                y: 4px;
                 width: parent.width - 20px;
-                height: parent.height;
+                height: parent.height - 8px;
                 text <=> root.url;
                 color: Theme.fg;
                 font-size: 13px;
@@ -255,24 +257,12 @@ export component MainWindow inherits Window {
             }
         }
 
-        GearButton {
-            x: parent.width - 140px;
-            y: (parent.height - 32px) / 2;
-            width: 36px;
-            height: 32px;
-            active: root.sources-open;
-            enabled: root.has-media;
-            clicked => {
-                root.toggle-sources();
-            }
-        }
-
         load-button := FlatButton {
-            x: parent.width - 76px - 16px;
+            x: parent.width - 56px;
             y: (parent.height - 32px) / 2;
-            width: 76px;
+            width: 40px;
             height: 32px;
-            label: "Load";
+            label: "↵";
             primary: true;
             clicked => {
                 root.load-requested();
@@ -288,6 +278,16 @@ export component MainWindow inherits Window {
         height: parent.height - Theme.bar-height;
         background: transparent;
 
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.move {
+                    root.pointer-activity();
+                }
+            }
+        }
+
         // A centred message, used for errors and for hints.
         Rectangle {
             x: 0px;
@@ -295,8 +295,20 @@ export component MainWindow inherits Window {
             width: parent.width;
             height: 48px;
 
+            if root.status-kind == "busy": Icon {
+                x: (parent.width - 28px) / 2;
+                y: parent.height / 2 - 26px;
+                width: 28px;
+                height: 28px;
+                glyph: root.spinner-phase ? "\\u{e5d5}" : "\\u{e5d4}";
+                size: 28px;
+                ink: Theme.accent;
+            }
+
             Text {
                 width: parent.width;
+                y: root.status-kind == "busy" ? parent.height / 2 + 8px : 0px;
+                height: root.status-kind == "busy" ? 24px : parent.height;
                 text: root.status;
                 color: root.status-kind == "error" ? Theme.danger : Theme.muted;
                 font-size: 14px;
@@ -308,10 +320,13 @@ export component MainWindow inherits Window {
         // The control bar, floating over the video.
         Rectangle {
             x: 0px;
-            y: parent.height - Theme.controls-height;
+            y: root.controls-visible ? parent.height - Theme.controls-height : parent.height;
             width: parent.width;
             height: Theme.controls-height;
             background: #000000a6;
+            opacity: root.controls-visible ? 1 : 0;
+            animate y { duration: 180ms; easing: ease-out; }
+            animate opacity { duration: 140ms; }
 
             PlayPauseButton {
                 x: 12px;
@@ -319,6 +334,7 @@ export component MainWindow inherits Window {
                 width: 44px;
                 height: 32px;
                 playing: root.playing;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.play-toggled();
                 }
@@ -328,18 +344,21 @@ export component MainWindow inherits Window {
             LiveButton {
                 x: 60px;
                 y: (parent.height - 32px) / 2;
-                width: 62px;
+                width: 82px;
                 height: 32px;
                 visible: root.live;
                 at-edge: root.at-live-edge;
+                label: root.time-text;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.live-requested();
                 }
             }
 
             Text {
-                x: 68px + root.live-room;
+                x: 68px;
                 width: 110px;
+                visible: !root.live;
                 text: root.time-text;
                 color: Theme.fg;
                 font-size: 12px;
@@ -347,12 +366,13 @@ export component MainWindow inherits Window {
             }
 
             seek := SeekBar {
-                x: 188px + root.live-room;
+                x: root.live ? 152px : 188px;
                 y: (parent.height - 18px) / 2;
-                width: parent.width - (188px + root.live-room) - 220px;
+                width: parent.width - (root.live ? 152px : 188px) - 220px;
                 height: 18px;
                 value: root.position;
                 maximum: root.duration;
+                pointer-activity => { root.pointer-activity(); }
                 moved(value) => {
                     root.seek-requested(value);
                 }
@@ -365,6 +385,7 @@ export component MainWindow inherits Window {
                 height: 32px;
                 active: root.sources-open;
                 enabled: root.has-media;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.toggle-sources();
                 }
@@ -395,6 +416,7 @@ export component MainWindow inherits Window {
                 width: 40px;
                 height: 32px;
                 fullscreen: root.fullscreen;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.fullscreen-toggled();
                 }

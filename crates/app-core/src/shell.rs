@@ -5,9 +5,10 @@
 //! through their own narrow interface, and nothing here knows how any of
 //! them works inside.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use playback_engine::{EndReason, EngineEvent};
 use slint::{ComponentHandle, Timer, TimerMode};
@@ -89,14 +90,29 @@ impl Shell {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
+        let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
+        let spinner_phase = Rc::new(Cell::new(false));
+        {
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            ui.on_pointer_activity(move || last_pointer_activity.set(Instant::now()));
+        }
 
         // A timer keeps the interface in sync with the player.
         let timer = Timer::default();
         {
             let ui = Rc::clone(&ui);
             let app = Arc::clone(&app);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            let spinner_phase = Rc::clone(&spinner_phase);
             timer.start(TimerMode::Repeated, TICK, move || {
                 tick(&ui, &app);
+                spinner_phase.set(!spinner_phase.get());
+                ui.set_spinner_phase(spinner_phase.get());
+                let visible = app.engine().is_idle()
+                    || Instant::now().duration_since(last_pointer_activity.get())
+                        < Duration::from_secs(3)
+                    || ui.sources_open();
+                ui.set_controls_visible(visible);
             });
         }
 

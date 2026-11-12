@@ -237,6 +237,21 @@ impl PlayerUi {
         self.window.set_at_live_edge(at_edge);
     }
 
+    /// Shows the playback controls while the pointer is active.
+    pub fn set_controls_visible(&self, visible: bool) {
+        self.window.set_controls_visible(visible);
+    }
+
+    /// Advances the loading indicator animation.
+    pub fn set_spinner_phase(&self, phase: bool) {
+        self.window.set_spinner_phase(phase);
+    }
+
+    /// Whether the source picker is open.
+    pub fn sources_open(&self) -> bool {
+        self.window.get_sources_open()
+    }
+
     // ------------------------------------------------------------ events --
 
     /// Called when the user asks for the URL to be loaded.
@@ -286,6 +301,11 @@ impl PlayerUi {
     /// Called when the user asks to go back to the live edge.
     pub fn on_live_pressed(&self, handler: impl Fn() + 'static) {
         self.window.on_live_requested(handler);
+    }
+
+    /// Called when the pointer moves over the video area.
+    pub fn on_pointer_activity(&self, handler: impl Fn() + 'static) {
+        self.window.on_pointer_activity(handler);
     }
 }
 
