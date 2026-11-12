@@ -53,6 +53,34 @@ enum PendingSeek {
     LiveEdge,
 }
 
+#[derive(Debug, Default)]
+struct PendingRestore {
+    seek: Option<PendingSeek>,
+    file_started: bool,
+}
+
+impl PendingRestore {
+    fn begin(&mut self, seek: Option<PendingSeek>) {
+        self.seek = seek;
+        self.file_started = false;
+    }
+
+    fn file_started(&mut self) {
+        if self.seek.is_some() {
+            self.file_started = true;
+        }
+    }
+
+    fn file_loaded(&mut self) -> Option<PendingSeek> {
+        if self.file_started {
+            self.file_started = false;
+            self.seek.take()
+        } else {
+            None
+        }
+    }
+}
+
 /// The state of the loaded media.
 #[derive(Debug, Default)]
 struct State {
@@ -61,7 +89,7 @@ struct State {
     selected_audio: Option<String>,
     selected_muxed: Option<String>,
     is_live: bool,
-    pending_seek: Option<PendingSeek>,
+    pending_restore: PendingRestore,
 }
 
 /// The application, without a user interface.
@@ -152,7 +180,7 @@ impl App {
             state.selected_audio = audio;
             state.selected_muxed = muxed;
             state.is_live = loaded.is_live;
-            state.pending_seek = None;
+            state.pending_restore.begin(None);
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -204,32 +232,27 @@ impl App {
             }
         };
 
-        let (is_live, pending) = {
+        let pending = {
             let state = self.state.lock().expect("the state is not poisoned");
             if state.is_live {
-                (true, Some(PendingSeek::LiveEdge))
+                Some(PendingSeek::LiveEdge)
             } else {
                 let position = self.engine.position().max(0.0);
-                (false, (position > 0.0).then_some(PendingSeek::Position(position)))
+                (position > 0.0).then_some(PendingSeek::Position(position))
             }
         };
-
-        {
-            let mut state = self.state.lock().expect("the state is not poisoned");
-            state.pending_seek = pending;
-        }
 
         if let Err(error) = self.start(&plan) {
             self.report(error);
             return;
         }
+        self.state.lock().expect("the state is not poisoned").pending_restore.begin(pending);
         self.live.lock().expect("the live axis is not poisoned").reset();
 
         let mut state = self.state.lock().expect("the state is not poisoned");
         state.selected_video = video;
         state.selected_audio = audio;
         state.selected_muxed = muxed;
-        let _ = is_live;
     }
 
     /// Switches between playing and paused.
@@ -349,9 +372,16 @@ impl App {
         });
     }
 
+    /// Marks the start of a replacement file so an older load event is ignored.
+    pub fn on_file_started(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.pending_restore.file_started();
+    }
+
     /// Restores playback position after a source change once the file is ready.
     pub fn on_file_loaded(&self) {
-        let pending = self.state.lock().expect("the state is not poisoned").pending_seek.take();
+        let pending =
+            self.state.lock().expect("the state is not poisoned").pending_restore.file_loaded();
         match pending {
             Some(PendingSeek::Position(position)) => {
                 if let Err(error) = self.engine.seek(position) {
@@ -660,6 +690,17 @@ mod tests {
     fn bitrates_are_readable() {
         assert_eq!(format_bitrate(128), "128 kb/s");
         assert_eq!(format_bitrate(4500), "4.5 Mb/s");
+    }
+
+    #[test]
+    fn restore_waits_for_the_new_file_start_before_file_loaded() {
+        let mut restore = PendingRestore::default();
+        restore.begin(Some(PendingSeek::Position(42.0)));
+
+        assert!(restore.file_loaded().is_none());
+        restore.file_started();
+        assert!(matches!(restore.file_loaded(), Some(PendingSeek::Position(p)) if p == 42.0));
+        assert!(restore.file_loaded().is_none());
     }
 
     #[test]

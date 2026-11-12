@@ -76,6 +76,7 @@ impl Shell {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             ui.on_sources_applied(move |video, audio, muxed| {
+                drain_engine_events(&app, &mut loading.borrow_mut());
                 loading.borrow_mut().sources_switching();
                 app.select_sources(video, audio, muxed);
             });
@@ -93,8 +94,7 @@ impl Shell {
             let app = Arc::clone(&app);
             let saved_mute_volume = Rc::clone(&saved_mute_volume);
             ui.on_volume(move |volume| {
-                saved_mute_volume.set(None);
-                app.set_volume(volume);
+                app.set_volume(slider_volume_changed(&saved_mute_volume, volume));
             });
         }
         {
@@ -102,13 +102,8 @@ impl Shell {
             let saved_mute_volume = Rc::clone(&saved_mute_volume);
             ui.on_volume_toggled(move || {
                 let current = app.engine().volume();
-                if current <= 0.0 {
-                    if let Some(saved) = saved_mute_volume.take() {
-                        app.set_volume(saved);
-                    }
-                } else {
-                    saved_mute_volume.set(Some(current));
-                    app.set_volume(0.0);
+                if let Some(volume) = toggle_mute(&saved_mute_volume, current) {
+                    app.set_volume(volume);
                 }
             });
         }
@@ -170,6 +165,22 @@ impl Shell {
     }
 }
 
+/// Chooses the next volume and remembers a nonzero level for the mute button.
+fn toggle_mute(saved: &Cell<Option<f64>>, current: f64) -> Option<f64> {
+    if current <= 0.0 {
+        saved.take()
+    } else {
+        saved.set(Some(current));
+        Some(0.0)
+    }
+}
+
+/// Forgets the pre-mute level when the user chooses a slider value.
+fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
+    saved.set(None);
+    volume
+}
+
 /// Brings the interface and the player back in sync.
 fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
@@ -200,25 +211,7 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
         }
     }
 
-    while let Some(event) = app.engine().poll_event() {
-        match event {
-            EngineEvent::StartFile => loading.file_started(),
-            EngineEvent::FileLoaded => {
-                app.on_file_loaded();
-            }
-            EngineEvent::EndFile { reason, error } => {
-                let failure = (reason == EndReason::Error)
-                    .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
-                loading.file_ended(failure);
-            }
-            EngineEvent::Log { level, text } => {
-                if level == "error" {
-                    crate::diag::note(&format!("mpv: {text}"));
-                }
-            }
-            EngineEvent::Shutdown => {}
-        }
-    }
+    drain_engine_events(app, loading);
 
     loading.observe(app.engine().is_active(), app.engine().is_buffering());
     match loading.status() {
@@ -242,6 +235,32 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     ui.set_volume(app.engine().volume());
 }
 
+/// Handles mpv events that are queued before or during a UI refresh.
+fn drain_engine_events(app: &App, loading: &mut Loading) {
+    while let Some(event) = app.engine().poll_event() {
+        match event {
+            EngineEvent::StartFile => {
+                loading.file_started();
+                app.on_file_started();
+            }
+            EngineEvent::FileLoaded => {
+                app.on_file_loaded();
+            }
+            EngineEvent::EndFile { reason, error } => {
+                let failure = (reason == EndReason::Error)
+                    .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
+                loading.file_ended(failure);
+            }
+            EngineEvent::Log { level, text } => {
+                if level == "error" {
+                    crate::diag::note(&format!("mpv: {text}"));
+                }
+            }
+            EngineEvent::Shutdown => {}
+        }
+    }
+}
+
 /// Everything that can go wrong while building the window.
 #[derive(Debug)]
 pub enum Error {
@@ -258,3 +277,27 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::{slider_volume_changed, toggle_mute};
+    use std::cell::Cell;
+
+    #[test]
+    fn mute_restores_the_previous_volume_once() {
+        let saved = Cell::new(None);
+        assert_eq!(toggle_mute(&saved, 63.0), Some(0.0));
+        assert_eq!(saved.get(), Some(63.0));
+        assert_eq!(toggle_mute(&saved, 0.0), Some(63.0));
+        assert_eq!(saved.get(), None);
+        assert_eq!(toggle_mute(&saved, 0.0), None);
+    }
+
+    #[test]
+    fn slider_changes_clear_the_saved_mute_volume() {
+        let saved = Cell::new(Some(63.0));
+        assert_eq!(slider_volume_changed(&saved, 22.0), 22.0);
+        assert_eq!(saved.get(), None);
+        assert_eq!(toggle_mute(&saved, 0.0), None);
+    }
+}

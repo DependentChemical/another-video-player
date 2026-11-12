@@ -271,7 +271,7 @@ impl Engine {
 
     /// Whether the player is idle, i.e. no media is loaded.
     pub fn is_idle(&self) -> bool {
-        self.core.get_property::<bool>("idle").unwrap_or(true)
+        self.core.get_property::<bool>("idle-active").unwrap_or(true)
     }
 
     /// Whether the player is decoding and drawing frames right now.
