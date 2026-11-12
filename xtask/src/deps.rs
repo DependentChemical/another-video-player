@@ -10,15 +10,19 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
 use serde::Deserialize;
 
 /// Where the mpv Windows builds are published.
+#[cfg(windows)]
 const MPV_RELEASES: &str =
     "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
 
+#[cfg(windows)]
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 
 /// A GitHub release.
+#[cfg(windows)]
 #[derive(Debug, Deserialize)]
 struct Release {
     /// The downloadable artifacts.
@@ -26,6 +30,7 @@ struct Release {
 }
 
 /// A downloadable artifact.
+#[cfg(windows)]
 #[derive(Debug, Deserialize)]
 struct Asset {
     /// File name of the artifact.
@@ -200,6 +205,7 @@ fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Downloads a file.
+#[cfg(windows)]
 fn download(url: &str, destination: &Path) -> Result<(), String> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
@@ -214,6 +220,7 @@ fn download(url: &str, destination: &Path) -> Result<(), String> {
 }
 
 /// Fetches and parses a JSON document.
+#[cfg(windows)]
 fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
