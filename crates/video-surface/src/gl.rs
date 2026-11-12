@@ -86,7 +86,7 @@ mod platform {
     use super::{c_char, c_void};
     use std::sync::OnceLock;
 
-    extern "C" {
+    unsafe extern "C" {
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }
 
