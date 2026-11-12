@@ -248,18 +248,9 @@ impl App {
             return;
         }
 
-        if self.timeline().behind <= 1.0 {
-            if let Err(error) = self.engine.play() {
-                self.report(error.to_string());
-            }
-            return;
-        }
-
         match self.engine.seek_to_live_edge() {
             Ok(()) => {
-                // The window starts again at the new edge, so the handle sits
-                // at the right hand end on the next tick.
-                self.live.lock().expect("the live axis is not poisoned").reset();
+                self.live.lock().expect("the live axis is not poisoned").anchor();
                 if let Err(error) = self.engine.play() {
                     self.report(error.to_string());
                 }
@@ -279,6 +270,12 @@ impl App {
         let duration = self.engine.duration();
         if self.is_live() {
             let mut live = self.live.lock().expect("the live axis is not poisoned");
+            if let Some(edge) = self.engine.seekable_end() {
+                live.observe(edge.max(position));
+            }
+            if self.engine.is_paused() {
+                live.advance_while_paused(std::time::Instant::now());
+            }
             live.sync(position);
             live.timeline(position)
         } else {

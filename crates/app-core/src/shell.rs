@@ -23,6 +23,7 @@ const TICK: Duration = Duration::from_millis(100);
 pub struct Shell {
     ui: Rc<PlayerUi>,
     app: Arc<App>,
+    last_pointer_activity: Rc<Cell<Instant>>,
     /// The timer has to outlive the window, otherwise it stops firing.
     _timer: Timer,
 }
@@ -32,6 +33,7 @@ impl Shell {
     pub fn new(app: Arc<App>) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
         let redraw = ui.redraw_handle();
+        let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
 
         // mpv draws the video into the part of the window below the top bar.
         // The weak handle is the only thing the render thread touches, so it
@@ -59,7 +61,9 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let status = Rc::clone(&ui);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
             ui.on_load(move |url| {
+                last_pointer_activity.set(Instant::now());
                 status.set_status("Resolving…", StatusKind::Busy);
                 app.load(url);
             });
@@ -90,7 +94,6 @@ impl Shell {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
-        let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let spinner_phase = Rc::new(Cell::new(false));
         {
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
@@ -108,15 +111,15 @@ impl Shell {
                 tick(&ui, &app);
                 spinner_phase.set(!spinner_phase.get());
                 ui.set_spinner_phase(spinner_phase.get());
-                let visible = app.engine().is_idle()
-                    || Instant::now().duration_since(last_pointer_activity.get())
-                        < Duration::from_secs(3)
+                let visible = ui.has_media()
+                    && Instant::now().duration_since(last_pointer_activity.get())
+                        < Duration::from_secs(4)
                     || ui.sources_open();
                 ui.set_controls_visible(visible);
             });
         }
 
-        Ok(Shell { ui, app, _timer: timer })
+        Ok(Shell { ui, app, last_pointer_activity, _timer: timer })
     }
 
     /// Shows the window and runs until it is closed.
@@ -127,6 +130,7 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
         self.ui.set_status("Resolving…", StatusKind::Busy);
         self.app.load(url.to_string());

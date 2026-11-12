@@ -86,6 +86,7 @@ export component FlatButton inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> enabled: true;
     callback clicked();
+    callback pointer-activity();
 
     border-radius: 6px;
     border-width: 1px;
@@ -102,6 +103,10 @@ export component FlatButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         enabled: root.enabled;
         clicked => {
             root.clicked();
@@ -147,6 +152,7 @@ export component PlayPauseButton inherits Rectangle {
         pointer-event(event) => {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
         }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -179,6 +185,7 @@ export component FullscreenButton inherits Rectangle {
         pointer-event(event) => {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
         }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -224,6 +231,7 @@ export component LiveButton inherits Rectangle {
         pointer-event(event) => {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
         }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -256,6 +264,7 @@ export component GearButton inherits Rectangle {
         pointer-event(event) => {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
         }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -328,6 +337,7 @@ export component SeekBar inherits Rectangle {
             }
         }
         moved => {
+            root.pointer-activity();
             root.moved(root.value-at(area.mouse-x));
         }
     }

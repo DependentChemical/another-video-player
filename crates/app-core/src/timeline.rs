@@ -9,6 +9,8 @@
 //! When the user scrubs back, the window stops following the edge so that the
 //! handle does not drift away under the finger.
 
+use std::time::Instant;
+
 /// How far back a live stream can be scrubbed, in seconds.
 pub const LIVE_WINDOW: f64 = 300.0;
 
@@ -42,6 +44,8 @@ pub struct LiveAxis {
     edge: f64,
     /// The stream time the left hand end of the axis shows.
     start: f64,
+    /// When the edge was last observed from playback or the demuxer cache.
+    edge_observed_at: Option<Instant>,
 }
 
 impl LiveAxis {
@@ -61,6 +65,18 @@ impl LiveAxis {
     pub fn observe(&mut self, position: f64) {
         if position > self.edge {
             self.edge = position;
+            self.edge_observed_at = Some(Instant::now());
+        } else if self.edge_observed_at.is_none() {
+            self.edge_observed_at = Some(Instant::now());
+        }
+    }
+
+    /// Lets the live edge advance in real time while playback is paused.
+    pub fn advance_while_paused(&mut self, now: Instant) {
+        if let Some(observed_at) = self.edge_observed_at {
+            let elapsed = now.saturating_duration_since(observed_at).as_secs_f64();
+            self.edge += elapsed;
+            self.edge_observed_at = Some(now);
         }
     }
 
@@ -187,6 +203,28 @@ mod tests {
         // the window is not anchored again and the handle does not drift.
         axis.sync(940.0);
         assert_eq!(axis.timeline(940.0).position, before);
+    }
+
+    #[test]
+    fn the_live_edge_can_advance_while_playback_is_paused() {
+        let mut axis = LiveAxis::new();
+        axis.sync(1000.0);
+        axis.observe(1040.0);
+
+        let timeline = axis.timeline(1000.0);
+        assert_eq!(timeline.behind, 40.0);
+        assert!(!axis.at_edge(1000.0));
+    }
+
+    #[test]
+    fn the_live_edge_advances_with_wall_time_when_paused() {
+        let mut axis = LiveAxis::new();
+        axis.observe(100.0);
+        let observed_at = axis.edge_observed_at.expect("observing the edge records its time");
+        axis.advance_while_paused(observed_at + std::time::Duration::from_secs(8));
+
+        assert_eq!(axis.edge(), 108.0);
+        assert_eq!(axis.timeline(100.0).behind, 8.0);
     }
 
     #[test]

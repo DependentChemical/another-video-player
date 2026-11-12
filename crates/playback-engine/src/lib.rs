@@ -194,7 +194,8 @@ impl Engine {
 
     /// Switches between playing and paused.
     pub fn toggle_pause(&self) -> Result<(), Error> {
-        self.core.command(&["cycle", "pause"])?;
+        let paused = self.core.get_property::<bool>("pause")?;
+        self.core.set_property("pause", !paused)?;
         Ok(())
     }
 
@@ -219,8 +220,21 @@ impl Engine {
     /// is clamped to the end of the seekable range, which is exactly the live
     /// edge of a stream that is still being produced.
     pub fn seek_to_live_edge(&self) -> Result<(), Error> {
-        self.core.command(&["seek", "1000000000", "relative"])?;
+        if let Some(edge) = self.seekable_end() {
+            self.seek(edge)?;
+        } else {
+            self.core.command(&["seek", "1000000000", "relative"])?;
+        }
         Ok(())
+    }
+
+    /// The latest timestamp mpv can seek to in its current demuxer cache.
+    ///
+    /// Live streams keep downloading while paused, so this is a better
+    /// estimate of the live edge than the paused playback position.
+    pub fn seekable_end(&self) -> Option<f64> {
+        let state = self.core.get_property("demuxer-cache-state").ok()?;
+        seekable_end_from_cache(&state)
     }
 
     /// Sets the volume, in percent.
@@ -311,9 +325,63 @@ impl Engine {
     }
 }
 
+/// The furthest timestamp in mpv's current seekable cache ranges.
+fn seekable_end_from_cache(state: &rsmpv::Node) -> Option<f64> {
+    let rsmpv::Node::Map(state) = state else {
+        return None;
+    };
+    let ranges =
+        state.iter().find_map(|(key, value)| (key == "seekable-ranges").then_some(value))?;
+    let rsmpv::Node::Array(ranges) = ranges else {
+        return None;
+    };
+
+    ranges
+        .iter()
+        .filter_map(|range| {
+            let rsmpv::Node::Map(fields) = range else {
+                return None;
+            };
+            fields.iter().find_map(|(key, value)| {
+                if key != "end" {
+                    return None;
+                }
+                match value {
+                    rsmpv::Node::Double(end) if end.is_finite() => Some(*end),
+                    _ => None,
+                }
+            })
+        })
+        .max_by(f64::total_cmp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_seekable_range_is_the_live_edge() {
+        let cache = rsmpv::Node::Map(vec![(
+            "seekable-ranges".to_string(),
+            rsmpv::Node::Array(vec![
+                rsmpv::Node::Map(vec![
+                    ("start".to_string(), rsmpv::Node::Double(10.0)),
+                    ("end".to_string(), rsmpv::Node::Double(20.0)),
+                ]),
+                rsmpv::Node::Map(vec![
+                    ("start".to_string(), rsmpv::Node::Double(30.0)),
+                    ("end".to_string(), rsmpv::Node::Double(40.0)),
+                ]),
+            ]),
+        )]);
+
+        assert_eq!(seekable_end_from_cache(&cache), Some(40.0));
+    }
+
+    #[test]
+    fn unavailable_seekable_ranges_have_no_live_edge() {
+        assert_eq!(seekable_end_from_cache(&rsmpv::Node::None), None);
+    }
 
     #[test]
     fn a_new_engine_is_idle_and_has_no_duration() {
@@ -323,6 +391,14 @@ mod tests {
         };
         assert!(engine.is_idle());
         assert_eq!(engine.duration(), 0.0);
+    }
+
+    #[test]
+    fn a_new_engine_has_no_seekable_live_edge() {
+        let Ok(engine) = Engine::new() else {
+            return;
+        };
+        assert_eq!(engine.seekable_end(), None);
     }
 
     #[test]

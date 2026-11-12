@@ -200,6 +200,11 @@ impl PlayerUi {
         self.window.set_has_media(has_media);
     }
 
+    /// Whether the window has loaded media.
+    pub fn has_media(&self) -> bool {
+        self.window.get_has_media()
+    }
+
     /// Whether playback is running.
     pub fn set_playing(&self, playing: bool) {
         self.window.set_playing(playing);

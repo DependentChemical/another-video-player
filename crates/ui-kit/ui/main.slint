@@ -207,6 +207,15 @@ export component MainWindow inherits Window {
         }
     }
 
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        moved => { root.pointer-activity(); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+    }
+
     // --------------------------------------------------------- top bar ----
     Rectangle {
         x: 0px;
@@ -262,8 +271,9 @@ export component MainWindow inherits Window {
             y: (parent.height - 32px) / 2;
             width: 40px;
             height: 32px;
-            label: "↵";
+            label: "Go";
             primary: true;
+            pointer-activity => { root.pointer-activity(); }
             clicked => {
                 root.load-requested();
             }
@@ -286,6 +296,7 @@ export component MainWindow inherits Window {
                     root.pointer-activity();
                 }
             }
+            moved => { root.pointer-activity(); }
         }
 
         // A centred message, used for errors and for hints.

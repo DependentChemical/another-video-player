@@ -63,10 +63,10 @@ pub fn mpv_library_dir() -> Option<PathBuf> {
     directory.is_dir().then_some(directory)
 }
 
-/// The version of the project.
+/// The version used for release tags and archive names.
 ///
-/// `version.txt` is the reference: the release workflow reads it to name the
-/// tag and the release, and the build puts it into the archive.
+/// The app embeds this same version at compile time; the version file itself
+/// is not shipped with the app.
 pub fn version() -> Result<String, String> {
     let file = workspace_root().join("version.txt");
     let text = std::fs::read_to_string(&file).map_err(|error| {

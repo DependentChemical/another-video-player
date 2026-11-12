@@ -65,7 +65,7 @@ impl CommandSpec {
 
     /// Builds the command, without any of the resolver's own arguments.
     pub fn command(&self) -> Command {
-        let mut command = match &self.interpreter {
+        let command = match &self.interpreter {
             Some(interpreter) => {
                 let mut command = Command::new(interpreter);
                 command.arg(&self.program);
@@ -74,10 +74,12 @@ impl CommandSpec {
             None => Command::new(&self.program),
         };
         #[cfg(windows)]
-        {
+        let command = {
+            let mut command = command;
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
-        }
+            command
+        };
         command
     }
 }
