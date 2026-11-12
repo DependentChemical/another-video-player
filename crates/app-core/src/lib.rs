@@ -22,7 +22,7 @@ use std::sync::Arc;
 pub use app::{App, Loaded, Message};
 pub use paths::AppPaths;
 pub use shell::Shell;
-pub use timeline::{LIVE_WINDOW, LiveAxis, Timeline};
+pub use timeline::{LIVE_BUFFER, LIVE_WINDOW, LiveAxis, Timeline};
 
 /// The version of Flatline, taken from `version.txt` when it was built.
 pub const VERSION: &str = env!("FLATLINE_VERSION");

@@ -294,25 +294,25 @@ export component SeekBar inherits Rectangle {
         : 0.0;
 
     track := Rectangle {
-        x: 0px;
+        x: 6px;
         y: (parent.height - self.height) / 2;
-        width: parent.width;
+        width: max(0px, parent.width - 12px);
         height: 4px;
         border-radius: 2px;
         background: Theme.border;
     }
 
     fill := Rectangle {
-        x: 0px;
+        x: 6px;
         y: (parent.height - self.height) / 2;
-        width: parent.width * root.ratio;
+        width: max(0px, parent.width - 12px) * root.ratio;
         height: 4px;
         border-radius: 2px;
         background: Theme.accent;
     }
 
     knob := Rectangle {
-        x: parent.width * root.ratio - self.width / 2;
+        x: 6px + max(0px, parent.width - 12px) * root.ratio - self.width / 2;
         y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;
@@ -346,6 +346,6 @@ export component SeekBar inherits Rectangle {
     pure function value-at(x: length) -> float {
         root.width <= 0px || root.maximum <= 0
             ? 0.0
-            : clamp((x / root.width) * root.maximum, 0.0, root.maximum)
+            : clamp(((x - 6px) / max(1px, root.width - 12px)) * root.maximum, 0.0, root.maximum)
     }
 }

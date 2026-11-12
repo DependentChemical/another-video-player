@@ -198,8 +198,9 @@ fn tick(ui: &PlayerUi, app: &App) {
     ui.set_position(timeline.position);
     ui.set_duration(timeline.duration);
     ui.set_time_text(&crate::time::format_timeline(&timeline));
-    ui.set_at_live_edge(timeline.live && timeline.behind <= 1.0);
-    ui.set_playing(!app.engine().is_idle() && !app.engine().is_paused());
+    let playing = !app.engine().is_idle() && !app.engine().is_paused();
+    ui.set_at_live_edge(timeline.live && timeline.behind <= crate::timeline::LIVE_BUFFER);
+    ui.set_playing(playing);
 
     // The volume is read back from the player, so the slider shows what the
     // player really uses and not only what was asked for.

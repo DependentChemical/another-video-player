@@ -14,6 +14,9 @@ use std::time::Instant;
 /// How far back a live stream can be scrubbed, in seconds.
 pub const LIVE_WINDOW: f64 = 300.0;
 
+/// Playback within this distance of the seekable edge is presented as live.
+pub const LIVE_BUFFER: f64 = 5.0;
+
 /// The time axis that is shown to the user.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Timeline {
@@ -97,7 +100,7 @@ impl LiveAxis {
     /// A small tolerance keeps the player from flickering between "live" and
     /// "behind" because of the rounding of the reported position.
     pub fn at_edge(&self, position: f64) -> bool {
-        self.edge - position <= 1.0
+        self.edge - position <= LIVE_BUFFER
     }
 
     /// Moves the window back to the live edge.
@@ -116,11 +119,13 @@ impl LiveAxis {
 
     /// The axis that is shown for the given playback position.
     pub fn timeline(&self, position: f64) -> Timeline {
+        let behind = (self.edge - position).max(0.0);
+        let display_position = if behind <= LIVE_BUFFER { self.edge } else { position };
         Timeline {
             live: true,
-            position: (position - self.start).clamp(0.0, LIVE_WINDOW),
+            position: (display_position - self.start).clamp(0.0, LIVE_WINDOW),
             duration: LIVE_WINDOW,
-            behind: (self.edge - position).max(0.0),
+            behind,
         }
     }
 
@@ -159,7 +164,17 @@ mod tests {
         let mut axis = LiveAxis::new();
         axis.observe(50.0);
         assert!(axis.at_edge(50.0));
-        assert!(!axis.at_edge(45.0));
+        assert!(!axis.at_edge(44.9));
+    }
+
+    #[test]
+    fn the_live_buffer_is_presented_at_the_edge() {
+        let mut axis = LiveAxis::new();
+        axis.observe(100.0);
+        axis.anchor();
+        assert!(axis.at_edge(95.0));
+        assert_eq!(axis.timeline(95.0).position, 100.0);
+        assert!(!axis.at_edge(94.9));
     }
 
     #[test]
