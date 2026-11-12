@@ -41,7 +41,7 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
         None => install_ytdlp(&tools)?,
     };
 
-    let app = Arc::new(App::new(&ytdlp)?);
+    let app = Arc::new(App::new(&ytdlp, &paths)?);
     let shell = Shell::new(Arc::clone(&app))?;
 
     // Look for a newer yt-dlp while the player is already running.

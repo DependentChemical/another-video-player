@@ -61,6 +61,7 @@ struct State {
 pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
+    youtube_cookies: std::path::PathBuf,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
     inbox: Mutex<Receiver<Box<Message>>>,
@@ -71,9 +72,10 @@ pub struct App {
 
 impl App {
     /// Creates the application around a `yt-dlp` installation.
-    pub fn new(ytdlp: &YtDlp) -> Result<App, Error> {
+    pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
         let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
-        let resolver = Resolver::new(command_spec(ytdlp));
+        let youtube_cookies = paths.youtube_cookies();
+        let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -84,6 +86,7 @@ impl App {
         Ok(App {
             engine,
             resolver: Mutex::new(resolver),
+            youtube_cookies,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
@@ -293,7 +296,7 @@ impl App {
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = Resolver::new(command_spec(ytdlp));
+        *resolver = Resolver::new(command_spec(ytdlp, &self.youtube_cookies));
     }
 
     /// Looks for a newer `yt-dlp` in the background.
@@ -472,11 +475,12 @@ fn format_bitrate(kilobits: u64) -> String {
 }
 
 /// Describes how `yt-dlp` has to be invoked.
-fn command_spec(ytdlp: &YtDlp) -> CommandSpec {
-    match ytdlp.interpreter() {
+fn command_spec(ytdlp: &YtDlp, youtube_cookies: &std::path::Path) -> CommandSpec {
+    let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
-    }
+    };
+    spec.with_youtube_cookies(youtube_cookies)
 }
 
 /// Everything that can go wrong while running the application.
