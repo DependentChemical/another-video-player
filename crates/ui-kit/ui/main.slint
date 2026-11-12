@@ -1,5 +1,103 @@
+import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { ChevronIcon, FlatButton, FullscreenButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
+
+/// One row of the source picker.
+export struct StreamItem {
+    id: string,
+    label: string,
+    detail: string,
+}
+
+// One column of the source picker.
+//
+// A row toggles its stream; the selected row is highlighted and the picker
+// turns the three columns into one selection when the user applies it.
+component SourceColumn inherits Rectangle {
+    in property <string> heading: "";
+    in property <[StreamItem]> items: [];
+    in property <string> selected: "";
+    callback picked(string);
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 6px;
+
+        Text {
+            height: 18px;
+            text: root.heading;
+            color: Theme.muted;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.elevated;
+            clip: true;
+
+            ScrollView {
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+
+                    if root.items.length == 0: Text {
+                        height: 36px;
+                        text: "None available";
+                        color: Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+
+                    for item in root.items: Rectangle {
+                        height: 44px;
+                        border-radius: 4px;
+                        background: touch.pressed
+                            ? Theme.border
+                            : (root.selected == item.id ? #4c8bf540 : transparent);
+
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 1px;
+                            alignment: center;
+
+                            Text {
+                                height: 16px;
+                                text: item.label;
+                                color: root.selected == item.id ? Theme.accent : Theme.fg;
+                                font-size: 13px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                height: 14px;
+                                text: item.detail;
+                                color: Theme.muted;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        touch := TouchArea {
+                            clicked => {
+                                root.picked(item.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -22,8 +120,16 @@ export component MainWindow inherits Window {
     in property <string> status: "";
     // "info", "busy" or "error".
     in property <string> status-kind: "info";
-    in property <[string]> quality-labels: [];
-    in property <int> quality-index: -1;
+    // The streams the source offers, split into the three picker columns.
+    in property <[StreamItem]> video-sources: [];
+    in property <[StreamItem]> audio-sources: [];
+    in property <[StreamItem]> muxed-sources: [];
+    // The streams that are currently playing.
+    in-out property <string> selected-video-id: "";
+    in-out property <string> selected-audio-id: "";
+    in-out property <string> selected-muxed-id: "";
+    // Whether the source picker is open. The host closes it on a new load.
+    in-out property <bool> sources-open: false;
     in property <bool> has-media: false;
     in property <bool> playing: false;
     in property <float> position: 0;
@@ -40,7 +146,7 @@ export component MainWindow inherits Window {
 
     // ------------------------------------------------------------ events --
     callback load-requested();
-    callback quality-selected(int);
+    callback sources-applied(string, string, string);
     callback play-toggled();
     callback seek-requested(float);
     callback volume-requested(float);
@@ -48,18 +154,57 @@ export component MainWindow inherits Window {
     callback live-requested();
 
     // --------------------------------------------------------- internals --
-    private property <bool> quality-menu-open: false;
+    // The picker edits a draft, so cancelling leaves the playing selection
+    // untouched.
+    private property <string> draft-video: "";
+    private property <string> draft-audio: "";
+    private property <string> draft-muxed: "";
 
     // The height of the top bar, so that the host knows how much of the
     // window the video may use.
     out property <length> top-bar-height: Theme.bar-height;
 
-    out property <string> quality-text: root.quality-labels.length > 0
-        ? root.quality-labels[root.quality-index < 0 ? 0 : root.quality-index]
-        : "Quality";
-
     // The room the control bar needs next to the play button.
     private property <length> live-room: root.live ? 70px : 0px;
+
+    private property <bool> can-apply: root.draft-video != ""
+        || root.draft-audio != ""
+        || root.draft-muxed != "";
+
+    function open-sources() {
+        root.draft-video = root.selected-video-id;
+        root.draft-audio = root.selected-audio-id;
+        root.draft-muxed = root.selected-muxed-id;
+        root.sources-open = true;
+    }
+
+    function toggle-sources() {
+        if (root.sources-open) {
+            root.sources-open = false;
+        } else {
+            root.open-sources();
+        }
+    }
+
+    function toggle-video(id: string) {
+        root.draft-muxed = "";
+        root.draft-video = root.draft-video == id ? "" : id;
+    }
+
+    function toggle-audio(id: string) {
+        root.draft-muxed = "";
+        root.draft-audio = root.draft-audio == id ? "" : id;
+    }
+
+    function toggle-muxed(id: string) {
+        if (root.draft-muxed == id) {
+            root.draft-muxed = "";
+        } else {
+            root.draft-muxed = id;
+            root.draft-video = "";
+            root.draft-audio = "";
+        }
+    }
 
     // --------------------------------------------------------- top bar ----
     Rectangle {
@@ -81,7 +226,7 @@ export component MainWindow inherits Window {
         url-field := Rectangle {
             x: 96px;
             y: (parent.height - 32px) / 2;
-            width: parent.width - 96px - 132px - 76px - 40px;
+            width: parent.width - 96px - 140px - 12px;
             height: 32px;
             border-radius: 6px;
             border-width: 1px;
@@ -110,34 +255,15 @@ export component MainWindow inherits Window {
             }
         }
 
-        quality-button := Rectangle {
-            x: parent.width - 132px - 76px - 40px;
+        GearButton {
+            x: parent.width - 140px;
             y: (parent.height - 32px) / 2;
-            width: 132px;
+            width: 36px;
             height: 32px;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: quality-touch.pressed ? Theme.elevated : Theme.panel;
-
-            Text {
-                x: 10px;
-                width: parent.width - 30px;
-                text: root.quality-text;
-                color: Theme.fg;
-                font-size: 13px;
-                vertical-alignment: center;
-            }
-
-            ChevronIcon {
-                x: parent.width - 18px;
-                y: (parent.height - self.height) / 2 + 2px;
-            }
-
-            quality-touch := TouchArea {
-                clicked => {
-                    root.quality-menu-open = !root.quality-menu-open;
-                }
+            active: root.sources-open;
+            enabled: root.has-media;
+            clicked => {
+                root.toggle-sources();
             }
         }
 
@@ -223,12 +349,24 @@ export component MainWindow inherits Window {
             seek := SeekBar {
                 x: 188px + root.live-room;
                 y: (parent.height - 18px) / 2;
-                width: parent.width - (188px + root.live-room) - 90px - 40px - 110px;
+                width: parent.width - (188px + root.live-room) - 220px;
                 height: 18px;
                 value: root.position;
                 maximum: root.duration;
                 moved(value) => {
                     root.seek-requested(value);
+                }
+            }
+
+            GearButton {
+                x: parent.width - 212px;
+                y: (parent.height - 32px) / 2;
+                width: 32px;
+                height: 32px;
+                active: root.sources-open;
+                enabled: root.has-media;
+                clicked => {
+                    root.toggle-sources();
                 }
             }
 
@@ -245,7 +383,7 @@ export component MainWindow inherits Window {
                 width: 90px;
                 height: 18px;
                 value: root.volume;
-                maximum: 100;
+                maximum: 200;
                 moved(value) => {
                     root.volume-requested(value);
                 }
@@ -264,42 +402,129 @@ export component MainWindow inherits Window {
         }
     }
 
-    // ----------------------------------------------------- quality menu ----
-    Rectangle {
-        visible: root.quality-menu-open;
-        x: quality-button.x;
-        y: Theme.bar-height;
-        width: 160px;
-        height: root.quality-labels.length * 32px + 8px;
-        background: Theme.panel;
-        border-width: 1px;
-        border-color: Theme.border;
-        border-radius: 6px;
-        drop-shadow-blur: 12px;
-        drop-shadow-color: #000000a0;
+    // --------------------------------------------------- source picker ----
+    if root.sources-open: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #00000066;
 
-        VerticalLayout {
-            padding: 4px;
-            spacing: 0;
+        TouchArea {
+            clicked => {
+                root.sources-open = false;
+            }
+        }
 
-            for label[index] in root.quality-labels: Rectangle {
-                height: 32px;
-                background: item-touch.pressed ? Theme.elevated : transparent;
-                border-radius: 4px;
+        panel := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 40px, 820px);
+            height: min(parent.height - 40px, 440px);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.panel;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #000000c0;
 
-                Text {
-                    x: 10px;
-                    width: parent.width - 20px;
-                    text: label;
-                    color: index == root.quality-index ? Theme.accent : Theme.fg;
-                    font-size: 13px;
-                    vertical-alignment: center;
+            // Keep clicks on the panel from reaching the backdrop.
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: "Sources";
+                        color: Theme.fg;
+                        font-size: 16px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Pick a video and an audio track, or one combined stream.";
+                        color: Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                 }
 
-                item-touch := TouchArea {
-                    clicked => {
-                        root.quality-selected(index);
-                        root.quality-menu-open = false;
+                HorizontalLayout {
+                    spacing: 10px;
+                    vertical-stretch: 1;
+
+                    SourceColumn {
+                        heading: "Video only";
+                        items: root.video-sources;
+                        selected: root.draft-video;
+                        picked(id) => {
+                            root.toggle-video(id);
+                        }
+                    }
+
+                    SourceColumn {
+                        heading: "Audio only";
+                        items: root.audio-sources;
+                        selected: root.draft-audio;
+                        picked(id) => {
+                            root.toggle-audio(id);
+                        }
+                    }
+
+                    SourceColumn {
+                        heading: "Video + audio";
+                        items: root.muxed-sources;
+                        selected: root.draft-muxed;
+                        picked(id) => {
+                            root.toggle-muxed(id);
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Selecting a combined stream clears the other two columns.";
+                        color: Theme.muted;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    FlatButton {
+                        width: 80px;
+                        height: 30px;
+                        label: "Cancel";
+                        clicked => {
+                            root.sources-open = false;
+                        }
+                    }
+
+                    FlatButton {
+                        width: 80px;
+                        height: 30px;
+                        label: "Apply";
+                        primary: true;
+                        enabled: root.can-apply;
+                        clicked => {
+                            root.selected-video-id = root.draft-video;
+                            root.selected-audio-id = root.draft-audio;
+                            root.selected-muxed-id = root.draft-muxed;
+                            root.sources-applied(
+                                root.draft-video,
+                                root.draft-audio,
+                                root.draft-muxed
+                            );
+                            root.sources-open = false;
+                        }
                     }
                 }
             }

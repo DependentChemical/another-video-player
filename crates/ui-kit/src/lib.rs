@@ -36,20 +36,37 @@ impl StatusKind {
     }
 }
 
-/// A quality the user can pick.
+/// One selectable stream in the source picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QualityOption {
+pub struct SourceOption {
     /// Identifier of the stream, handed back to the host when picked.
     pub id: String,
-    /// The label shown to the user.
+    /// The prominent label, e.g. `1080p` or `128 kb/s`.
     pub label: String,
+    /// The supporting line, e.g. `1920×1080 · 60 fps · mp4`.
+    pub detail: String,
 }
 
-impl QualityOption {
+impl SourceOption {
     /// Creates an option.
-    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into() }
+    pub fn new(id: impl Into<String>, label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { id: id.into(), label: label.into(), detail: detail.into() }
     }
+}
+
+/// The three kinds of stream a source can offer.
+///
+/// A source may have video-only streams, audio-only streams and streams that
+/// already carry both. The picker shows them in three columns; the host
+/// decides what to do with the selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceLists {
+    /// Streams that carry only a video track.
+    pub video: Vec<SourceOption>,
+    /// Streams that carry only an audio track.
+    pub audio: Vec<SourceOption>,
+    /// Streams that carry both tracks in one file.
+    pub muxed: Vec<SourceOption>,
 }
 
 /// The player window.
@@ -154,19 +171,28 @@ impl PlayerUi {
         self.window.set_status_kind(kind.as_str().into());
     }
 
-    /// Offers a list of qualities to the user.
-    pub fn set_quality_options(&self, options: &[QualityOption]) {
-        let labels: Vec<slint::SharedString> =
-            options.iter().map(|option| option.label.as_str().into()).collect();
-        self.window.set_quality_labels(slint::ModelRc::new(slint::VecModel::from(labels)));
-        if options.is_empty() {
-            self.window.set_quality_index(-1);
-        }
+    /// Offers the streams of a source to the source picker.
+    ///
+    /// Replacing the lists also closes the picker and forgets the previous
+    /// selection; the host calls [`PlayerUi::set_selected_sources`] right
+    /// after this to show what is playing.
+    pub fn set_sources(&self, sources: &SourceLists) {
+        self.window.set_video_sources(to_model(&sources.video));
+        self.window.set_audio_sources(to_model(&sources.audio));
+        self.window.set_muxed_sources(to_model(&sources.muxed));
+        self.window.set_sources_open(false);
     }
 
-    /// Marks one of the offered qualities as the selected one.
-    pub fn set_selected_quality(&self, index: i32) {
-        self.window.set_quality_index(index);
+    /// Marks the streams that are currently playing.
+    pub fn set_selected_sources(
+        &self,
+        video: Option<&str>,
+        audio: Option<&str>,
+        muxed: Option<&str>,
+    ) {
+        self.window.set_selected_video_id(video.unwrap_or_default().into());
+        self.window.set_selected_audio_id(audio.unwrap_or_default().into());
+        self.window.set_selected_muxed_id(muxed.unwrap_or_default().into());
     }
 
     /// Whether a media is loaded.
@@ -223,9 +249,18 @@ impl PlayerUi {
         });
     }
 
-    /// Called when the user picks a quality.
-    pub fn on_quality_selected(&self, handler: impl Fn(i32) + 'static) {
-        self.window.on_quality_selected(handler);
+    /// Called when the user applies a source selection.
+    ///
+    /// The arguments are the chosen video-only stream, audio-only stream and
+    /// combined stream. An empty value means "nothing selected" in that
+    /// column.
+    pub fn on_sources_applied(
+        &self,
+        handler: impl Fn(Option<String>, Option<String>, Option<String>) + 'static,
+    ) {
+        self.window.on_sources_applied(move |video, audio, muxed| {
+            handler(non_empty(video), non_empty(audio), non_empty(muxed));
+        });
     }
 
     /// Called when the user presses play or pause.
@@ -252,4 +287,23 @@ impl PlayerUi {
     pub fn on_live_pressed(&self, handler: impl Fn() + 'static) {
         self.window.on_live_requested(handler);
     }
+}
+
+/// Converts host options into the model Slint understands.
+fn to_model(options: &[SourceOption]) -> slint::ModelRc<StreamItem> {
+    let items: Vec<StreamItem> = options
+        .iter()
+        .map(|option| StreamItem {
+            id: option.id.as_str().into(),
+            label: option.label.as_str().into(),
+            detail: option.detail.as_str().into(),
+        })
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+/// Turns the empty string of an unselected column into `None`.
+fn non_empty(value: slint::SharedString) -> Option<String> {
+    let value = value.to_string();
+    (!value.is_empty()).then_some(value)
 }

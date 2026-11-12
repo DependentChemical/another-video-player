@@ -14,10 +14,15 @@ a control bar that floats over the picture.
 
 - **Plays any URL `yt-dlp` supports.** The URL is resolved into a catalog of
   streams, the best one is picked, and the player starts.
-- **Lets you choose the quality.** The dropdown lists every height the media
-  offers, plus *Best* for the highest bitrate.
+- **Lets you pick the streams.** A gear button on the control bar opens the
+  source picker: video-only streams in one column, audio-only streams in
+  another and already combined streams in a third. Pick one from each of the
+  first two columns to mix them, deselect one to play the other alone, or
+  pick a combined stream, which clears the other two columns.
 - **Combines separate video and audio tracks.** When a site only offers split
   streams, the video-only and audio-only formats are joined into one playback.
+  Live streams are included: their audio-only rows are recognised even when
+  the extractor omits the codec names.
 - **Plays live streams.** A live stream opens at the live edge. Dragging the
   seek bar backwards moves through the window the site still serves, and the
   **LIVE** button jumps back to the newest frame.
@@ -61,7 +66,7 @@ dist/
 
 The release archive is the same folder as a `.zip`, named after the platform
 and the version in `version.txt` (for example
-`flatline-0.0.1-windows-x64.zip`).
+`flatline-0.1.0-windows-x64.zip`).
 
 For day-to-day work the debug build is faster:
 
@@ -105,13 +110,17 @@ instance — Flatline falls back to its per-user directory
    **Load**.
 2. While the media is loading, the status line in the middle of the video area
    says what is happening. Errors are shown in red.
-3. Open the quality dropdown next to the URL bar to switch to another
-   resolution; the change applies immediately.
+3. Open the source picker with the gear button (next to the URL bar or on the
+   control bar) to mix and match video and audio streams; **Apply** switches
+   to the new selection immediately.
 4. The control bar at the bottom has play/pause, a seek bar with the current
-   position and duration, a volume slider and a fullscreen button. Double
-   clicking the video area toggles fullscreen as well.
-5. On a live stream the control bar shows a **LIVE** button. Seeking backwards
-   fills the bar up to the live edge, and the button returns to it.
+   position and duration, a volume slider from 0 to 200 percent (100 in the
+   middle) and a fullscreen button. Double clicking the video area toggles
+   fullscreen as well.
+5. On a live stream the control bar shows a **LIVE** button. It is red while
+   the playback sits at the live edge and grey while you are behind it.
+   Seeking backwards fills the bar up to the live edge, and the button
+   returns to it without pausing.
 
 ## How it is put together
 

@@ -18,7 +18,7 @@ use std::process::Command;
 use media_model::MediaSource;
 
 pub use parse::parse_catalog;
-pub use plan::{plan, qualities};
+pub use plan::plan;
 
 /// Everything that can go wrong while resolving a URL.
 #[derive(Debug)]
@@ -34,12 +34,12 @@ pub enum Error {
     },
     /// The output of `yt-dlp` could not be understood.
     Json(serde_json::Error),
-    /// The media carries no video track at all.
-    NoVideo,
     /// The document contained no media at all.
     Empty,
-    /// The requested quality does not exist.
-    UnknownQuality(String),
+    /// The chosen stream identifier does not exist.
+    UnknownStream(String),
+    /// The selection names neither a video nor an audio stream.
+    NoStream,
 }
 
 /// How to invoke `yt-dlp`.
@@ -85,9 +85,9 @@ impl std::fmt::Display for Error {
                 None => write!(f, "yt-dlp failed: {stderr}"),
             },
             Error::Json(error) => write!(f, "yt-dlp returned something unexpected: {error}"),
-            Error::NoVideo => write!(f, "the media has no video track"),
             Error::Empty => write!(f, "the URL did not lead to any media"),
-            Error::UnknownQuality(name) => write!(f, "the quality {name} is not available"),
+            Error::UnknownStream(name) => write!(f, "the stream {name} is not available"),
+            Error::NoStream => write!(f, "no stream was selected"),
         }
     }
 }

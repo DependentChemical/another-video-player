@@ -63,6 +63,12 @@ export component LiveDot inherits Icon {
     size: 10px;
 }
 
+// The cog that opens the source picker.
+export component GearIcon inherits Icon {
+    glyph: "\u{e8b8}";
+    ink: Theme.muted;
+}
+
 // The loudspeaker that marks the volume slider.
 export component VolumeIcon inherits Icon {
     glyph: "\u{e050}";
@@ -174,7 +180,9 @@ export component FullscreenButton inherits Rectangle {
 // The button that jumps back to the live edge of a live stream.
 //
 // It is only shown while a live stream is playing, the same way YouTube
-// only shows it for live streams.
+// only shows it for live streams. It is red while the playback sits at the
+// edge and grey while the user is behind it, so the button doubles as a
+// status light.
 export component LiveButton inherits Rectangle {
     in property <bool> at-edge: true;
     callback clicked();
@@ -183,25 +191,54 @@ export component LiveButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.danger;
+    border-color: root.at-edge ? Theme.danger : Theme.border;
     background: touch.pressed ? Theme.elevated : Theme.panel;
 
     LiveDot {
         x: 8px;
         y: (parent.height - self.height) / 2;
+        ink: root.at-edge ? Theme.danger : Theme.muted;
     }
 
     Text {
         x: 22px;
         width: parent.width - 28px;
         text: "LIVE";
-        color: Theme.danger;
+        color: root.at-edge ? Theme.danger : Theme.muted;
         font-size: 12px;
         font-weight: root.at-edge ? 700 : 400;
         vertical-alignment: center;
     }
 
     touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The button that opens the source picker.
+export component GearButton inherits Rectangle {
+    in property <bool> active: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: 36px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.active ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : Theme.panel;
+    opacity: root.enabled ? 1 : 0.45;
+
+    GearIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: root.active ? Theme.accent : Theme.muted;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
         clicked => {
             root.clicked();
         }

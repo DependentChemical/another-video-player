@@ -133,6 +133,9 @@ pub struct AudioStream {
     /// Language tag, when the extractor reports one.
     #[serde(default)]
     pub language: Option<String>,
+    /// Human readable note from the extractor, e.g. `Default, high`.
+    #[serde(default)]
+    pub note: Option<String>,
     /// Transport protocol, e.g. `https` or `m3u8_native`.
     #[serde(default)]
     pub protocol: Option<String>,

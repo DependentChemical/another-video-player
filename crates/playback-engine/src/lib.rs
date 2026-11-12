@@ -17,6 +17,17 @@ use std::fmt;
 
 pub use render::{GlProcAddress, VideoRenderer};
 
+/// The loudest volume the player accepts, in percent.
+///
+/// mpv's default ceiling is 130; Flatline raises it so the slider can go to
+/// 200 percent without the player clipping the value.
+pub const MAX_VOLUME: f64 = 200.0;
+
+/// Keeps a volume inside the range the player accepts.
+fn clamp_volume(volume: f64) -> f64 {
+    volume.clamp(0.0, MAX_VOLUME)
+}
+
 /// Why playback of a file ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
@@ -132,6 +143,7 @@ impl Engine {
             .set_property("input-default-bindings", "no")?
             .set_property("input-vo-keyboard", "no")?
             .set_property("title", "Flatline")?
+            .set_property("volume-max", MAX_VOLUME)?
             .build()?;
 
         Ok(Engine { core: std::sync::Arc::new(mpv) })
@@ -211,9 +223,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Sets the volume, in the range mpv uses (0 - 100).
+    /// Sets the volume, in percent.
+    ///
+    /// The value is clamped to `0..=`[`MAX_VOLUME`], so a stray click on the
+    /// slider can never ask mpv for something it refuses.
     pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
-        self.core.set_property("volume", volume)?;
+        self.core.set_property("volume", clamp_volume(volume))?;
         Ok(())
     }
 
@@ -316,5 +331,12 @@ mod tests {
             LoadRequest::with_audio("https://example.com/v.mp4", "https://example.com/a.m4a");
         assert_eq!(request.media, "https://example.com/v.mp4");
         assert_eq!(request.audio.as_deref(), Some("https://example.com/a.m4a"));
+    }
+
+    #[test]
+    fn volume_is_clamped_to_the_player_range() {
+        assert_eq!(clamp_volume(-10.0), 0.0);
+        assert_eq!(clamp_volume(50.0), 50.0);
+        assert_eq!(clamp_volume(250.0), MAX_VOLUME);
     }
 }

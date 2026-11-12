@@ -65,7 +65,9 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
-            ui.on_quality_selected(move |index| app.select_quality(index));
+            ui.on_sources_applied(move |video, audio, muxed| {
+                app.select_sources(video, audio, muxed);
+            });
         }
         {
             let app = Arc::clone(&app);
@@ -127,8 +129,12 @@ fn tick(ui: &PlayerUi, app: &App) {
             Message::Resolved(Ok(source)) => {
                 let loaded = app.accept(source);
                 ui.set_media_title(&loaded.title);
-                ui.set_quality_options(&loaded.qualities);
-                ui.set_selected_quality(app.selected_quality() as i32);
+                ui.set_sources(&loaded.sources);
+                ui.set_selected_sources(
+                    loaded.video.as_deref(),
+                    loaded.audio.as_deref(),
+                    loaded.muxed.as_deref(),
+                );
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
                 ui.set_status("", StatusKind::Info);

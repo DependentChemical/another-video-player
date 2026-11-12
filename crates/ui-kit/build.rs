@@ -25,6 +25,7 @@ const REQUIRED_GLYPHS: &[(&str, u32)] = &[
     ("fullscreen", 0xe5d0),
     ("fullscreen_exit", 0xe5d1),
     ("live_tv", 0xe639),
+    ("settings", 0xe8b8),
     ("fiber_manual_record", 0xe061),
     ("volume_up", 0xe050),
     ("volume_off", 0xe04f),

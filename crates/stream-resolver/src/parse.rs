@@ -43,6 +43,9 @@ struct RawFormat {
     protocol: Option<String>,
     format_note: Option<String>,
     language: Option<String>,
+    resolution: Option<String>,
+    video_ext: Option<String>,
+    audio_ext: Option<String>,
 }
 
 /// Parses a `yt-dlp` metadata document.
@@ -70,18 +73,37 @@ fn build(raw: RawInfo) -> MediaSource {
             continue;
         };
         let format_id = format.format_id.unwrap_or_default();
+        let ext = format.ext.unwrap_or_default();
+        // Storyboards are images, not playable streams.
+        if ext.eq_ignore_ascii_case("mhtml") {
+            continue;
+        }
         let file_size = format.filesize.or(format.filesize_approx);
-        let has_video = format.vcodec.as_deref().is_some_and(|codec| codec != "none");
-        let has_audio = format.acodec.as_deref().is_some_and(|codec| codec != "none");
-        // A plain file the extractor did not look into reports neither codec.
-        // It carries both, so it is treated as a combined stream.
-        let unknown = format.vcodec.is_none() && format.acodec.is_none();
+        // `yt-dlp` sometimes omits a codec but still says which track the
+        // format carries through `video_ext` / `audio_ext`. Live HLS audio
+        // rows are the common case: `vcodec: none`, no `acodec`, but
+        // `audio_ext: mp4` and `resolution: audio only`.
+        let has_video = match format.vcodec.as_deref() {
+            Some(codec) => codec != "none",
+            None => format.video_ext.as_deref().is_some_and(|ext| ext != "none"),
+        };
+        let has_audio = match format.acodec.as_deref() {
+            Some(codec) => codec != "none",
+            None => format.audio_ext.as_deref().is_some_and(|ext| ext != "none"),
+        };
+        // A plain file the extractor did not look into reports neither codec
+        // nor track extension. It carries both, so it is a combined stream.
+        let unknown = format.vcodec.is_none()
+            && format.acodec.is_none()
+            && format.video_ext.is_none()
+            && format.audio_ext.is_none()
+            && format.resolution.as_deref() != Some("audio only");
 
         if has_video || unknown {
             video_streams.push(VideoStream {
                 format_id,
                 url,
-                ext: format.ext.unwrap_or_default(),
+                ext,
                 width: format.width,
                 height: format.height,
                 fps: format.fps,
@@ -96,7 +118,7 @@ fn build(raw: RawInfo) -> MediaSource {
             audio_streams.push(AudioStream {
                 format_id,
                 url,
-                ext: format.ext.unwrap_or_default(),
+                ext,
                 audio_codec: format.acodec,
                 bitrate: format
                     .abr
@@ -104,6 +126,7 @@ fn build(raw: RawInfo) -> MediaSource {
                     .or(format.tbr.map(|v| v.round() as u64)),
                 file_size,
                 language: format.language,
+                note: format.format_note,
                 protocol: format.protocol,
             });
         }
@@ -195,6 +218,61 @@ mod tests {
         let source = parse_catalog(json).expect("catalog parses");
         assert_eq!(source.video_streams.len(), 1);
         assert!(source.video_streams[0].has_audio);
+        assert!(source.audio_streams.is_empty());
+    }
+
+    #[test]
+    fn a_live_audio_stream_without_a_codec_is_audio_only() {
+        let json = r#"{
+            "id": "live",
+            "title": "Live",
+            "is_live": true,
+            "formats": [
+                {
+                    "format_id": "312",
+                    "url": "https://example.com/video.m3u8",
+                    "ext": "mp4",
+                    "height": 1080,
+                    "width": 1920,
+                    "vcodec": "avc1",
+                    "acodec": "none",
+                    "video_ext": "mp4",
+                    "audio_ext": "none",
+                    "resolution": "1920x1080",
+                    "protocol": "m3u8_native"
+                },
+                {
+                    "format_id": "234",
+                    "url": "https://example.com/audio.m3u8",
+                    "ext": "mp4",
+                    "vcodec": "none",
+                    "audio_ext": "mp4",
+                    "video_ext": "none",
+                    "resolution": "audio only",
+                    "format_note": "Default, high",
+                    "protocol": "m3u8_native"
+                }
+            ]
+        }"#;
+        let source = parse_catalog(json).expect("catalog parses");
+        assert_eq!(source.video_streams.len(), 1);
+        assert_eq!(source.video_streams[0].format_id, "312");
+        assert_eq!(source.audio_streams.len(), 1);
+        assert_eq!(source.audio_streams[0].format_id, "234");
+        assert_eq!(source.audio_streams[0].note.as_deref(), Some("Default, high"));
+    }
+
+    #[test]
+    fn storyboard_images_are_not_streams() {
+        let json = r#"{
+            "id": "sample",
+            "title": "sample",
+            "formats": [
+                {"format_id": "sb0", "url": "https://example.com/sb.mhtml", "ext": "mhtml"}
+            ]
+        }"#;
+        let source = parse_catalog(json).expect("catalog parses");
+        assert!(source.video_streams.is_empty());
         assert!(source.audio_streams.is_empty());
     }
 }
