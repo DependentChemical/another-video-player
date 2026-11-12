@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use playback_engine::{EndReason, EngineEvent};
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
 use ui_kit::{PlayerUi, StatusKind};
 
@@ -19,6 +20,10 @@ use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
+/// Attenuation range represented by the lower half of the slider.
+const VOLUME_ATTENUATION_DB: f64 = 60.0;
+/// Boost range represented by the upper half of the slider.
+const VOLUME_BOOST_DB: f64 = 20.0 * std::f64::consts::LOG10_2;
 
 /// The window of the player, together with everything it is wired to.
 pub struct Shell {
@@ -36,6 +41,7 @@ impl Shell {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
+        let controls_hovered = Rc::new(Cell::new(false));
 
         // mpv draws the video into the part of the window below the top bar.
         // The weak handle is the only thing the render thread touches, so it
@@ -60,6 +66,28 @@ impl Shell {
         .map_err(|error| Error::Ui(error.to_string()))?;
 
         let loading = Rc::new(RefCell::new(Loading::new()));
+
+        // Window exit is distinct from pointer movement within the client area.
+        {
+            let window = ui.window().window();
+            let ui_for_events = Rc::clone(&ui);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            window.on_winit_window_event(move |_, event| {
+                match event {
+                    winit::event::WindowEvent::CursorLeft { .. } => {
+                        last_pointer_activity.set(Instant::now() - Duration::from_secs(5));
+                        if ui_for_events.has_media() && !ui_for_events.sources_open() {
+                            ui_for_events.set_controls_visible(false);
+                        }
+                    }
+                    winit::event::WindowEvent::CursorEntered { .. } => {
+                        last_pointer_activity.set(Instant::now());
+                    }
+                    _ => {}
+                }
+                EventResult::Propagate
+            });
+        }
 
         // The interface only ever calls into the application.
         {
@@ -94,7 +122,10 @@ impl Shell {
             let app = Arc::clone(&app);
             let saved_mute_volume = Rc::clone(&saved_mute_volume);
             ui.on_volume(move |volume| {
-                app.set_volume(slider_volume_changed(&saved_mute_volume, volume));
+                app.set_volume(slider_volume_changed(
+                    &saved_mute_volume,
+                    slider_to_player_volume(volume),
+                ));
             });
         }
         {
@@ -120,6 +151,10 @@ impl Shell {
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             ui.on_pointer_activity(move || last_pointer_activity.set(Instant::now()));
         }
+        {
+            let controls_hovered = Rc::clone(&controls_hovered);
+            ui.on_controls_hovered(move |hovered| controls_hovered.set(hovered));
+        }
 
         // A timer keeps the interface in sync with the player.
         let timer = Timer::default();
@@ -128,16 +163,18 @@ impl Shell {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            let controls_hovered = Rc::clone(&controls_hovered);
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
                 tick(&ui, &app, &mut loading);
                 spinner_step.set((spinner_step.get() + 1) % 3);
                 ui.set_spinner_step(spinner_step.get());
-                let visible = ui.has_media()
-                    && Instant::now().duration_since(last_pointer_activity.get())
-                        < Duration::from_secs(4)
-                    || ui.sources_open();
+                let visible = ui.sources_open()
+                    || (ui.has_media()
+                        && (controls_hovered.get()
+                            || Instant::now().duration_since(last_pointer_activity.get())
+                                < Duration::from_secs(4)));
                 ui.set_controls_visible(visible);
             });
         }
@@ -179,6 +216,32 @@ fn toggle_mute(saved: &Cell<Option<f64>>, current: f64) -> Option<f64> {
 fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
     saved.set(None);
     volume
+}
+
+/// Converts the UI's audio-tapered slider value to mpv's linear gain percent.
+fn slider_to_player_volume(slider: f64) -> f64 {
+    let slider = slider.clamp(0.0, 200.0);
+    if slider == 0.0 {
+        0.0
+    } else if slider <= 100.0 {
+        let position = slider / 100.0;
+        100.0 * 10.0_f64.powf(-VOLUME_ATTENUATION_DB * (1.0 - position) / 20.0)
+    } else {
+        let position = (slider - 100.0) / 100.0;
+        100.0 * 10.0_f64.powf(VOLUME_BOOST_DB * position / 20.0)
+    }
+}
+
+/// Converts mpv's linear gain percent back to the audio-tapered UI position.
+fn player_to_slider_volume(volume: f64) -> f64 {
+    let volume = volume.clamp(0.0, 200.0);
+    if volume == 0.0 {
+        0.0
+    } else if volume <= 100.0 {
+        100.0 * (1.0 + 20.0 * (volume / 100.0).log10() / VOLUME_ATTENUATION_DB)
+    } else {
+        100.0 + 100.0 * 20.0 * (volume / 100.0).log10() / VOLUME_BOOST_DB
+    }
 }
 
 /// Brings the interface and the player back in sync.
@@ -232,7 +295,7 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
 
     // The volume is read back from the player, so the slider shows what the
     // player really uses and not only what was asked for.
-    ui.set_volume(app.engine().volume());
+    ui.set_volume(player_to_slider_volume(app.engine().volume()));
 }
 
 /// Handles mpv events that are queued before or during a UI refresh.
@@ -280,7 +343,9 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{slider_volume_changed, toggle_mute};
+    use super::{
+        player_to_slider_volume, slider_to_player_volume, slider_volume_changed, toggle_mute,
+    };
     use std::cell::Cell;
 
     #[test]
@@ -299,5 +364,22 @@ mod tests {
         assert_eq!(slider_volume_changed(&saved, 22.0), 22.0);
         assert_eq!(saved.get(), None);
         assert_eq!(toggle_mute(&saved, 0.0), None);
+    }
+
+    #[test]
+    fn audio_taper_keeps_mute_unity_and_double_gain_anchors() {
+        assert_eq!(slider_to_player_volume(0.0), 0.0);
+        assert!((slider_to_player_volume(100.0) - 100.0).abs() < 1e-10);
+        assert!((slider_to_player_volume(200.0) - 200.0).abs() < 1e-10);
+        assert!((player_to_slider_volume(100.0) - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn audio_taper_round_trips_volume_values() {
+        for slider in [1.0, 25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 175.0, 200.0] {
+            let player = slider_to_player_volume(slider);
+            assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
+        }
+        assert!(slider_to_player_volume(50.0) < 10.0);
     }
 }

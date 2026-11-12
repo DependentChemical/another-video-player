@@ -154,6 +154,7 @@ export component MainWindow inherits Window {
     callback fullscreen-toggled();
     callback live-requested();
     callback pointer-activity();
+    callback controls-hovered(bool);
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -369,6 +370,14 @@ export component MainWindow inherits Window {
             opacity: root.controls-visible ? 1 : 0;
             animate y { duration: 180ms; easing: ease-out; }
             animate opacity { duration: 140ms; }
+
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+                changed has-hover => {
+                    root.controls-hovered(self.has-hover);
+                }
+            }
 
             PlayPauseButton {
                 x: 12px;

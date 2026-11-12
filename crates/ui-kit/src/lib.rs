@@ -319,6 +319,11 @@ impl PlayerUi {
     pub fn on_pointer_activity(&self, handler: impl Fn() + 'static) {
         self.window.on_pointer_activity(handler);
     }
+
+    /// Called when the pointer enters or leaves the control bar.
+    pub fn on_controls_hovered(&self, handler: impl Fn(bool) + 'static) {
+        self.window.on_controls_hovered(handler);
+    }
 }
 
 /// Converts host options into the model Slint understands.
