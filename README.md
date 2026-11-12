@@ -1,14 +1,18 @@
 # Flatline
 
-Flatline is a small desktop video player for everything `yt-dlp` can reach —
-YouTube, Twitch, Pornhub, Eporner, podcasts, direct `.mp4` links and everything
-else the extractors understand. There is no hardcoded list of supported sites:
-the player asks `yt-dlp` what is behind a URL and plays the answer.
+<div align="center">
+  <img src="resources/flatline-256.png" alt="Flatline mascot" width="112" />
+  <h3>A small desktop video player for everything <code>yt-dlp</code> can reach.</h3>
+  <p>YouTube · Twitch · podcasts · direct video links · and more</p>
+</div>
 
-![Flatline playing a video](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" alt="Flatline playing a video" width="800" />
+</p>
 
-The interface is deliberately plain: a URL bar on top, the video below it, and
-a control bar that floats over the picture.
+Flatline has a URL bar on top, the video below it, and a control bar that
+floats over the picture. It asks `yt-dlp` what is behind a URL and plays the
+streams it finds, without a hardcoded list of supported sites.
 
 ## What it does
 
@@ -111,8 +115,9 @@ instance — Flatline falls back to its per-user directory
 
 1. Paste a URL into the bar at the top and press <kbd>Enter</kbd>, or press
    **Load**.
-2. While the media is loading, the status line in the middle of the video area
-   says what is happening. Errors are shown in red.
+2. While a URL is being resolved or the player has to wait for data, three
+   dots run above a status line in the middle of the video area. The dots
+   stop once playback runs, and errors are shown in red.
 3. Open the source picker with the gear button (next to the URL bar or on the
    control bar) to mix and match video and audio streams; **Apply** switches
    to the new selection immediately.

@@ -47,6 +47,40 @@ pub struct Loaded {
     pub is_live: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingSeek {
+    Position(f64),
+    LiveEdge,
+}
+
+#[derive(Debug, Default)]
+struct PendingRestore {
+    seek: Option<PendingSeek>,
+    file_started: bool,
+}
+
+impl PendingRestore {
+    fn begin(&mut self, seek: Option<PendingSeek>) {
+        self.seek = seek;
+        self.file_started = false;
+    }
+
+    fn file_started(&mut self) {
+        if self.seek.is_some() {
+            self.file_started = true;
+        }
+    }
+
+    fn file_loaded(&mut self) -> Option<PendingSeek> {
+        if self.file_started {
+            self.file_started = false;
+            self.seek.take()
+        } else {
+            None
+        }
+    }
+}
+
 /// The state of the loaded media.
 #[derive(Debug, Default)]
 struct State {
@@ -55,12 +89,14 @@ struct State {
     selected_audio: Option<String>,
     selected_muxed: Option<String>,
     is_live: bool,
+    pending_restore: PendingRestore,
 }
 
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
+    youtube_cookies: std::path::PathBuf,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
     inbox: Mutex<Receiver<Box<Message>>>,
@@ -71,9 +107,10 @@ pub struct App {
 
 impl App {
     /// Creates the application around a `yt-dlp` installation.
-    pub fn new(ytdlp: &YtDlp) -> Result<App, Error> {
+    pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
         let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
-        let resolver = Resolver::new(command_spec(ytdlp));
+        let youtube_cookies = paths.youtube_cookies();
+        let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -84,6 +121,7 @@ impl App {
         Ok(App {
             engine,
             resolver: Mutex::new(resolver),
+            youtube_cookies,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
@@ -142,6 +180,7 @@ impl App {
             state.selected_audio = audio;
             state.selected_muxed = muxed;
             state.is_live = loaded.is_live;
+            state.pending_restore.begin(None);
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -193,10 +232,21 @@ impl App {
             }
         };
 
+        let pending = {
+            let state = self.state.lock().expect("the state is not poisoned");
+            if state.is_live {
+                Some(PendingSeek::LiveEdge)
+            } else {
+                let position = self.engine.position().max(0.0);
+                (position > 0.0).then_some(PendingSeek::Position(position))
+            }
+        };
+
         if let Err(error) = self.start(&plan) {
             self.report(error);
             return;
         }
+        self.state.lock().expect("the state is not poisoned").pending_restore.begin(pending);
         self.live.lock().expect("the live axis is not poisoned").reset();
 
         let mut state = self.state.lock().expect("the state is not poisoned");
@@ -248,18 +298,9 @@ impl App {
             return;
         }
 
-        if self.timeline().behind <= 1.0 {
-            if let Err(error) = self.engine.play() {
-                self.report(error.to_string());
-            }
-            return;
-        }
-
         match self.engine.seek_to_live_edge() {
             Ok(()) => {
-                // The window starts again at the new edge, so the handle sits
-                // at the right hand end on the next tick.
-                self.live.lock().expect("the live axis is not poisoned").reset();
+                self.live.lock().expect("the live axis is not poisoned").anchor();
                 if let Err(error) = self.engine.play() {
                     self.report(error.to_string());
                 }
@@ -279,6 +320,12 @@ impl App {
         let duration = self.engine.duration();
         if self.is_live() {
             let mut live = self.live.lock().expect("the live axis is not poisoned");
+            if let Some(edge) = self.engine.seekable_end() {
+                live.observe(edge.max(position));
+            }
+            if self.engine.is_paused() {
+                live.advance_while_paused(std::time::Instant::now());
+            }
             live.sync(position);
             live.timeline(position)
         } else {
@@ -296,7 +343,7 @@ impl App {
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = Resolver::new(command_spec(ytdlp));
+        *resolver = Resolver::new(command_spec(ytdlp, &self.youtube_cookies));
     }
 
     /// Looks for a newer `yt-dlp` in the background.
@@ -323,6 +370,33 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Marks the start of a replacement file so an older load event is ignored.
+    pub fn on_file_started(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.pending_restore.file_started();
+    }
+
+    /// Restores playback position after a source change once the file is ready.
+    pub fn on_file_loaded(&self) {
+        let pending =
+            self.state.lock().expect("the state is not poisoned").pending_restore.file_loaded();
+        match pending {
+            Some(PendingSeek::Position(position)) => {
+                if let Err(error) = self.engine.seek(position) {
+                    self.report(error.to_string());
+                }
+            }
+            Some(PendingSeek::LiveEdge) => {
+                if let Err(error) = self.engine.seek_to_live_edge() {
+                    self.report(error.to_string());
+                }
+                let _ = self.engine.play();
+                self.live.lock().expect("the live axis is not poisoned").anchor();
+            }
+            None => {}
+        }
     }
 
     /// Takes the messages the background work produced.
@@ -475,11 +549,12 @@ fn format_bitrate(kilobits: u64) -> String {
 }
 
 /// Describes how `yt-dlp` has to be invoked.
-fn command_spec(ytdlp: &YtDlp) -> CommandSpec {
-    match ytdlp.interpreter() {
+fn command_spec(ytdlp: &YtDlp, youtube_cookies: &std::path::Path) -> CommandSpec {
+    let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
-    }
+    };
+    spec.with_youtube_cookies(youtube_cookies)
 }
 
 /// Everything that can go wrong while running the application.
@@ -615,6 +690,17 @@ mod tests {
     fn bitrates_are_readable() {
         assert_eq!(format_bitrate(128), "128 kb/s");
         assert_eq!(format_bitrate(4500), "4.5 Mb/s");
+    }
+
+    #[test]
+    fn restore_waits_for_the_new_file_start_before_file_loaded() {
+        let mut restore = PendingRestore::default();
+        restore.begin(Some(PendingSeek::Position(42.0)));
+
+        assert!(restore.file_loaded().is_none());
+        restore.file_started();
+        assert!(matches!(restore.file_loaded(), Some(PendingSeek::Position(p)) if p == 42.0));
+        assert!(restore.file_loaded().is_none());
     }
 
     #[test]

@@ -5,23 +5,32 @@
 //! through their own narrow interface, and nothing here knows how any of
 //! them works inside.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use playback_engine::{EndReason, EngineEvent};
+use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
 use ui_kit::{PlayerUi, StatusKind};
 
 use crate::app::{App, Message};
+use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
+/// Attenuation range represented by the lower half of the slider.
+const VOLUME_ATTENUATION_DB: f64 = 60.0;
+/// Boost range represented by the upper half of the slider.
+const VOLUME_BOOST_DB: f64 = 20.0 * std::f64::consts::LOG10_2;
 
 /// The window of the player, together with everything it is wired to.
 pub struct Shell {
     ui: Rc<PlayerUi>,
     app: Arc<App>,
+    loading: Rc<RefCell<Loading>>,
+    last_pointer_activity: Rc<Cell<Instant>>,
     /// The timer has to outlive the window, otherwise it stops firing.
     _timer: Timer,
 }
@@ -31,6 +40,8 @@ impl Shell {
     pub fn new(app: Arc<App>) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
         let redraw = ui.redraw_handle();
+        let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
+        let controls_hovered = Rc::new(Cell::new(false));
 
         // mpv draws the video into the part of the window below the top bar.
         // The weak handle is the only thing the render thread touches, so it
@@ -54,18 +65,47 @@ impl Shell {
         )
         .map_err(|error| Error::Ui(error.to_string()))?;
 
+        let loading = Rc::new(RefCell::new(Loading::new()));
+
+        // Window exit is distinct from pointer movement within the client area.
+        {
+            let window = ui.window().window();
+            let ui_for_events = Rc::clone(&ui);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            window.on_winit_window_event(move |_, event| {
+                match event {
+                    winit::event::WindowEvent::CursorLeft { .. } => {
+                        last_pointer_activity.set(Instant::now() - Duration::from_secs(5));
+                        if ui_for_events.has_media() && !ui_for_events.sources_open() {
+                            ui_for_events.set_controls_visible(false);
+                        }
+                    }
+                    winit::event::WindowEvent::CursorEntered { .. } => {
+                        last_pointer_activity.set(Instant::now());
+                    }
+                    _ => {}
+                }
+                EventResult::Propagate
+            });
+        }
+
         // The interface only ever calls into the application.
         {
             let app = Arc::clone(&app);
-            let status = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
             ui.on_load(move |url| {
-                status.set_status("Resolving…", StatusKind::Busy);
+                last_pointer_activity.set(Instant::now());
+                loading.borrow_mut().resolve_started();
                 app.load(url);
             });
         }
         {
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             ui.on_sources_applied(move |video, audio, muxed| {
+                drain_engine_events(&app, &mut loading.borrow_mut());
+                loading.borrow_mut().sources_switching();
                 app.select_sources(video, audio, muxed);
             });
         }
@@ -77,9 +117,26 @@ impl Shell {
             let app = Arc::clone(&app);
             ui.on_seek(move |seconds| app.seek(seconds));
         }
+        let saved_mute_volume = Rc::new(Cell::new(None::<f64>));
         {
             let app = Arc::clone(&app);
-            ui.on_volume(move |volume| app.set_volume(volume));
+            let saved_mute_volume = Rc::clone(&saved_mute_volume);
+            ui.on_volume(move |volume| {
+                app.set_volume(slider_volume_changed(
+                    &saved_mute_volume,
+                    slider_to_player_volume(volume),
+                ));
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let saved_mute_volume = Rc::clone(&saved_mute_volume);
+            ui.on_volume_toggled(move || {
+                let current = app.engine().volume();
+                if let Some(volume) = toggle_mute(&saved_mute_volume, current) {
+                    app.set_volume(volume);
+                }
+            });
         }
         {
             let app = Arc::clone(&app);
@@ -89,18 +146,40 @@ impl Shell {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
+        let spinner_step = Rc::new(Cell::new(0u32));
+        {
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            ui.on_pointer_activity(move || last_pointer_activity.set(Instant::now()));
+        }
+        {
+            let controls_hovered = Rc::clone(&controls_hovered);
+            ui.on_controls_hovered(move |hovered| controls_hovered.set(hovered));
+        }
 
         // A timer keeps the interface in sync with the player.
         let timer = Timer::default();
         {
             let ui = Rc::clone(&ui);
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            let controls_hovered = Rc::clone(&controls_hovered);
+            let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
-                tick(&ui, &app);
+                let mut loading = loading.borrow_mut();
+                tick(&ui, &app, &mut loading);
+                spinner_step.set((spinner_step.get() + 1) % 3);
+                ui.set_spinner_step(spinner_step.get());
+                let visible = ui.sources_open()
+                    || (ui.has_media()
+                        && (controls_hovered.get()
+                            || Instant::now().duration_since(last_pointer_activity.get())
+                                < Duration::from_secs(4)));
+                ui.set_controls_visible(visible);
             });
         }
 
-        Ok(Shell { ui, app, _timer: timer })
+        Ok(Shell { ui, app, loading, last_pointer_activity, _timer: timer })
     }
 
     /// Shows the window and runs until it is closed.
@@ -111,8 +190,9 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
-        self.ui.set_status("Resolving…", StatusKind::Busy);
+        self.loading.borrow_mut().resolve_started();
         self.app.load(url.to_string());
     }
 
@@ -122,8 +202,50 @@ impl Shell {
     }
 }
 
+/// Chooses the next volume and remembers a nonzero level for the mute button.
+fn toggle_mute(saved: &Cell<Option<f64>>, current: f64) -> Option<f64> {
+    if current <= 0.0 {
+        saved.take()
+    } else {
+        saved.set(Some(current));
+        Some(0.0)
+    }
+}
+
+/// Forgets the pre-mute level when the user chooses a slider value.
+fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
+    saved.set(None);
+    volume
+}
+
+/// Converts the UI's audio-tapered slider value to mpv's linear gain percent.
+fn slider_to_player_volume(slider: f64) -> f64 {
+    let slider = slider.clamp(0.0, 200.0);
+    if slider == 0.0 {
+        0.0
+    } else if slider <= 100.0 {
+        let position = slider / 100.0;
+        100.0 * 10.0_f64.powf(-VOLUME_ATTENUATION_DB * (1.0 - position) / 20.0)
+    } else {
+        let position = (slider - 100.0) / 100.0;
+        100.0 * 10.0_f64.powf(VOLUME_BOOST_DB * position / 20.0)
+    }
+}
+
+/// Converts mpv's linear gain percent back to the audio-tapered UI position.
+fn player_to_slider_volume(volume: f64) -> f64 {
+    let volume = volume.clamp(0.0, 200.0);
+    if volume == 0.0 {
+        0.0
+    } else if volume <= 100.0 {
+        100.0 * (1.0 + 20.0 * (volume / 100.0).log10() / VOLUME_ATTENUATION_DB)
+    } else {
+        100.0 + 100.0 * 20.0 * (volume / 100.0).log10() / VOLUME_BOOST_DB
+    }
+}
+
 /// Brings the interface and the player back in sync.
-fn tick(ui: &PlayerUi, app: &App) {
+fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(source)) => {
@@ -137,31 +259,60 @@ fn tick(ui: &PlayerUi, app: &App) {
                 );
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
-                ui.set_status("", StatusKind::Info);
+                loading.resolved();
                 if let Some(duration) = loaded.duration {
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => {
-                ui.set_status(&error, StatusKind::Error);
-            }
+            Message::Resolved(Err(error)) => loading.resolve_failed(error),
             Message::ToolUpdated(path) => {
-                ui.set_status(&format!("yt-dlp was updated ({path})"), StatusKind::Info);
+                if !loading.tool_updated(&path) {
+                    crate::diag::note(&format!("yt-dlp was updated ({path})"));
+                }
             }
-            Message::Problem(text) => {
-                ui.set_status(&text, StatusKind::Error);
-            }
+            Message::Problem(text) => loading.problem(text),
         }
     }
 
+    drain_engine_events(app, loading);
+
+    loading.observe(app.engine().is_active(), app.engine().is_buffering());
+    match loading.status() {
+        loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
+        loading::Status::Info(text) => ui.set_status(text, StatusKind::Info),
+        loading::Status::Error(text) => ui.set_status(text, StatusKind::Error),
+    }
+
+    // The time axis of a live stream is the window behind the live edge, so
+    // the interface always shows the same kind of position.
+    let timeline = app.timeline();
+    ui.set_position(timeline.position);
+    ui.set_duration(timeline.duration);
+    ui.set_time_text(&crate::time::format_timeline(&timeline));
+    let playing = !app.engine().is_idle() && !app.engine().is_paused();
+    ui.set_at_live_edge(timeline.live && timeline.behind <= crate::timeline::LIVE_BUFFER);
+    ui.set_playing(playing);
+
+    // The volume is read back from the player, so the slider shows what the
+    // player really uses and not only what was asked for.
+    ui.set_volume(player_to_slider_volume(app.engine().volume()));
+}
+
+/// Handles mpv events that are queued before or during a UI refresh.
+fn drain_engine_events(app: &App, loading: &mut Loading) {
     while let Some(event) = app.engine().poll_event() {
         match event {
-            EngineEvent::FileLoaded => {}
+            EngineEvent::StartFile => {
+                loading.file_started();
+                app.on_file_started();
+            }
+            EngineEvent::FileLoaded => {
+                app.on_file_loaded();
+            }
             EngineEvent::EndFile { reason, error } => {
-                if reason == EndReason::Error {
-                    let message = error.unwrap_or_else(|| "playback failed".to_string());
-                    ui.set_status(&message, StatusKind::Error);
-                }
+                let failure = (reason == EndReason::Error)
+                    .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
+                loading.file_ended(failure);
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {
@@ -171,19 +322,6 @@ fn tick(ui: &PlayerUi, app: &App) {
             EngineEvent::Shutdown => {}
         }
     }
-
-    // The time axis of a live stream is the window behind the live edge, so
-    // the interface always shows the same kind of position.
-    let timeline = app.timeline();
-    ui.set_position(timeline.position);
-    ui.set_duration(timeline.duration);
-    ui.set_time_text(&crate::time::format_timeline(&timeline));
-    ui.set_at_live_edge(timeline.live && timeline.behind <= 1.0);
-    ui.set_playing(!app.engine().is_idle() && !app.engine().is_paused());
-
-    // The volume is read back from the player, so the slider shows what the
-    // player really uses and not only what was asked for.
-    ui.set_volume(app.engine().volume());
 }
 
 /// Everything that can go wrong while building the window.
@@ -202,3 +340,46 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        player_to_slider_volume, slider_to_player_volume, slider_volume_changed, toggle_mute,
+    };
+    use std::cell::Cell;
+
+    #[test]
+    fn mute_restores_the_previous_volume_once() {
+        let saved = Cell::new(None);
+        assert_eq!(toggle_mute(&saved, 63.0), Some(0.0));
+        assert_eq!(saved.get(), Some(63.0));
+        assert_eq!(toggle_mute(&saved, 0.0), Some(63.0));
+        assert_eq!(saved.get(), None);
+        assert_eq!(toggle_mute(&saved, 0.0), None);
+    }
+
+    #[test]
+    fn slider_changes_clear_the_saved_mute_volume() {
+        let saved = Cell::new(Some(63.0));
+        assert_eq!(slider_volume_changed(&saved, 22.0), 22.0);
+        assert_eq!(saved.get(), None);
+        assert_eq!(toggle_mute(&saved, 0.0), None);
+    }
+
+    #[test]
+    fn audio_taper_keeps_mute_unity_and_double_gain_anchors() {
+        assert_eq!(slider_to_player_volume(0.0), 0.0);
+        assert!((slider_to_player_volume(100.0) - 100.0).abs() < 1e-10);
+        assert!((slider_to_player_volume(200.0) - 200.0).abs() < 1e-10);
+        assert!((player_to_slider_volume(100.0) - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn audio_taper_round_trips_volume_values() {
+        for slider in [1.0, 25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 175.0, 200.0] {
+            let player = slider_to_player_volume(slider);
+            assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
+        }
+        assert!(slider_to_player_volume(50.0) < 10.0);
+    }
+}

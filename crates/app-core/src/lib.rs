@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod diag;
+pub mod loading;
 pub mod paths;
 pub mod shell;
 pub mod time;
@@ -22,7 +23,7 @@ use std::sync::Arc;
 pub use app::{App, Loaded, Message};
 pub use paths::AppPaths;
 pub use shell::Shell;
-pub use timeline::{LIVE_WINDOW, LiveAxis, Timeline};
+pub use timeline::{LIVE_BUFFER, LIVE_WINDOW, LiveAxis, Timeline};
 
 /// The version of Flatline, taken from `version.txt` when it was built.
 pub const VERSION: &str = env!("FLATLINE_VERSION");
@@ -41,7 +42,7 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
         None => install_ytdlp(&tools)?,
     };
 
-    let app = Arc::new(App::new(&ytdlp)?);
+    let app = Arc::new(App::new(&ytdlp, &paths)?);
     let shell = Shell::new(Arc::clone(&app))?;
 
     // Look for a newer yt-dlp while the player is already running.

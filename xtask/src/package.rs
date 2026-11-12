@@ -49,9 +49,6 @@ pub fn package() -> Result<PathBuf, String> {
     // The tool that resolves the URLs, so the folder works offline.
     copy_ytdlp(&staging, platform)?;
 
-    // The version of the player, for the people who unpack it.
-    write_file(&staging.join("version.txt"), &format!("{version}\n"))?;
-
     let archive = distribution.join(format!("{FOLDER}-{version}-{}.zip", platform.archive_name()));
     compress(&staging, &archive)?;
 
@@ -138,11 +135,6 @@ fn copy_ytdlp(staging: &Path, platform: Platform) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Writes a file with the given content.
-fn write_file(path: &Path, content: &str) -> Result<(), String> {
-    std::fs::write(path, content).map_err(|error| error.to_string())
 }
 
 /// Packs the folder into a zip archive.

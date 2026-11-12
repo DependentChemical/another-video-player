@@ -6,6 +6,31 @@ written in Rust, it draws its interface with Slint and it plays with libmpv.
 This file is the contract for every agent and every contributor working in
 this repository. Read it before changing anything.
 
+## Release from `dev` to `main`
+
+Work on `dev` by default. Keep `main` for changes that have been tested and
+solidified; do not develop directly on `main`.
+
+To release, first confirm the working tree is clean and `dev` is the current
+branch. Compare `dev` with `main` from their merge base and collect the commit
+subjects since the previous merge. Use those subjects to prepare a concise,
+grouped changelog; do not infer additional changes from diffs or other notes.
+Check that `version.txt` on `dev` is higher than the version on `main`, and
+that the corresponding `v<version>` tag has not already been released.
+
+Update this file on `dev` if the release procedure changes, then create a
+`--no-ff` merge commit on `main` whose message contains the prepared
+changelog. The Release workflow uses that merge commit message as the GitHub
+release body after the Build workflow succeeds on `main`. Push `main` to
+trigger the build and release workflows, then return to `dev` for all further
+work. Check the GitHub Actions run and report whether the build and release
+completed successfully. If the status cannot be checked, leave that check to
+the user and say why.
+
+After returning to `dev`, remove generated build output such as `target/`
+and `dist/` so the workspace is clean. Keep `.flatline/`, which holds
+downloaded runtime dependencies and state rather than build output.
+
 ## The isolation rule
 
 This is the rule the whole repository is built around. It is not a style
@@ -111,7 +136,7 @@ for itself when it is missing, and looks for a newer one on every start.
 
 ## PR & commit conventions
 
-- Branch from `main`; never push to it directly.
+- Work on `dev`; `main` is reserved for tested and solidified releases.
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`,
   `chore:`.
 - Keep one capability per commit. A commit that touches three crates for

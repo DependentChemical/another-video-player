@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 
 /// One row of the source picker.
 export struct StreamItem {
@@ -150,8 +150,11 @@ export component MainWindow inherits Window {
     callback play-toggled();
     callback seek-requested(float);
     callback volume-requested(float);
+    callback volume-toggled();
     callback fullscreen-toggled();
     callback live-requested();
+    callback pointer-activity();
+    callback controls-hovered(bool);
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -164,8 +167,9 @@ export component MainWindow inherits Window {
     // window the video may use.
     out property <length> top-bar-height: Theme.bar-height;
 
-    // The room the control bar needs next to the play button.
-    private property <length> live-room: root.live ? 70px : 0px;
+    in property <bool> controls-visible: true;
+    // Which of the three loading dots is lit up, from zero to two.
+    in property <int> spinner-step: 0;
 
     private property <bool> can-apply: root.draft-video != ""
         || root.draft-audio != ""
@@ -206,6 +210,15 @@ export component MainWindow inherits Window {
         }
     }
 
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        moved => { root.pointer-activity(); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+    }
+
     // --------------------------------------------------------- top bar ----
     Rectangle {
         x: 0px;
@@ -215,7 +228,7 @@ export component MainWindow inherits Window {
         background: Theme.panel;
 
         Text {
-            x: 16px;
+            x: 40px;
             width: 72px;
             text: "Flatline";
             color: Theme.fg;
@@ -223,10 +236,19 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
         }
 
+        Image {
+            x: 14px;
+            y: (parent.height - 20px) / 2;
+            width: 20px;
+            height: 20px;
+            source: @image-url("../../../resources/flatline-32.png");
+            image-fit: contain;
+        }
+
         url-field := Rectangle {
-            x: 96px;
+            x: 124px;
             y: (parent.height - 32px) / 2;
-            width: parent.width - 96px - 140px - 12px;
+            width: parent.width - 124px - 68px;
             height: 32px;
             border-radius: 6px;
             border-width: 1px;
@@ -244,36 +266,27 @@ export component MainWindow inherits Window {
 
             url-input := TextInput {
                 x: 10px;
+                y: 0px;
                 width: parent.width - 20px;
                 height: parent.height;
                 text <=> root.url;
                 color: Theme.fg;
                 font-size: 13px;
+                vertical-alignment: center;
                 accepted => {
                     root.load-requested();
                 }
             }
         }
 
-        GearButton {
-            x: parent.width - 140px;
-            y: (parent.height - 32px) / 2;
-            width: 36px;
-            height: 32px;
-            active: root.sources-open;
-            enabled: root.has-media;
-            clicked => {
-                root.toggle-sources();
-            }
-        }
-
         load-button := FlatButton {
-            x: parent.width - 76px - 16px;
+            x: parent.width - 56px;
             y: (parent.height - 32px) / 2;
-            width: 76px;
+            width: 40px;
             height: 32px;
-            label: "Load";
+            label: "Go";
             primary: true;
+            pointer-activity => { root.pointer-activity(); }
             clicked => {
                 root.load-requested();
             }
@@ -288,6 +301,17 @@ export component MainWindow inherits Window {
         height: parent.height - Theme.bar-height;
         background: transparent;
 
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.move {
+                    root.pointer-activity();
+                }
+            }
+            moved => { root.pointer-activity(); }
+        }
+
         // A centred message, used for errors and for hints.
         Rectangle {
             x: 0px;
@@ -295,8 +319,48 @@ export component MainWindow inherits Window {
             width: parent.width;
             height: 48px;
 
+            // Three dots that take turns lighting up while the player waits.
+            if root.status-kind == "busy": Rectangle {
+                x: (parent.width - 40px) / 2;
+                y: parent.height / 2 - 16px;
+                width: 40px;
+                height: 8px;
+
+                Rectangle {
+                    x: 0px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.accent;
+                    opacity: root.spinner-step == 0 ? 1.0 : 0.3;
+                    animate opacity { duration: 160ms; }
+                }
+
+                Rectangle {
+                    x: 16px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.accent;
+                    opacity: root.spinner-step == 1 ? 1.0 : 0.3;
+                    animate opacity { duration: 160ms; }
+                }
+
+                Rectangle {
+                    x: 32px;
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.accent;
+                    opacity: root.spinner-step == 2 ? 1.0 : 0.3;
+                    animate opacity { duration: 160ms; }
+                }
+            }
+
             Text {
                 width: parent.width;
+                y: root.status-kind == "busy" ? parent.height / 2 + 8px : 0px;
+                height: root.status-kind == "busy" ? 24px : parent.height;
                 text: root.status;
                 color: root.status-kind == "error" ? Theme.danger : Theme.muted;
                 font-size: 14px;
@@ -308,10 +372,21 @@ export component MainWindow inherits Window {
         // The control bar, floating over the video.
         Rectangle {
             x: 0px;
-            y: parent.height - Theme.controls-height;
+            y: root.controls-visible ? parent.height - Theme.controls-height : parent.height;
             width: parent.width;
             height: Theme.controls-height;
             background: #000000a6;
+            opacity: root.controls-visible ? 1 : 0;
+            animate y { duration: 180ms; easing: ease-out; }
+            animate opacity { duration: 140ms; }
+
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+                changed has-hover => {
+                    root.controls-hovered(self.has-hover);
+                }
+            }
 
             PlayPauseButton {
                 x: 12px;
@@ -319,6 +394,7 @@ export component MainWindow inherits Window {
                 width: 44px;
                 height: 32px;
                 playing: root.playing;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.play-toggled();
                 }
@@ -328,18 +404,21 @@ export component MainWindow inherits Window {
             LiveButton {
                 x: 60px;
                 y: (parent.height - 32px) / 2;
-                width: 62px;
+                width: 82px;
                 height: 32px;
                 visible: root.live;
                 at-edge: root.at-live-edge;
+                label: root.time-text;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.live-requested();
                 }
             }
 
             Text {
-                x: 68px + root.live-room;
-                width: 110px;
+                x: 68px;
+                width: 64px;
+                visible: !root.live;
                 text: root.time-text;
                 color: Theme.fg;
                 font-size: 12px;
@@ -347,12 +426,13 @@ export component MainWindow inherits Window {
             }
 
             seek := SeekBar {
-                x: 188px + root.live-room;
+                x: root.live ? 152px : 140px;
                 y: (parent.height - 18px) / 2;
-                width: parent.width - (188px + root.live-room) - 220px;
+                width: parent.width - (root.live ? 152px : 140px) - 220px;
                 height: 18px;
                 value: root.position;
                 maximum: root.duration;
+                pointer-activity => { root.pointer-activity(); }
                 moved(value) => {
                     root.seek-requested(value);
                 }
@@ -365,16 +445,41 @@ export component MainWindow inherits Window {
                 height: 32px;
                 active: root.sources-open;
                 enabled: root.has-media;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.toggle-sources();
                 }
             }
 
-            VolumeIcon {
-                x: parent.width - 40px - 90px - 20px - 22px;
-                y: (parent.height - self.height) / 2;
-                width: 16px;
-                height: 16px;
+            Rectangle {
+                x: parent.width - 40px - 90px - 20px - 26px;
+                y: (parent.height - 24px) / 2;
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                background: volume-touch.pressed ? Theme.elevated : transparent;
+
+                if root.volume <= 0: VolumeOffIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+                if root.volume > 0: VolumeIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+
+                volume-touch := TouchArea {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                    }
+                    clicked => {
+                        root.volume-toggled();
+                    }
+                }
             }
 
             volume := SeekBar {
@@ -395,6 +500,7 @@ export component MainWindow inherits Window {
                 width: 40px;
                 height: 32px;
                 fullscreen: root.fullscreen;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.fullscreen-toggled();
                 }

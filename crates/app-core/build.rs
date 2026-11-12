@@ -15,6 +15,16 @@ fn main() {
         panic!("the version could not be read from {}: {error}", version_file.display())
     });
     println!("cargo:rustc-env=FLATLINE_VERSION={version}");
+    println!("cargo:rerun-if-changed=../../resources/flatline.ico");
+
+    #[cfg(target_os = "windows")]
+    {
+        let icon = manifest_dir().join("resources").join("flatline.ico");
+        winres::WindowsResource::new()
+            .set_icon(icon.to_str().expect("icon path is valid UTF-8"))
+            .compile()
+            .expect("the Windows executable icon could not be embedded");
+    }
 
     // The build puts the mpv runtime next to the executable, so the loader
     // has to look there first. On Windows the loader does that by itself.

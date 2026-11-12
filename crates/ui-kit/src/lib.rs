@@ -200,6 +200,11 @@ impl PlayerUi {
         self.window.set_has_media(has_media);
     }
 
+    /// Whether the window has loaded media.
+    pub fn has_media(&self) -> bool {
+        self.window.get_has_media()
+    }
+
     /// Whether playback is running.
     pub fn set_playing(&self, playing: bool) {
         self.window.set_playing(playing);
@@ -235,6 +240,23 @@ impl PlayerUi {
     /// Whether the playback is at the live edge of a live stream.
     pub fn set_at_live_edge(&self, at_edge: bool) {
         self.window.set_at_live_edge(at_edge);
+    }
+
+    /// Shows the playback controls while the pointer is active.
+    pub fn set_controls_visible(&self, visible: bool) {
+        self.window.set_controls_visible(visible);
+    }
+
+    /// Advances the loading indicator animation.
+    ///
+    /// The step selects which of the three dots is lit up.
+    pub fn set_spinner_step(&self, step: u32) {
+        self.window.set_spinner_step(step as i32);
+    }
+
+    /// Whether the source picker is open.
+    pub fn sources_open(&self) -> bool {
+        self.window.get_sources_open()
     }
 
     // ------------------------------------------------------------ events --
@@ -278,6 +300,11 @@ impl PlayerUi {
         self.window.on_volume_requested(move |volume| handler(volume as f64));
     }
 
+    /// Called when the user toggles mute from the volume icon.
+    pub fn on_volume_toggled(&self, handler: impl Fn() + 'static) {
+        self.window.on_volume_toggled(handler);
+    }
+
     /// Called when the user toggles full screen.
     pub fn on_fullscreen_toggled(&self, handler: impl Fn() + 'static) {
         self.window.on_fullscreen_toggled(handler);
@@ -286,6 +313,16 @@ impl PlayerUi {
     /// Called when the user asks to go back to the live edge.
     pub fn on_live_pressed(&self, handler: impl Fn() + 'static) {
         self.window.on_live_requested(handler);
+    }
+
+    /// Called when the pointer moves over the video area.
+    pub fn on_pointer_activity(&self, handler: impl Fn() + 'static) {
+        self.window.on_pointer_activity(handler);
+    }
+
+    /// Called when the pointer enters or leaves the control bar.
+    pub fn on_controls_hovered(&self, handler: impl Fn(bool) + 'static) {
+        self.window.on_controls_hovered(handler);
     }
 }
 

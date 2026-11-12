@@ -75,6 +75,12 @@ export component VolumeIcon inherits Icon {
     ink: Theme.muted;
 }
 
+// The loudspeaker with a slash, used when the volume is muted.
+export component VolumeOffIcon inherits Icon {
+    glyph: "\u{e04f}";
+    ink: Theme.muted;
+}
+
 // The arrow that points back in time.
 export component ReplayIcon inherits Icon {
     glyph: "\u{e059}";
@@ -86,6 +92,7 @@ export component FlatButton inherits Rectangle {
     in property <bool> primary: false;
     in property <bool> enabled: true;
     callback clicked();
+    callback pointer-activity();
 
     border-radius: 6px;
     border-width: 1px;
@@ -102,6 +109,10 @@ export component FlatButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         enabled: root.enabled;
         clicked => {
             root.clicked();
@@ -113,6 +124,7 @@ export component FlatButton inherits Rectangle {
 export component PlayPauseButton inherits Rectangle {
     in property <bool> playing: false;
     callback clicked();
+    callback pointer-activity();
 
     width: 44px;
     height: 32px;
@@ -143,6 +155,10 @@ export component PlayPauseButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -153,6 +169,7 @@ export component PlayPauseButton inherits Rectangle {
 export component FullscreenButton inherits Rectangle {
     in property <bool> fullscreen: false;
     callback clicked();
+    callback pointer-activity();
 
     width: 40px;
     height: 32px;
@@ -171,6 +188,10 @@ export component FullscreenButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -185,9 +206,11 @@ export component FullscreenButton inherits Rectangle {
 // status light.
 export component LiveButton inherits Rectangle {
     in property <bool> at-edge: true;
+    in property <string> label: "LIVE";
     callback clicked();
+    callback pointer-activity();
 
-    width: 62px;
+    width: 82px;
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
@@ -203,7 +226,7 @@ export component LiveButton inherits Rectangle {
     Text {
         x: 22px;
         width: parent.width - 28px;
-        text: "LIVE";
+        text: root.label;
         color: root.at-edge ? Theme.danger : Theme.muted;
         font-size: 12px;
         font-weight: root.at-edge ? 700 : 400;
@@ -211,6 +234,10 @@ export component LiveButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -222,6 +249,7 @@ export component GearButton inherits Rectangle {
     in property <bool> active: false;
     in property <bool> enabled: true;
     callback clicked();
+    callback pointer-activity();
 
     width: 36px;
     height: 32px;
@@ -239,6 +267,10 @@ export component GearButton inherits Rectangle {
 
     touch := TouchArea {
         enabled: root.enabled;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
         clicked => {
             root.clicked();
         }
@@ -256,6 +288,7 @@ export component SeekBar inherits Rectangle {
     in property <float> maximum: 1;
     in property <bool> interactive: true;
     callback moved(float);
+    callback pointer-activity();
 
     height: 18px;
 
@@ -267,25 +300,25 @@ export component SeekBar inherits Rectangle {
         : 0.0;
 
     track := Rectangle {
-        x: 0px;
+        x: 6px;
         y: (parent.height - self.height) / 2;
-        width: parent.width;
+        width: max(0px, parent.width - 12px);
         height: 4px;
         border-radius: 2px;
         background: Theme.border;
     }
 
     fill := Rectangle {
-        x: 0px;
+        x: 6px;
         y: (parent.height - self.height) / 2;
-        width: parent.width * root.ratio;
+        width: max(0px, parent.width - 12px) * root.ratio;
         height: 4px;
         border-radius: 2px;
         background: Theme.accent;
     }
 
     knob := Rectangle {
-        x: parent.width * root.ratio - self.width / 2;
+        x: 6px + max(0px, parent.width - 12px) * root.ratio - self.width / 2;
         y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;
@@ -301,6 +334,7 @@ export component SeekBar inherits Rectangle {
         height: parent.height;
         enabled: root.interactive;
         pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
             if (event.kind == PointerEventKind.down) {
                 root.moved(root.value-at(area.mouse-x));
             }
@@ -309,6 +343,7 @@ export component SeekBar inherits Rectangle {
             }
         }
         moved => {
+            root.pointer-activity();
             root.moved(root.value-at(area.mouse-x));
         }
     }
@@ -317,6 +352,6 @@ export component SeekBar inherits Rectangle {
     pure function value-at(x: length) -> float {
         root.width <= 0px || root.maximum <= 0
             ? 0.0
-            : clamp((x / root.width) * root.maximum, 0.0, root.maximum)
+            : clamp(((x - 6px) / max(1px, root.width - 12px)) * root.maximum, 0.0, root.maximum)
     }
 }

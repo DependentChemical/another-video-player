@@ -224,7 +224,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "app-core"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "media-model",
  "playback-engine",
@@ -234,6 +234,7 @@ dependencies = [
  "tokio",
  "ui-kit",
  "video-surface",
+ "winres",
  "ytdlp-tool",
 ]
 
@@ -2784,7 +2785,7 @@ checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
 
 [[package]]
 name = "media-model"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
 ]
@@ -3594,7 +3595,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-engine"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "rsmpv",
 ]
@@ -4290,7 +4291,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tar",
- "toml",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]
@@ -4511,11 +4512,11 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storyboard"
-version = "0.1.0"
+version = "0.1.4"
 
 [[package]]
 name = "stream-resolver"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "media-model",
  "serde",
@@ -4841,6 +4842,15 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml"
 version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
@@ -4987,7 +4997,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "slint",
  "slint-build",
@@ -5173,7 +5183,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-surface"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "playback-engine",
  "slint",
@@ -5926,6 +5936,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6060,7 +6079,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -6112,7 +6131,7 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-tool"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",

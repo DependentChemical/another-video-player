@@ -1,6 +1,6 @@
 //! Formatting helpers for the user interface.
 
-use crate::timeline::Timeline;
+use crate::timeline::{LIVE_BUFFER, Timeline};
 
 /// Formats a number of seconds as `m:ss`, or `h:mm:ss` for long media.
 pub fn format_time(seconds: f64) -> String {
@@ -27,7 +27,7 @@ pub fn format_timeline(timeline: &Timeline) -> String {
     if !timeline.live {
         return format!("{} / {}", format_time(timeline.position), format_time(timeline.duration));
     }
-    if timeline.behind <= 1.0 {
+    if timeline.behind <= LIVE_BUFFER {
         return "LIVE".to_string();
     }
     format!("-{}", format_time(timeline.behind))

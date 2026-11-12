@@ -50,6 +50,11 @@ impl AppPaths {
         &self.program
     }
 
+    /// The optional YouTube cookies file beside the executable.
+    pub fn youtube_cookies(&self) -> PathBuf {
+        self.program.join("cookies-youtube.txt")
+    }
+
     /// Whether the program directory is the one that is written to.
     ///
     /// When this is false the files live in the per user directory instead.
@@ -157,5 +162,9 @@ mod tests {
         assert_eq!(paths.tools(), PathBuf::from("/tmp/flatline").join("tools"));
         assert_eq!(paths.thumbnails(), PathBuf::from("/tmp/flatline").join("thumbnails"));
         assert_eq!(paths.log_file(), PathBuf::from("/tmp/flatline").join("flatline.log"));
+        assert_eq!(
+            paths.youtube_cookies(),
+            PathBuf::from("/tmp/flatline").join("cookies-youtube.txt")
+        );
     }
 }

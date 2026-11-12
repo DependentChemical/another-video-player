@@ -10,6 +10,7 @@
 
 # Build output of `cargo xtask package`
 /dist/
+/out/
 
 # Research material and scratch files (reference projects, screenshots, logs)
 /.ref/

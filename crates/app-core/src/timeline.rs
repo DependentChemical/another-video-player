@@ -9,8 +9,13 @@
 //! When the user scrubs back, the window stops following the edge so that the
 //! handle does not drift away under the finger.
 
+use std::time::Instant;
+
 /// How far back a live stream can be scrubbed, in seconds.
 pub const LIVE_WINDOW: f64 = 300.0;
+
+/// Playback within this distance of the seekable edge is presented as live.
+pub const LIVE_BUFFER: f64 = 5.0;
 
 /// The time axis that is shown to the user.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +47,8 @@ pub struct LiveAxis {
     edge: f64,
     /// The stream time the left hand end of the axis shows.
     start: f64,
+    /// When the edge was last observed from playback or the demuxer cache.
+    edge_observed_at: Option<Instant>,
 }
 
 impl LiveAxis {
@@ -61,6 +68,18 @@ impl LiveAxis {
     pub fn observe(&mut self, position: f64) {
         if position > self.edge {
             self.edge = position;
+            self.edge_observed_at = Some(Instant::now());
+        } else if self.edge_observed_at.is_none() {
+            self.edge_observed_at = Some(Instant::now());
+        }
+    }
+
+    /// Lets the live edge advance in real time while playback is paused.
+    pub fn advance_while_paused(&mut self, now: Instant) {
+        if let Some(observed_at) = self.edge_observed_at {
+            let elapsed = now.saturating_duration_since(observed_at).as_secs_f64();
+            self.edge += elapsed;
+            self.edge_observed_at = Some(now);
         }
     }
 
@@ -81,7 +100,7 @@ impl LiveAxis {
     /// A small tolerance keeps the player from flickering between "live" and
     /// "behind" because of the rounding of the reported position.
     pub fn at_edge(&self, position: f64) -> bool {
-        self.edge - position <= 1.0
+        self.edge - position <= LIVE_BUFFER
     }
 
     /// Moves the window back to the live edge.
@@ -100,11 +119,13 @@ impl LiveAxis {
 
     /// The axis that is shown for the given playback position.
     pub fn timeline(&self, position: f64) -> Timeline {
+        let behind = (self.edge - position).max(0.0);
+        let display_position = if behind <= LIVE_BUFFER { self.edge } else { position };
         Timeline {
             live: true,
-            position: (position - self.start).clamp(0.0, LIVE_WINDOW),
+            position: (display_position - self.start).clamp(0.0, LIVE_WINDOW),
             duration: LIVE_WINDOW,
-            behind: (self.edge - position).max(0.0),
+            behind,
         }
     }
 
@@ -143,7 +164,17 @@ mod tests {
         let mut axis = LiveAxis::new();
         axis.observe(50.0);
         assert!(axis.at_edge(50.0));
-        assert!(!axis.at_edge(45.0));
+        assert!(!axis.at_edge(44.9));
+    }
+
+    #[test]
+    fn the_live_buffer_is_presented_at_the_edge() {
+        let mut axis = LiveAxis::new();
+        axis.observe(100.0);
+        axis.anchor();
+        assert!(axis.at_edge(95.0));
+        assert_eq!(axis.timeline(95.0).position, 100.0);
+        assert!(!axis.at_edge(94.9));
     }
 
     #[test]
@@ -187,6 +218,28 @@ mod tests {
         // the window is not anchored again and the handle does not drift.
         axis.sync(940.0);
         assert_eq!(axis.timeline(940.0).position, before);
+    }
+
+    #[test]
+    fn the_live_edge_can_advance_while_playback_is_paused() {
+        let mut axis = LiveAxis::new();
+        axis.sync(1000.0);
+        axis.observe(1040.0);
+
+        let timeline = axis.timeline(1000.0);
+        assert_eq!(timeline.behind, 40.0);
+        assert!(!axis.at_edge(1000.0));
+    }
+
+    #[test]
+    fn the_live_edge_advances_with_wall_time_when_paused() {
+        let mut axis = LiveAxis::new();
+        axis.observe(100.0);
+        let observed_at = axis.edge_observed_at.expect("observing the edge records its time");
+        axis.advance_while_paused(observed_at + std::time::Duration::from_secs(8));
+
+        assert_eq!(axis.edge(), 108.0);
+        assert_eq!(axis.timeline(100.0).behind, 8.0);
     }
 
     #[test]
