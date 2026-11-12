@@ -1,0 +1,143 @@
+name: Release
+
+# A release is produced when the Build workflow succeeds on `main`. The
+# version of the project is `version.txt`; a release is only published when
+# that version does not have a tag yet. Small changes keep the version and
+# therefore never produce a release.
+on:
+  workflow_run:
+    workflows:
+      - Build
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  publish-release:
+    name: Publish the release
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download the Windows archive
+        uses: actions/download-artifact@v5
+        with:
+          name: flatline-windows-x64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: release-artifact/windows
+        continue-on-error: true
+
+      - name: Download the Linux archive
+        uses: actions/download-artifact@v5
+        with:
+          name: flatline-linux-x86_64
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          path: release-artifact/linux
+        continue-on-error: true
+
+      - name: Create the release
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.workflow_run.head_sha;
+
+            // `version.txt` is the reference for the version of the project.
+            const versionFile = (await github.rest.repos.getContent({
+              owner,
+              repo,
+              path: 'version.txt',
+              ref: headSha,
+            })).data;
+            if (!versionFile.content || !versionFile.encoding) {
+              throw new Error('Unable to read version.txt from the release commit.');
+            }
+            const version = Buffer.from(versionFile.content, versionFile.encoding)
+              .toString('utf8').trim();
+            if (!/^\d+\.\d+\.\d+$/.test(version)) {
+              throw new Error(`"${version}" is not a version number.`);
+            }
+
+            const tag = `v${version}`;
+
+            // Versions are tags. A tag that already exists was released
+            // before, so a small change that does not move the version ends
+            // here instead of producing a second release.
+            let tagExists = true;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              tagExists = false;
+            }
+            if (tagExists) {
+              core.info(`The tag ${tag} already exists, there is nothing to release.`);
+              return;
+            }
+
+            // The message of the release is the message of the commit that
+            // the build succeeded on.
+            const commit = (await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: headSha,
+            })).data;
+            const body = commit.commit.message.trim() || `Flatline ${version}`;
+
+            const release = (await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              target_commitish: headSha,
+              name: `Flatline ${version}`,
+              body,
+              draft: false,
+              prerelease: false,
+            })).data;
+
+            const folders = ['release-artifact/windows', 'release-artifact/linux'];
+            for (const folder of folders) {
+              const directory = path.join(process.env.GITHUB_WORKSPACE, folder);
+              if (!fs.existsSync(directory)) {
+                continue;
+              }
+              for (const file of fs.readdirSync(directory)) {
+                if (!file.endsWith('.zip')) {
+                  continue;
+                }
+                const assetPath = path.join(directory, file);
+                const assetData = fs.readFileSync(assetPath);
+                await github.rest.repos.uploadReleaseAsset({
+                  owner,
+                  repo,
+                  release_id: release.id,
+                  name: file,
+                  headers: {
+                    'content-length': assetData.length,
+                    'content-type': 'application/zip',
+                  },
+                  data: assetData,
+                });
+                core.info(`Uploaded ${file}`);
+              }
+            }
