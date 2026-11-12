@@ -300,6 +300,11 @@ impl PlayerUi {
         self.window.on_volume_requested(move |volume| handler(volume as f64));
     }
 
+    /// Called when the user toggles mute from the volume icon.
+    pub fn on_volume_toggled(&self, handler: impl Fn() + 'static) {
+        self.window.on_volume_toggled(handler);
+    }
+
     /// Called when the user toggles full screen.
     pub fn on_fullscreen_toggled(&self, handler: impl Fn() + 'static) {
         self.window.on_fullscreen_toggled(handler);

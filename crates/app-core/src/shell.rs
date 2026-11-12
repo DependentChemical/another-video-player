@@ -88,9 +88,29 @@ impl Shell {
             let app = Arc::clone(&app);
             ui.on_seek(move |seconds| app.seek(seconds));
         }
+        let saved_mute_volume = Rc::new(Cell::new(None::<f64>));
         {
             let app = Arc::clone(&app);
-            ui.on_volume(move |volume| app.set_volume(volume));
+            let saved_mute_volume = Rc::clone(&saved_mute_volume);
+            ui.on_volume(move |volume| {
+                saved_mute_volume.set(None);
+                app.set_volume(volume);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let saved_mute_volume = Rc::clone(&saved_mute_volume);
+            ui.on_volume_toggled(move || {
+                let current = app.engine().volume();
+                if current <= 0.0 {
+                    if let Some(saved) = saved_mute_volume.take() {
+                        app.set_volume(saved);
+                    }
+                } else {
+                    saved_mute_volume.set(Some(current));
+                    app.set_volume(0.0);
+                }
+            });
         }
         {
             let app = Arc::clone(&app);

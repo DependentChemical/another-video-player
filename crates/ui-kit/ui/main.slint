@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 
 /// One row of the source picker.
 export struct StreamItem {
@@ -150,6 +150,7 @@ export component MainWindow inherits Window {
     callback play-toggled();
     callback seek-requested(float);
     callback volume-requested(float);
+    callback volume-toggled();
     callback fullscreen-toggled();
     callback live-requested();
     callback pointer-activity();
@@ -432,11 +433,31 @@ export component MainWindow inherits Window {
                 }
             }
 
-            VolumeIcon {
-                x: parent.width - 40px - 90px - 20px - 22px;
-                y: (parent.height - self.height) / 2;
-                width: 16px;
-                height: 16px;
+            Rectangle {
+                x: parent.width - 40px - 90px - 20px - 26px;
+                y: (parent.height - 24px) / 2;
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                background: volume-touch.pressed ? Theme.elevated : transparent;
+
+                if root.volume <= 0: VolumeOffIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+                if root.volume > 0: VolumeIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                }
+
+                volume-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                    }
+                    clicked => {
+                        root.volume-toggled();
+                    }
+                }
             }
 
             volume := SeekBar {
