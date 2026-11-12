@@ -183,7 +183,9 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     while let Some(event) = app.engine().poll_event() {
         match event {
             EngineEvent::StartFile => loading.file_started(),
-            EngineEvent::FileLoaded => {}
+            EngineEvent::FileLoaded => {
+                app.on_file_loaded();
+            }
             EngineEvent::EndFile { reason, error } => {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));

@@ -47,6 +47,12 @@ pub struct Loaded {
     pub is_live: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingSeek {
+    Position(f64),
+    LiveEdge,
+}
+
 /// The state of the loaded media.
 #[derive(Debug, Default)]
 struct State {
@@ -55,6 +61,7 @@ struct State {
     selected_audio: Option<String>,
     selected_muxed: Option<String>,
     is_live: bool,
+    pending_seek: Option<PendingSeek>,
 }
 
 /// The application, without a user interface.
@@ -145,6 +152,7 @@ impl App {
             state.selected_audio = audio;
             state.selected_muxed = muxed;
             state.is_live = loaded.is_live;
+            state.pending_seek = None;
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -196,6 +204,21 @@ impl App {
             }
         };
 
+        let (is_live, pending) = {
+            let state = self.state.lock().expect("the state is not poisoned");
+            if state.is_live {
+                (true, Some(PendingSeek::LiveEdge))
+            } else {
+                let position = self.engine.position().max(0.0);
+                (false, (position > 0.0).then_some(PendingSeek::Position(position)))
+            }
+        };
+
+        {
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            state.pending_seek = pending;
+        }
+
         if let Err(error) = self.start(&plan) {
             self.report(error);
             return;
@@ -206,6 +229,7 @@ impl App {
         state.selected_video = video;
         state.selected_audio = audio;
         state.selected_muxed = muxed;
+        let _ = is_live;
     }
 
     /// Switches between playing and paused.
@@ -323,6 +347,26 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Restores playback position after a source change once the file is ready.
+    pub fn on_file_loaded(&self) {
+        let pending = self.state.lock().expect("the state is not poisoned").pending_seek.take();
+        match pending {
+            Some(PendingSeek::Position(position)) => {
+                if let Err(error) = self.engine.seek(position) {
+                    self.report(error.to_string());
+                }
+            }
+            Some(PendingSeek::LiveEdge) => {
+                if let Err(error) = self.engine.seek_to_live_edge() {
+                    self.report(error.to_string());
+                }
+                let _ = self.engine.play();
+                self.live.lock().expect("the live axis is not poisoned").anchor();
+            }
+            None => {}
+        }
     }
 
     /// Takes the messages the background work produced.
