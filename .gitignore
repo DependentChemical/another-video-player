@@ -5,6 +5,9 @@
 # Flatline managed runtime state (downloaded yt-dlp, thumbnails, config)
 .flatline/
 
+# The Material Icons font, downloaded when the interface is built
+/crates/ui-kit/fonts/
+
 # Build output of `cargo xtask package`
 /dist/
 

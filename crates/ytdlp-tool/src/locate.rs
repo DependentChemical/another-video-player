@@ -127,16 +127,32 @@ fn describe(program: PathBuf) -> YtDlp {
 
 /// The interpreter an executable needs, if any.
 ///
-/// Windows binaries published by the `yt-dlp` project are self contained.
-/// Everything else is a Python application and needs a `python3`.
+/// The artifacts the `yt-dlp` project publishes are self contained binaries
+/// on every platform, but an old `yt-dlp` may be the Python zip application.
+/// The first two bytes tell the two apart: a zip application starts with a
+/// `#!` shebang, a native binary starts with its own magic.
 fn interpreter_for(program: &Path) -> Option<PathBuf> {
-    if cfg!(windows) && program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+    if program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
         return None;
     }
-    if !cfg!(windows) && program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
-        return None;
+    if needs_python(program) { python_on_path() } else { None }
+}
+
+/// Whether a file looks like a Python script rather than a native executable.
+fn needs_python(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 2];
+    match std::io::Read::read_exact(&mut file, &mut magic) {
+        Ok(()) => is_python_magic(&magic),
+        Err(_) => false,
     }
-    python_on_path()
+}
+
+/// Whether the first bytes of a file are a shebang.
+fn is_python_magic(magic: &[u8]) -> bool {
+    magic.starts_with(b"#!")
 }
 
 /// Finds a `python3` (or `python`) executable on `PATH`.
@@ -156,4 +172,20 @@ pub fn python_on_path() -> Option<PathBuf> {
 /// Whether `name` looks like a `yt-dlp` executable.
 pub fn is_ytdlp_name(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("yt-dlp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shebang_marks_a_python_script() {
+        assert!(is_python_magic(b"#!/usr/bin/env python3"));
+    }
+
+    #[test]
+    fn a_native_binary_needs_no_interpreter() {
+        assert!(!is_python_magic(b"\x7fELF"));
+        assert!(!is_python_magic(b"MZ"));
+    }
 }

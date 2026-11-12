@@ -143,12 +143,22 @@ impl Engine {
     /// mpv's per file `audio-file` option, which is how a video only stream
     /// and an audio only stream are played together.
     pub fn load(&self, request: &LoadRequest) -> Result<(), Error> {
-        let mut arguments =
-            vec!["loadfile".to_string(), request.media.clone(), "replace".to_string()];
+        // `loadfile` takes the per-file options as a map, which keeps an URL
+        // that contains a comma from being split into two options. The `-1`
+        // is the insertion index mpv requires before the options argument.
+        let mut arguments = vec![
+            rsmpv::Node::String("loadfile".into()),
+            rsmpv::Node::String(request.media.clone()),
+            rsmpv::Node::String("replace".into()),
+        ];
         if let Some(audio) = &request.audio {
-            arguments.push(format!("audio-file={audio}"));
+            arguments.push(rsmpv::Node::Int64(-1));
+            arguments.push(rsmpv::Node::Map(vec![(
+                "audio-file".to_string(),
+                rsmpv::Node::String(audio.clone()),
+            )]));
         }
-        self.core.command(&arguments)?;
+        self.core.command_node(&rsmpv::Node::Array(arguments))?;
         Ok(())
     }
 
@@ -179,6 +189,25 @@ impl Engine {
     /// Seeks to an absolute position in seconds.
     pub fn seek(&self, seconds: f64) -> Result<(), Error> {
         self.core.command(&["seek", &seconds.to_string(), "absolute"])?;
+        Ok(())
+    }
+
+    /// Seeks by an offset in seconds.
+    ///
+    /// A negative offset goes back in time. This is what a live stream needs
+    /// when the user wants to replay a moment that just passed.
+    pub fn seek_relative(&self, seconds: f64) -> Result<(), Error> {
+        self.core.command(&["seek", &seconds.to_string(), "relative"])?;
+        Ok(())
+    }
+
+    /// Jumps to the live edge of a live stream.
+    ///
+    /// mpv has no dedicated command for it. A relative seek far past the end
+    /// is clamped to the end of the seekable range, which is exactly the live
+    /// edge of a stream that is still being produced.
+    pub fn seek_to_live_edge(&self) -> Result<(), Error> {
+        self.core.command(&["seek", "1000000000", "relative"])?;
         Ok(())
     }
 

@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { ChevronIcon, FlatButton, FullscreenButton, PlayPauseButton, SeekBar } from "widgets.slint";
+import { ChevronIcon, FlatButton, FullscreenButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon } from "widgets.slint";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -31,6 +31,12 @@ export component MainWindow inherits Window {
     in property <float> volume: 100;
     // The playback position, formatted for the user.
     in property <string> time-text: "0:00 / 0:00";
+    // Whether the media is a live stream.
+    in property <bool> live: false;
+    // Whether the playback is at the live edge.
+    in property <bool> at-live-edge: true;
+    // Whether the window is in full screen.
+    in property <bool> fullscreen: false;
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -39,6 +45,7 @@ export component MainWindow inherits Window {
     callback seek-requested(float);
     callback volume-requested(float);
     callback fullscreen-toggled();
+    callback live-requested();
 
     // --------------------------------------------------------- internals --
     private property <bool> quality-menu-open: false;
@@ -50,6 +57,9 @@ export component MainWindow inherits Window {
     out property <string> quality-text: root.quality-labels.length > 0
         ? root.quality-labels[root.quality-index < 0 ? 0 : root.quality-index]
         : "Quality";
+
+    // The room the control bar needs next to the play button.
+    private property <length> live-room: root.live ? 70px : 0px;
 
     // --------------------------------------------------------- top bar ----
     Rectangle {
@@ -188,9 +198,22 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // The live button is only there while a live stream plays.
+            LiveButton {
+                x: 60px;
+                y: (parent.height - 32px) / 2;
+                width: 62px;
+                height: 32px;
+                visible: root.live;
+                at-edge: root.at-live-edge;
+                clicked => {
+                    root.live-requested();
+                }
+            }
+
             Text {
-                x: 68px;
-                width: 130px;
+                x: 68px + root.live-room;
+                width: 110px;
                 text: root.time-text;
                 color: Theme.fg;
                 font-size: 12px;
@@ -198,15 +221,22 @@ export component MainWindow inherits Window {
             }
 
             seek := SeekBar {
-                x: 208px;
+                x: 188px + root.live-room;
                 y: (parent.height - 18px) / 2;
-                width: parent.width - 208px - 90px - 40px - 110px;
+                width: parent.width - (188px + root.live-room) - 90px - 40px - 110px;
                 height: 18px;
                 value: root.position;
                 maximum: root.duration;
                 moved(value) => {
                     root.seek-requested(value);
                 }
+            }
+
+            VolumeIcon {
+                x: parent.width - 40px - 90px - 20px - 22px;
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
             }
 
             volume := SeekBar {
@@ -226,6 +256,7 @@ export component MainWindow inherits Window {
                 y: (parent.height - 32px) / 2;
                 width: 40px;
                 height: 32px;
+                fullscreen: root.fullscreen;
                 clicked => {
                     root.fullscreen-toggled();
                 }

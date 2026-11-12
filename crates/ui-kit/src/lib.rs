@@ -133,6 +133,7 @@ impl PlayerUi {
         let fullscreen = !self.fullscreen.get();
         self.fullscreen.set(fullscreen);
         self.window.window().set_fullscreen(fullscreen);
+        self.window.set_fullscreen(fullscreen);
     }
 
     // ------------------------------------------------------------- state --
@@ -198,6 +199,18 @@ impl PlayerUi {
         self.window.set_time_text(text.into());
     }
 
+    /// Whether the media that plays is a live stream.
+    ///
+    /// The live button is only shown while this is true.
+    pub fn set_live(&self, live: bool) {
+        self.window.set_live(live);
+    }
+
+    /// Whether the playback is at the live edge of a live stream.
+    pub fn set_at_live_edge(&self, at_edge: bool) {
+        self.window.set_at_live_edge(at_edge);
+    }
+
     // ------------------------------------------------------------ events --
 
     /// Called when the user asks for the URL to be loaded.
@@ -233,5 +246,10 @@ impl PlayerUi {
     /// Called when the user toggles full screen.
     pub fn on_fullscreen_toggled(&self, handler: impl Fn() + 'static) {
         self.window.on_fullscreen_toggled(handler);
+    }
+
+    /// Called when the user asks to go back to the live edge.
+    pub fn on_live_pressed(&self, handler: impl Fn() + 'static) {
+        self.window.on_live_requested(handler);
     }
 }

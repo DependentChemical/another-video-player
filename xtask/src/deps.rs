@@ -58,6 +58,22 @@ pub fn mpv_library_dir() -> Option<PathBuf> {
     directory.is_dir().then_some(directory)
 }
 
+/// The version of the project.
+///
+/// `version.txt` is the reference: the release workflow reads it to name the
+/// tag and the release, and the build puts it into the archive.
+pub fn version() -> Result<String, String> {
+    let file = workspace_root().join("version.txt");
+    let text = std::fs::read_to_string(&file).map_err(|error| {
+        format!("the version could not be read from {}: {error}", file.display())
+    })?;
+    let version = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
+    if version.is_empty() {
+        return Err(format!("{} is empty", file.display()));
+    }
+    Ok(version.to_string())
+}
+
 /// Prepares every external dependency.
 pub fn setup() -> Result<(), String> {
     #[cfg(windows)]

@@ -13,3 +13,5 @@ slint = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }
+ttf-parser = { workspace = true }
+ureq = { workspace = true }

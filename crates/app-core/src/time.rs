@@ -1,5 +1,7 @@
 //! Formatting helpers for the user interface.
 
+use crate::timeline::Timeline;
+
 /// Formats a number of seconds as `m:ss`, or `h:mm:ss` for long media.
 pub fn format_time(seconds: f64) -> String {
     if !seconds.is_finite() || seconds <= 0.0 {
@@ -16,9 +18,25 @@ pub fn format_time(seconds: f64) -> String {
     }
 }
 
+/// Formats the time axis for the user.
+///
+/// A recorded media shows the position and the duration. A live stream shows
+/// `LIVE` while the playback is at the edge, and how far behind the edge it
+/// is otherwise.
+pub fn format_timeline(timeline: &Timeline) -> String {
+    if !timeline.live {
+        return format!("{} / {}", format_time(timeline.position), format_time(timeline.duration));
+    }
+    if timeline.behind <= 1.0 {
+        return "LIVE".to_string();
+    }
+    format!("-{}", format_time(timeline.behind))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_time;
+    use super::{format_time, format_timeline};
+    use crate::timeline::Timeline;
 
     #[test]
     fn short_media_uses_minutes_and_seconds() {
@@ -36,5 +54,23 @@ mod tests {
     fn nonsense_becomes_zero() {
         assert_eq!(format_time(-5.0), "0:00");
         assert_eq!(format_time(f64::NAN), "0:00");
+    }
+
+    #[test]
+    fn a_recorded_media_shows_position_and_duration() {
+        let timeline = Timeline::recorded(65.0, 300.0);
+        assert_eq!(format_timeline(&timeline), "1:05 / 5:00");
+    }
+
+    #[test]
+    fn a_live_stream_at_the_edge_says_live() {
+        let timeline = Timeline { live: true, position: 300.0, duration: 300.0, behind: 0.0 };
+        assert_eq!(format_timeline(&timeline), "LIVE");
+    }
+
+    #[test]
+    fn a_live_stream_behind_the_edge_shows_the_distance() {
+        let timeline = Timeline { live: true, position: 240.0, duration: 300.0, behind: 60.0 };
+        assert_eq!(format_timeline(&timeline), "-1:00");
     }
 }

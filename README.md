@@ -18,6 +18,9 @@ a control bar that floats over the picture.
   offers, plus *Best* for the highest bitrate.
 - **Combines separate video and audio tracks.** When a site only offers split
   streams, the video-only and audio-only formats are joined into one playback.
+- **Plays live streams.** A live stream opens at the live edge. Dragging the
+  seek bar backwards moves through the window the site still serves, and the
+  **LIVE** button jumps back to the newest frame.
 - **Keeps its own `yt-dlp` up to date.** The first start downloads a private
   copy of `yt-dlp`; every later start checks GitHub for a newer release and
   swaps it in the background. A failed check never blocks the player.
@@ -49,9 +52,16 @@ mode and collects a runnable player in `dist/`:
 
 ```
 dist/
-├── flatline.exe     the player
-└── libmpv-2.dll     the mpv runtime it needs
+├── flatline.exe          the player
+├── libmpv-2.dll          the mpv runtime it needs
+├── tools/
+│   └── yt-dlp.exe        the resolver the player keeps up to date
+└── version.txt           the version of this build
 ```
+
+The release archive is the same folder as a `.zip`, named after the platform
+and the version in `version.txt` (for example
+`flatline-0.0.1-windows-x64.zip`).
 
 For day-to-day work the debug build is faster:
 
@@ -63,6 +73,18 @@ cargo xtask build --debug    # or just: cargo build --workspace
 `.cargo/config.toml`. `cargo run -p xtask -- build` does the same thing if you
 prefer to spell it out.
 
+## Releases
+
+The version lives in `version.txt`; the workspace version in `Cargo.toml` has
+to match it, and a test keeps the two in step. The **Build** workflow runs the
+tests and packages the Windows and Linux archives on every push to `main`.
+
+When a build on `main` succeeds, the **Release** workflow publishes a GitHub
+release named `v<version>` with both archives attached. It reads the version
+from `version.txt` at the commit that was built, uses the commit message as the
+release notes and does nothing when the tag already exists. To cut a release,
+bump `version.txt` and `Cargo.toml` together and push.
+
 ## Run
 
 ```sh
@@ -70,9 +92,12 @@ cargo run -p app-core                       # an empty player
 cargo run -p app-core -- "https://youtu.be/…"   # opens and loads right away
 ```
 
-The first start downloads `yt-dlp` into the per-user application directory
-(`%LOCALAPPDATA%\Flatline\tools` on Windows, `~/.local/share/flatline/tools`
-on Linux) and reports what it found on the console.
+The first start downloads `yt-dlp` into the `tools` folder next to the
+executable. When that folder is not writable — a system-wide installation, for
+instance — Flatline falls back to its per-user directory
+(`%LOCALAPPDATA%\Flatline\tools` on Windows,
+`~/.local/share/flatline/tools` on Linux). Diagnostics are appended to
+`flatline.log` in the same root.
 
 ### Using the player
 
@@ -85,6 +110,8 @@ on Linux) and reports what it found on the console.
 4. The control bar at the bottom has play/pause, a seek bar with the current
    position and duration, a volume slider and a fullscreen button. Double
    clicking the video area toggles fullscreen as well.
+5. On a live stream the control bar shows a **LIVE** button. Seeking backwards
+   fills the bar up to the live edge, and the button returns to it.
 
 ## How it is put together
 

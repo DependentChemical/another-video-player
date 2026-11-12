@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         "build" => build(&rest),
         "setup" => deps::setup(),
         "isolation" => isolation::check(),
-        "package" => package::package(),
+        "package" => package_only(),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -39,6 +39,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Collects the player in an archive.
+fn package_only() -> Result<(), String> {
+    let archive = package::package()?;
+    println!("xtask: the player is ready in {}", archive.display());
+    Ok(())
 }
 
 /// Builds the whole workspace.
@@ -66,7 +73,8 @@ fn build(arguments: &[String]) -> Result<(), String> {
     }
 
     if release {
-        package::package()?;
+        let archive = package::package()?;
+        println!("xtask: the player is ready in {}", archive.display());
     }
     Ok(())
 }

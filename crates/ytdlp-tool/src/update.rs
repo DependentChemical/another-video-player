@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::Error;
 use crate::locate::{ToolPaths, YtDlp};
+use crate::platform::Platform;
 use crate::version::is_newer;
 
 /// Where the newest release is announced.
@@ -55,7 +56,12 @@ pub struct Asset {
 impl Release {
     /// The artifact that matches the current platform.
     pub fn asset_for_platform(&self) -> Option<&Asset> {
-        let wanted = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+        self.asset_for(Platform::current())
+    }
+
+    /// The artifact that matches the given platform.
+    pub fn asset_for(&self, platform: Platform) -> Option<&Asset> {
+        let wanted = platform.ytdlp_asset();
         self.assets.iter().find(|asset| asset.name == wanted)
     }
 }
@@ -99,6 +105,20 @@ pub fn install_latest(paths: &ToolPaths) -> Result<std::path::PathBuf, Error> {
     let destination = paths.managed_binary();
     download(&asset.browser_download_url, &destination)?;
     Ok(destination)
+}
+
+/// Downloads the newest published release for another platform.
+///
+/// The build uses this to put a `yt-dlp` next to the player it packages, so
+/// that the folder works without a network connection.
+pub fn download_for_platform(
+    platform: Platform,
+    destination: &Path,
+) -> Result<std::path::PathBuf, Error> {
+    let release = latest_release()?;
+    let asset = release.asset_for(platform).ok_or(Error::UnsupportedPlatform)?;
+    download(&asset.browser_download_url, destination)?;
+    Ok(destination.to_path_buf())
 }
 
 /// Asks GitHub for the newest published release.

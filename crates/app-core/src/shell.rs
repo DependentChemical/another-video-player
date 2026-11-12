@@ -80,6 +80,10 @@ impl Shell {
             ui.on_volume(move |volume| app.set_volume(volume));
         }
         {
+            let app = Arc::clone(&app);
+            ui.on_live_pressed(move || app.go_live());
+        }
+        {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
@@ -105,6 +109,7 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        self.ui.set_url(url);
         self.ui.set_status("Resolving…", StatusKind::Busy);
         self.app.load(url.to_string());
     }
@@ -125,6 +130,7 @@ fn tick(ui: &PlayerUi, app: &App) {
                 ui.set_quality_options(&loaded.qualities);
                 ui.set_selected_quality(app.selected_quality() as i32);
                 ui.set_has_media(true);
+                ui.set_live(loaded.is_live);
                 ui.set_status("", StatusKind::Info);
                 if let Some(duration) = loaded.duration {
                     ui.set_duration(duration);
@@ -153,24 +159,25 @@ fn tick(ui: &PlayerUi, app: &App) {
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {
-                    eprintln!("flatline: mpv: {text}");
+                    crate::diag::note(&format!("mpv: {text}"));
                 }
             }
             EngineEvent::Shutdown => {}
         }
     }
 
-    let engine = app.engine();
-    let position = engine.position();
-    let duration = engine.duration();
-    ui.set_position(position);
-    ui.set_duration(duration);
-    ui.set_time_text(&format!(
-        "{} / {}",
-        crate::time::format_time(position),
-        crate::time::format_time(duration)
-    ));
-    ui.set_playing(!engine.is_idle() && !engine.is_paused());
+    // The time axis of a live stream is the window behind the live edge, so
+    // the interface always shows the same kind of position.
+    let timeline = app.timeline();
+    ui.set_position(timeline.position);
+    ui.set_duration(timeline.duration);
+    ui.set_time_text(&crate::time::format_timeline(&timeline));
+    ui.set_at_live_edge(timeline.live && timeline.behind <= 1.0);
+    ui.set_playing(!app.engine().is_idle() && !app.engine().is_paused());
+
+    // The volume is read back from the player, so the slider shows what the
+    // player really uses and not only what was asked for.
+    ui.set_volume(app.engine().volume());
 }
 
 /// Everything that can go wrong while building the window.

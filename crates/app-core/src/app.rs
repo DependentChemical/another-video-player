@@ -15,6 +15,7 @@ use ui_kit::QualityOption;
 use ytdlp_tool::YtDlp;
 
 use crate::paths::AppPaths;
+use crate::timeline::{LiveAxis, Timeline};
 
 /// Something the background work wants to tell the user interface.
 #[derive(Debug, Clone)]
@@ -36,6 +37,8 @@ pub struct Loaded {
     pub duration: Option<f64>,
     /// The qualities the user can pick from.
     pub qualities: Vec<QualityOption>,
+    /// Whether the media is a live stream.
+    pub is_live: bool,
 }
 
 /// The state of the loaded media.
@@ -44,6 +47,7 @@ struct State {
     source: Option<MediaSource>,
     qualities: Vec<QualityOption>,
     selected: usize,
+    is_live: bool,
 }
 
 /// The application, without a user interface.
@@ -54,6 +58,8 @@ pub struct App {
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
     inbox: Mutex<Receiver<Box<Message>>>,
     state: Mutex<State>,
+    /// The time axis of a live stream.
+    live: Mutex<LiveAxis>,
 }
 
 impl App {
@@ -75,6 +81,7 @@ impl App {
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
             state: Mutex::new(State::default()),
+            live: Mutex::new(LiveAxis::new()),
         })
     }
 
@@ -109,6 +116,7 @@ impl App {
             title: source.title.clone(),
             duration: source.duration,
             qualities: qualities.clone(),
+            is_live: source.is_live,
         };
 
         {
@@ -116,7 +124,9 @@ impl App {
             state.source = Some(source);
             state.qualities = qualities;
             state.selected = 0;
+            state.is_live = loaded.is_live;
         }
+        self.live.lock().expect("the live axis is not poisoned").reset();
 
         if let Err(error) = self.apply_quality(0) {
             self.report(error);
@@ -152,9 +162,61 @@ impl App {
     }
 
     /// Jumps to a position in seconds.
+    ///
+    /// The position is the one the interface shows. For a live stream that is
+    /// a position inside the shown window, not a position in the stream.
     pub fn seek(&self, seconds: f64) {
-        if let Err(error) = self.engine.seek(seconds) {
+        let target = if self.is_live() {
+            let mut live = self.live.lock().expect("the live axis is not poisoned");
+            live.anchor();
+            live.to_stream(seconds)
+        } else {
+            seconds
+        };
+        if let Err(error) = self.engine.seek(target) {
             self.report(error.to_string());
+        }
+    }
+
+    /// Jumps back by a number of seconds.
+    ///
+    /// This is the fast replay of a live stream.
+    pub fn seek_back(&self, seconds: f64) {
+        if let Err(error) = self.engine.seek_relative(-seconds.abs()) {
+            self.report(error.to_string());
+        }
+    }
+
+    /// Jumps back to the live edge of a live stream.
+    pub fn go_live(&self) {
+        if !self.is_live() {
+            return;
+        }
+        match self.engine.seek_to_live_edge() {
+            Ok(()) => {
+                // The window starts again at the new edge, so the handle sits
+                // at the right hand end on the next tick.
+                self.live.lock().expect("the live axis is not poisoned").reset();
+            }
+            Err(error) => self.report(error.to_string()),
+        }
+    }
+
+    /// Whether the media that is playing is a live stream.
+    pub fn is_live(&self) -> bool {
+        self.state.lock().expect("the state is not poisoned").is_live
+    }
+
+    /// The time axis that is shown to the user.
+    pub fn timeline(&self) -> Timeline {
+        let position = self.engine.position();
+        let duration = self.engine.duration();
+        if self.is_live() {
+            let mut live = self.live.lock().expect("the live axis is not poisoned");
+            live.sync(position);
+            live.timeline(position)
+        } else {
+            Timeline::recorded(position, duration)
         }
     }
 
@@ -188,10 +250,10 @@ impl App {
                     });
                 }
                 Ok(outcome) => {
-                    eprintln!("flatline: yt-dlp {} is up to date", outcome.current);
+                    crate::diag::note(&format!("yt-dlp {} is up to date", outcome.current));
                 }
                 Err(error) => {
-                    eprintln!("flatline: the yt-dlp update check failed: {error}");
+                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"));
                 }
             }
         });

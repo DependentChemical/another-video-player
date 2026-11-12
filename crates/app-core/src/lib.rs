@@ -11,21 +11,28 @@
 //! this workspace follows.
 
 pub mod app;
+pub mod diag;
 pub mod paths;
 pub mod shell;
 pub mod time;
+pub mod timeline;
 
 use std::sync::Arc;
 
 pub use app::{App, Loaded, Message};
 pub use paths::AppPaths;
 pub use shell::Shell;
+pub use timeline::{LIVE_WINDOW, LiveAxis, Timeline};
+
+/// The version of Flatline, taken from `version.txt` when it was built.
+pub const VERSION: &str = env!("FLATLINE_VERSION");
 
 /// Starts the player.
 ///
 /// When a URL is given, it is loaded right away.
 pub fn run(url: Option<&str>) -> Result<(), Error> {
     let paths = AppPaths::discover();
+    diag::init(&paths.log_file());
     paths.ensure().map_err(|error| Error::Tools(error.to_string()))?;
 
     let tools = paths.tool_paths();
@@ -50,7 +57,7 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
 
 /// Downloads `yt-dlp` when it is not installed yet.
 fn install_ytdlp(tools: &ytdlp_tool::ToolPaths) -> Result<ytdlp_tool::YtDlp, Error> {
-    eprintln!("flatline: yt-dlp is not installed, downloading it");
+    diag::note("yt-dlp is not installed, downloading it");
     let path = ytdlp_tool::update::install_latest(tools)
         .map_err(|error| Error::Tools(format!("yt-dlp could not be installed: {error}")))?;
     Ok(ytdlp_tool::locate::at(path))
@@ -96,5 +103,25 @@ impl From<app::Error> for Error {
 impl From<shell::Error> for Error {
     fn from(value: shell::Error) -> Self {
         Error::Shell(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The version file is the reference for the version of the project.
+    ///
+    /// Cargo needs a version of its own, so this test keeps the two in step.
+    #[test]
+    fn the_version_file_matches_the_crate_version() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../version.txt")
+            .canonicalize()
+            .expect("version.txt exists");
+        let text = std::fs::read_to_string(&file).expect("version.txt can be read");
+        let version = text.trim();
+
+        assert!(!version.is_empty(), "version.txt is empty");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"), "version.txt and Cargo.toml do not agree");
+        assert_eq!(version, crate::VERSION);
     }
 }

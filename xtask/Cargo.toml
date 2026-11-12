@@ -13,3 +13,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }
 sevenz-rust2 = "0.25"
+ytdlp-tool = { workspace = true }
+zip = { workspace = true }

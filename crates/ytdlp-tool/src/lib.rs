@@ -12,12 +12,14 @@
 //! [`YtDlp`] hides that difference behind [`YtDlp::command`].
 
 pub mod locate;
+pub mod platform;
 pub mod update;
 pub mod version;
 
 use std::fmt;
 
 pub use locate::{ToolPaths, YtDlp};
+pub use platform::Platform;
 pub use update::UpdateOutcome;
 
 /// Everything that can go wrong while managing the `yt-dlp` executable.
