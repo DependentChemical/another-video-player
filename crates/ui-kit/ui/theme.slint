@@ -1,0 +1,30 @@
+// The colour palette and the metrics of the player.
+//
+// A global component is visible to every file that imports it, which keeps
+// the colours in one place without threading a theme through every widget.
+
+export global Theme {
+    // Window background, used while no media is loaded.
+    out property <color> bg: #14161a;
+    // Background of the bars.
+    out property <color> panel: #1b1e25;
+    // Background of input fields and raised surfaces.
+    out property <color> elevated: #262a33;
+    // Border colour of surfaces.
+    out property <color> border: #333947;
+    // Primary text.
+    out property <color> fg: #e7e9ee;
+    // Secondary text.
+    out property <color> muted: #9299a6;
+    // Accent colour.
+    out property <color> accent: #4c8bf5;
+    // Text on the accent colour.
+    out property <color> on-accent: #ffffff;
+    // Colour of error messages.
+    out property <color> danger: #e5534b;
+
+    // Height of the top bar.
+    out property <length> bar-height: 52px;
+    // Height of the control bar at the bottom of the video.
+    out property <length> controls-height: 56px;
+}

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/app-core",
+    "crates/media-model",
+    "crates/playback-engine",
+    "crates/storyboard",
+    "crates/stream-resolver",
+    "crates/ui-kit",
+    "crates/video-surface",
+    "crates/ytdlp-tool",
+    "xtask",
+]
+# `cargo run` / `cargo build` at the workspace root operate on the primary crate.
+default-members = ["crates/app-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+authors = ["Flatline contributors"]
+
+[workspace.dependencies]
+# --- internal crates (see AGENTS.md "Crate isolation") -------------------------
+app-core = { path = "crates/app-core" }
+media-model = { path = "crates/media-model" }
+playback-engine = { path = "crates/playback-engine" }
+storyboard = { path = "crates/storyboard" }
+stream-resolver = { path = "crates/stream-resolver" }
+ui-kit = { path = "crates/ui-kit" }
+video-surface = { path = "crates/video-surface" }
+ytdlp-tool = { path = "crates/ytdlp-tool" }
+
+# --- external crates ---------------------------------------------------------
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "backend-winit",
+    "renderer-femtovg",
+    "unstable-winit-030",
+    "accessibility",
+] }
+slint-build = "1.18"
+rsmpv = { version = "0.2.1", features = ["render"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

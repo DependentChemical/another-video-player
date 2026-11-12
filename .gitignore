@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Flatline managed runtime state (downloaded yt-dlp, thumbnails, config)
+.flatline/
+
+# Build output of `cargo xtask package`
+/dist/
+
+# Research material and scratch files (reference projects, screenshots, logs)
+/.ref/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

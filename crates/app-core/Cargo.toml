@@ -1,0 +1,28 @@
+[package]
+name = "app-core"
+description = "Flatline: the composition root and application shell for the video player."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 3: the composition root. The only crate that wires capabilities together.
+[dependencies]
+media-model = { workspace = true }
+playback-engine = { workspace = true }
+storyboard = { workspace = true }
+stream-resolver = { workspace = true }
+ui-kit = { workspace = true }
+video-surface = { workspace = true }
+ytdlp-tool = { workspace = true }
+slint = { workspace = true }
+tokio = { workspace = true }
+
+[[bin]]
+name = "flatline"
+path = "src/main.rs"
+
+[lib]
+name = "app_core"
+path = "src/lib.rs"

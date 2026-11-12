@@ -1,0 +1,12 @@
+[package]
+name = "media-model"
+description = "Shared vocabulary for Flatline: media sources, stream catalogs and quality selection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 0 of the isolation ladder: pure vocabulary, no internal dependencies.
+[dependencies]
+serde = { workspace = true }

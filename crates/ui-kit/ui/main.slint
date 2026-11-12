@@ -1,0 +1,277 @@
+import { Theme } from "theme.slint";
+import { ChevronIcon, FlatButton, FullscreenButton, PlayPauseButton, SeekBar } from "widgets.slint";
+
+// The shell of the player: a URL bar on top, the video below it.
+//
+// The video itself is *not* drawn here. mpv draws it into the lower part of
+// the window before Slint renders this scene, and every part of the scene
+// that stays transparent lets that frame through.
+export component MainWindow inherits Window {
+    title: root.has-media ? root.media-title + " — Flatline" : "Flatline";
+    preferred-width: 1100px;
+    preferred-height: 680px;
+    min-width: 560px;
+    min-height: 340px;
+    background: root.has-media ? transparent : Theme.bg;
+    default-font-family: "Segoe UI";
+    default-font-size: 13px;
+
+    // ------------------------------------------------------------- state --
+    in-out property <string> url: "";
+    in property <string> media-title: "";
+    in property <string> status: "";
+    // "info", "busy" or "error".
+    in property <string> status-kind: "info";
+    in property <[string]> quality-labels: [];
+    in property <int> quality-index: -1;
+    in property <bool> has-media: false;
+    in property <bool> playing: false;
+    in property <float> position: 0;
+    in property <float> duration: 0;
+    in property <float> volume: 100;
+    // The playback position, formatted for the user.
+    in property <string> time-text: "0:00 / 0:00";
+
+    // ------------------------------------------------------------ events --
+    callback load-requested();
+    callback quality-selected(int);
+    callback play-toggled();
+    callback seek-requested(float);
+    callback volume-requested(float);
+    callback fullscreen-toggled();
+
+    // --------------------------------------------------------- internals --
+    private property <bool> quality-menu-open: false;
+
+    // The height of the top bar, so that the host knows how much of the
+    // window the video may use.
+    out property <length> top-bar-height: Theme.bar-height;
+
+    out property <string> quality-text: root.quality-labels.length > 0
+        ? root.quality-labels[root.quality-index < 0 ? 0 : root.quality-index]
+        : "Quality";
+
+    // --------------------------------------------------------- top bar ----
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: Theme.bar-height;
+        background: Theme.panel;
+
+        Text {
+            x: 16px;
+            width: 72px;
+            text: "Flatline";
+            color: Theme.fg;
+            font-size: 15px;
+            vertical-alignment: center;
+        }
+
+        url-field := Rectangle {
+            x: 96px;
+            y: (parent.height - 32px) / 2;
+            width: parent.width - 96px - 132px - 76px - 40px;
+            height: 32px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: url-input.has-focus ? Theme.accent : Theme.border;
+            background: Theme.elevated;
+
+            url-placeholder := Text {
+                x: 10px;
+                text: "Paste a video URL and press Enter";
+                color: Theme.muted;
+                font-size: 13px;
+                vertical-alignment: center;
+                visible: url-input.text == "";
+            }
+
+            url-input := TextInput {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                text <=> root.url;
+                color: Theme.fg;
+                font-size: 13px;
+                accepted => {
+                    root.load-requested();
+                }
+            }
+        }
+
+        quality-button := Rectangle {
+            x: parent.width - 132px - 76px - 40px;
+            y: (parent.height - 32px) / 2;
+            width: 132px;
+            height: 32px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: quality-touch.pressed ? Theme.elevated : Theme.panel;
+
+            Text {
+                x: 10px;
+                width: parent.width - 30px;
+                text: root.quality-text;
+                color: Theme.fg;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            ChevronIcon {
+                x: parent.width - 18px;
+                y: (parent.height - self.height) / 2 + 2px;
+            }
+
+            quality-touch := TouchArea {
+                clicked => {
+                    root.quality-menu-open = !root.quality-menu-open;
+                }
+            }
+        }
+
+        load-button := FlatButton {
+            x: parent.width - 76px - 16px;
+            y: (parent.height - 32px) / 2;
+            width: 76px;
+            height: 32px;
+            label: "Load";
+            primary: true;
+            clicked => {
+                root.load-requested();
+            }
+        }
+    }
+
+    // ------------------------------------------------------- video area ----
+    Rectangle {
+        x: 0px;
+        y: Theme.bar-height;
+        width: parent.width;
+        height: parent.height - Theme.bar-height;
+        background: transparent;
+
+        // A centred message, used for errors and for hints.
+        Rectangle {
+            x: 0px;
+            y: (parent.height - 48px) / 2;
+            width: parent.width;
+            height: 48px;
+
+            Text {
+                width: parent.width;
+                text: root.status;
+                color: root.status-kind == "error" ? Theme.danger : Theme.muted;
+                font-size: 14px;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        // The control bar, floating over the video.
+        Rectangle {
+            x: 0px;
+            y: parent.height - Theme.controls-height;
+            width: parent.width;
+            height: Theme.controls-height;
+            background: #000000a6;
+
+            PlayPauseButton {
+                x: 12px;
+                y: (parent.height - 32px) / 2;
+                width: 44px;
+                height: 32px;
+                playing: root.playing;
+                clicked => {
+                    root.play-toggled();
+                }
+            }
+
+            Text {
+                x: 68px;
+                width: 130px;
+                text: root.time-text;
+                color: Theme.fg;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+
+            seek := SeekBar {
+                x: 208px;
+                y: (parent.height - 18px) / 2;
+                width: parent.width - 208px - 90px - 40px - 110px;
+                height: 18px;
+                value: root.position;
+                maximum: root.duration;
+                moved(value) => {
+                    root.seek-requested(value);
+                }
+            }
+
+            volume := SeekBar {
+                x: parent.width - 40px - 90px - 20px;
+                y: (parent.height - 18px) / 2;
+                width: 90px;
+                height: 18px;
+                value: root.volume;
+                maximum: 100;
+                moved(value) => {
+                    root.volume-requested(value);
+                }
+            }
+
+            FullscreenButton {
+                x: parent.width - 40px - 12px;
+                y: (parent.height - 32px) / 2;
+                width: 40px;
+                height: 32px;
+                clicked => {
+                    root.fullscreen-toggled();
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------- quality menu ----
+    Rectangle {
+        visible: root.quality-menu-open;
+        x: quality-button.x;
+        y: Theme.bar-height;
+        width: 160px;
+        height: root.quality-labels.length * 32px + 8px;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.border;
+        border-radius: 6px;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000a0;
+
+        VerticalLayout {
+            padding: 4px;
+            spacing: 0;
+
+            for label[index] in root.quality-labels: Rectangle {
+                height: 32px;
+                background: item-touch.pressed ? Theme.elevated : transparent;
+                border-radius: 4px;
+
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    text: label;
+                    color: index == root.quality-index ? Theme.accent : Theme.fg;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                item-touch := TouchArea {
+                    clicked => {
+                        root.quality-selected(index);
+                        root.quality-menu-open = false;
+                    }
+                }
+            }
+        }
+    }
+}

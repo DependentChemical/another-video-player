@@ -1,0 +1,13 @@
+[package]
+name = "video-surface"
+description = "Binds the mpv render context into a Slint OpenGL underlay."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 2 adapter: the single sanctioned link between two capabilities.
+[dependencies]
+playback-engine = { workspace = true }
+slint = { workspace = true }

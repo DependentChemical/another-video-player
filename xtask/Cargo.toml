@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Build orchestration for Flatline: dependency provisioning, workspace build and packaging."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+sevenz-rust2 = "0.25"

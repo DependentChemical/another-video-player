@@ -1,0 +1,13 @@
+# `cargo xtask <command>` is the single entry point of this repository.
+# It is an alias for the `xtask` crate that lives in this workspace.
+[alias]
+xtask = "run -p xtask --"
+
+# The mpv library is downloaded by `cargo xtask setup` and unpacked here.
+# The path is relative to this file, so it works no matter where cargo is
+# started from.
+#
+# The variable is only set when it is not already set, so a system wide
+# installation of libmpv always wins.
+[env]
+MPV_LIBRARY_DIR = { value = ".flatline/deps/mpv/lib", relative = true, force = false }

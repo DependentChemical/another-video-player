@@ -1,0 +1,176 @@
+import { Theme } from "theme.slint";
+
+// A flat button with a text label.
+export component FlatButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.primary ? Theme.accent : Theme.border;
+    background: root.primary ? Theme.accent : (touch.pressed ? Theme.elevated : Theme.panel);
+    opacity: root.enabled ? 1 : 0.45;
+
+    Text {
+        text: root.label;
+        color: root.primary ? Theme.on-accent : Theme.fg;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The triangle that marks the play button.
+export component PlayIcon inherits Path {
+    commands: "M 15 0 L 100 50 L 15 100 Z";
+    fill: Theme.fg;
+    width: 13px;
+    height: 13px;
+}
+
+// The two bars that mark the pause button.
+export component PauseIcon inherits Path {
+    commands: "M 15 0 L 40 0 L 40 100 L 15 100 Z M 60 0 L 85 0 L 85 100 L 60 100 Z";
+    fill: Theme.fg;
+    width: 13px;
+    height: 13px;
+}
+
+// A small triangle that points down.
+export component ChevronIcon inherits Path {
+    commands: "M 0 0 L 100 0 L 50 100 Z";
+    fill: Theme.muted;
+    width: 10px;
+    height: 10px;
+}
+
+// The four corners that mark the full screen button.
+export component FullscreenIcon inherits Path {
+    commands: "M 0 0 L 0 28 M 0 0 L 28 0 M 72 0 L 100 0 L 100 28 M 100 72 L 100 100 L 72 100 M 28 100 L 0 100 L 0 72";
+    stroke: Theme.fg;
+    stroke-width: 2px;
+    width: 14px;
+    height: 14px;
+}
+
+// The button that starts and stops the playback.
+export component PlayPauseButton inherits Rectangle {
+    in property <bool> playing: false;
+    callback clicked();
+
+    width: 44px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: touch.pressed ? Theme.elevated : Theme.panel;
+
+    icon := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 13px;
+        height: 13px;
+        background: transparent;
+
+        if !root.playing: PlayIcon {
+            x: 0px;
+            y: 0px;
+        }
+        if root.playing: PauseIcon {
+            x: 0px;
+            y: 0px;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The button that switches between windowed and full screen.
+export component FullscreenButton inherits Rectangle {
+    callback clicked();
+
+    width: 40px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: touch.pressed ? Theme.elevated : Theme.panel;
+
+    FullscreenIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// A horizontal slider.
+//
+// The slider reports the position the user picked through the `moved`
+// callback; the caller decides what to do with it.
+export component SeekBar inherits Rectangle {
+    in property <float> value: 0;
+    in property <float> maximum: 1;
+    in property <bool> interactive: true;
+    callback moved(float);
+
+    height: 18px;
+
+    track := Rectangle {
+        y: parent.height / 2 - 2px;
+        width: parent.width;
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.border;
+    }
+
+    fill := Rectangle {
+        y: parent.height / 2 - 2px;
+        width: parent.width * root.ratio;
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+
+    knob := Rectangle {
+        x: parent.width * root.ratio - 6px;
+        y: parent.height / 2 - 6px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: Theme.accent;
+        visible: root.interactive;
+    }
+
+    area := TouchArea {
+        enabled: root.interactive;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.moved(area.mouse-x * root.maximum / root.width);
+            }
+        }
+        moved => {
+            root.moved(area.mouse-x * root.maximum / root.width);
+        }
+    }
+
+    // The position of the handle, between 0 and 1.
+    out property <float> ratio: root.maximum > 0 ? root.value / root.maximum : 0;
+}

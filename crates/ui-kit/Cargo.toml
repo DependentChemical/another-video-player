@@ -1,0 +1,15 @@
+[package]
+name = "ui-kit"
+description = "Slint component library for the Flatline player shell."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1: standalone capability. Knows nothing about any other Flatline crate.
+[dependencies]
+slint = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }
