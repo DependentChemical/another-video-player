@@ -87,7 +87,10 @@ tests and packages the Windows and Linux archives on every push to `main`.
 When a build on `main` succeeds, the **Release** workflow publishes a GitHub
 release named `v<version>` with both archives attached. It reads the version
 from `version.txt` at the commit that was built, uses the commit message as the
-release notes and does nothing when the tag already exists. To cut a release,
+release notes and does nothing when the tag already exists. The release only
+runs when every test and both platform builds of the **Build** workflow
+passed. Each release also moves the floating `latest` tag to the release
+commit, so `latest` always points at the newest release. To cut a release,
 bump `version.txt` and `Cargo.toml` together and push.
 
 ## Run
