@@ -46,6 +46,8 @@ pub enum EndReason {
 /// Something the player reported.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
+    /// The player began loading a new file.
+    StartFile,
     /// A file finished loading and decoding started.
     FileLoaded,
     /// Playback of a file ended.
@@ -272,6 +274,22 @@ impl Engine {
         self.core.get_property::<bool>("idle").unwrap_or(true)
     }
 
+    /// Whether the player is decoding and drawing frames right now.
+    ///
+    /// The value stays false while a file is still being opened, while the
+    /// player waits for data and while playback is paused.
+    pub fn is_active(&self) -> bool {
+        !self.core.get_property::<bool>("core-idle").unwrap_or(true)
+    }
+
+    /// Whether playback has to wait for data.
+    ///
+    /// mpv raises this flag when the network cannot feed the player fast
+    /// enough, which is the moment the interface shows its loading dots.
+    pub fn is_buffering(&self) -> bool {
+        self.core.get_property::<bool>("paused-for-cache").unwrap_or(false)
+    }
+
     /// The current volume.
     pub fn volume(&self) -> f64 {
         self.core.get_property::<f64>("volume").unwrap_or(100.0)
@@ -286,6 +304,7 @@ impl Engine {
     pub fn poll_event(&self) -> Option<EngineEvent> {
         let event = self.core.poll_event()?;
         Some(match event {
+            rsmpv::Event::StartFile { .. } => EngineEvent::StartFile,
             rsmpv::Event::FileLoaded => EngineEvent::FileLoaded,
             rsmpv::Event::EndFile { reason, error, .. } => EngineEvent::EndFile {
                 reason: match reason {
@@ -391,6 +410,15 @@ mod tests {
         };
         assert!(engine.is_idle());
         assert_eq!(engine.duration(), 0.0);
+    }
+
+    #[test]
+    fn a_new_engine_is_neither_active_nor_buffering() {
+        let Ok(engine) = Engine::new() else {
+            return;
+        };
+        assert!(!engine.is_active());
+        assert!(!engine.is_buffering());
     }
 
     #[test]
