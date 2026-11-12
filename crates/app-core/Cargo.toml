@@ -19,6 +19,9 @@ ytdlp-tool = { workspace = true }
 slint = { workspace = true }
 tokio = { workspace = true }
 
+[build-dependencies]
+winres = "0.1"
+
 [[bin]]
 name = "flatline"
 path = "src/main.rs"
