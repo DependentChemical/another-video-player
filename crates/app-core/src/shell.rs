@@ -39,6 +39,18 @@ impl Shell {
     /// Builds the window and connects it to the application.
     pub fn new(app: Arc<App>) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
+        let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
+            .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
+            .into_rgba8();
+        let icon = slint::winit_030::winit::window::Icon::from_rgba(
+            icon.into_raw(),
+            256,
+            256,
+        )
+        .map_err(|error| Error::Ui(format!("the window icon is invalid: {error}")))?;
+        ui.window()
+            .window()
+            .with_winit_window(|window| window.set_window_icon(Some(icon)));
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let controls_hovered = Rc::new(Cell::new(false));
