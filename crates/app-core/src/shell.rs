@@ -5,7 +5,7 @@
 //! through their own narrow interface, and nothing here knows how any of
 //! them works inside.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use slint::{ComponentHandle, Timer, TimerMode};
 use ui_kit::{PlayerUi, StatusKind};
 
 use crate::app::{App, Message};
+use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
@@ -23,6 +24,7 @@ const TICK: Duration = Duration::from_millis(100);
 pub struct Shell {
     ui: Rc<PlayerUi>,
     app: Arc<App>,
+    loading: Rc<RefCell<Loading>>,
     last_pointer_activity: Rc<Cell<Instant>>,
     /// The timer has to outlive the window, otherwise it stops firing.
     _timer: Timer,
@@ -57,20 +59,24 @@ impl Shell {
         )
         .map_err(|error| Error::Ui(error.to_string()))?;
 
+        let loading = Rc::new(RefCell::new(Loading::new()));
+
         // The interface only ever calls into the application.
         {
             let app = Arc::clone(&app);
-            let status = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
-                status.set_status("Resolving…", StatusKind::Busy);
+                loading.borrow_mut().resolve_started();
                 app.load(url);
             });
         }
         {
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             ui.on_sources_applied(move |video, audio, muxed| {
+                loading.borrow_mut().sources_switching();
                 app.select_sources(video, audio, muxed);
             });
         }
@@ -94,7 +100,7 @@ impl Shell {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
-        let spinner_phase = Rc::new(Cell::new(false));
+        let spinner_step = Rc::new(Cell::new(0u32));
         {
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             ui.on_pointer_activity(move || last_pointer_activity.set(Instant::now()));
@@ -105,12 +111,14 @@ impl Shell {
         {
             let ui = Rc::clone(&ui);
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
-            let spinner_phase = Rc::clone(&spinner_phase);
+            let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
-                tick(&ui, &app);
-                spinner_phase.set(!spinner_phase.get());
-                ui.set_spinner_phase(spinner_phase.get());
+                let mut loading = loading.borrow_mut();
+                tick(&ui, &app, &mut loading);
+                spinner_step.set((spinner_step.get() + 1) % 3);
+                ui.set_spinner_step(spinner_step.get());
                 let visible = ui.has_media()
                     && Instant::now().duration_since(last_pointer_activity.get())
                         < Duration::from_secs(4)
@@ -119,7 +127,7 @@ impl Shell {
             });
         }
 
-        Ok(Shell { ui, app, last_pointer_activity, _timer: timer })
+        Ok(Shell { ui, app, loading, last_pointer_activity, _timer: timer })
     }
 
     /// Shows the window and runs until it is closed.
@@ -132,7 +140,7 @@ impl Shell {
     pub fn load(&self, url: &str) {
         self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
-        self.ui.set_status("Resolving…", StatusKind::Busy);
+        self.loading.borrow_mut().resolve_started();
         self.app.load(url.to_string());
     }
 
@@ -143,7 +151,7 @@ impl Shell {
 }
 
 /// Brings the interface and the player back in sync.
-fn tick(ui: &PlayerUi, app: &App) {
+fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(source)) => {
@@ -157,31 +165,29 @@ fn tick(ui: &PlayerUi, app: &App) {
                 );
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
-                ui.set_status("", StatusKind::Info);
+                loading.resolved();
                 if let Some(duration) = loaded.duration {
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => {
-                ui.set_status(&error, StatusKind::Error);
-            }
+            Message::Resolved(Err(error)) => loading.resolve_failed(error),
             Message::ToolUpdated(path) => {
-                ui.set_status(&format!("yt-dlp was updated ({path})"), StatusKind::Info);
+                if !loading.tool_updated(&path) {
+                    crate::diag::note(&format!("yt-dlp was updated ({path})"));
+                }
             }
-            Message::Problem(text) => {
-                ui.set_status(&text, StatusKind::Error);
-            }
+            Message::Problem(text) => loading.problem(text),
         }
     }
 
     while let Some(event) = app.engine().poll_event() {
         match event {
+            EngineEvent::StartFile => loading.file_started(),
             EngineEvent::FileLoaded => {}
             EngineEvent::EndFile { reason, error } => {
-                if reason == EndReason::Error {
-                    let message = error.unwrap_or_else(|| "playback failed".to_string());
-                    ui.set_status(&message, StatusKind::Error);
-                }
+                let failure = (reason == EndReason::Error)
+                    .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
+                loading.file_ended(failure);
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {
@@ -190,6 +196,13 @@ fn tick(ui: &PlayerUi, app: &App) {
             }
             EngineEvent::Shutdown => {}
         }
+    }
+
+    loading.observe(app.engine().is_active(), app.engine().is_buffering());
+    match loading.status() {
+        loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
+        loading::Status::Info(text) => ui.set_status(text, StatusKind::Info),
+        loading::Status::Error(text) => ui.set_status(text, StatusKind::Error),
     }
 
     // The time axis of a live stream is the window behind the live edge, so

@@ -248,8 +248,10 @@ impl PlayerUi {
     }
 
     /// Advances the loading indicator animation.
-    pub fn set_spinner_phase(&self, phase: bool) {
-        self.window.set_spinner_phase(phase);
+    ///
+    /// The step selects which of the three dots is lit up.
+    pub fn set_spinner_step(&self, step: u32) {
+        self.window.set_spinner_step(step as i32);
     }
 
     /// Whether the source picker is open.

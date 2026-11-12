@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod diag;
+pub mod loading;
 pub mod paths;
 pub mod shell;
 pub mod time;

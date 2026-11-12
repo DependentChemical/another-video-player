@@ -111,8 +111,9 @@ instance — Flatline falls back to its per-user directory
 
 1. Paste a URL into the bar at the top and press <kbd>Enter</kbd>, or press
    **Load**.
-2. While the media is loading, the status line in the middle of the video area
-   says what is happening. Errors are shown in red.
+2. While a URL is being resolved or the player has to wait for data, three
+   dots run above a status line in the middle of the video area. The dots
+   stop once playback runs, and errors are shown in red.
 3. Open the source picker with the gear button (next to the URL bar or on the
    control bar) to mix and match video and audio streams; **Apply** switches
    to the new selection immediately.
