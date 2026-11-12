@@ -451,6 +451,10 @@ export component MainWindow inherits Window {
                 }
 
                 volume-touch := TouchArea {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
                     pointer-event(event) => {
                         if event.kind == PointerEventKind.move { root.pointer-activity(); }
                     }
