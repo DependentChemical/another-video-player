@@ -279,18 +279,20 @@ export component GearButton inherits Rectangle {
 
 // A horizontal slider.
 //
-// The slider reports the position the user picked through the `moved`
-// callback; the caller decides what to do with it. The part that has been
-// played is filled from the left and grows to the right, the same way a
-// progress bar does.
-export component SeekBar inherits Rectangle {
-    in property <float> value: 0;
-    in property <float> maximum: 1;
-    in property <bool> interactive: true;
-    callback moved(float);
-    callback pointer-activity();
+ // The slider reports the position the user picked through the `moved`
+ // callback; the caller decides what to do with it. The part that has been
+ // played is filled from the left and grows to the right, the same way a
+ // progress bar does.
+ export component SeekBar inherits Rectangle {
+     in property <float> value: 0;
+     in property <float> maximum: 1;
+     in property <bool> interactive: true;
+     callback moved(float);
+     callback pointer-activity();
+     callback drag-started();
+     callback drag-ended();
 
-    height: 18px;
+     height: 18px;
 
     // The position of the handle, between 0 and 1. The clamp keeps a slider
     // whose maximum is still unknown (a live stream before the first tick)
@@ -337,9 +339,11 @@ export component SeekBar inherits Rectangle {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
             if (event.kind == PointerEventKind.down) {
                 root.moved(root.value-at(area.mouse-x));
+                root.drag-started();
             }
             if (event.kind == PointerEventKind.up) {
                 root.moved(root.value-at(area.mouse-x));
+                root.drag-ended();
             }
         }
         moved => {

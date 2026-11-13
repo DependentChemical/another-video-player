@@ -22,6 +22,7 @@ export component PlayerControls inherits Rectangle {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback interacting-changed(bool);
     callback sources-toggled();
 
     width: root.width;
@@ -32,11 +33,23 @@ export component PlayerControls inherits Rectangle {
     animate y { duration: 180ms; easing: ease-out; }
     animate opacity { duration: 140ms; }
 
+    private property <bool> interacting: false;
+
     TouchArea {
         width: root.width;
         height: root.height;
         changed has-hover => {
             root.controls-hovered(self.has-hover);
+        }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.interacting = true;
+                root.interacting-changed(true);
+            }
+            if event.kind == PointerEventKind.up {
+                root.interacting = false;
+                root.interacting-changed(false);
+            }
         }
 
         PlayPauseButton {
@@ -86,6 +99,14 @@ export component PlayerControls inherits Rectangle {
             moved(value) => {
                 root.seek-requested(value);
             }
+            drag-started => {
+                root.interacting = true;
+                root.interacting-changed(true);
+            }
+            drag-ended => {
+                root.interacting = false;
+                root.interacting-changed(false);
+            }
         }
 
         GearButton {
@@ -129,6 +150,14 @@ export component PlayerControls inherits Rectangle {
                 height: root.height;
                 pointer-event(event) => {
                     if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                    if event.kind == PointerEventKind.down {
+                        root.interacting = true;
+                        root.interacting-changed(true);
+                    }
+                    if event.kind == PointerEventKind.up {
+                        root.interacting = false;
+                        root.interacting-changed(false);
+                    }
                 }
                 clicked => {
                     root.volume-toggled();
@@ -146,6 +175,14 @@ export component PlayerControls inherits Rectangle {
             moved(value) => {
                 root.pointer-activity();
                 root.volume-requested(value);
+            }
+            drag-started => {
+                root.interacting = true;
+                root.interacting-changed(true);
+            }
+            drag-ended => {
+                root.interacting = false;
+                root.interacting-changed(false);
             }
         }
 

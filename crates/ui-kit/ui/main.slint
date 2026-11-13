@@ -80,6 +80,7 @@ export component MainWindow inherits Window {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback interacting-changed(bool);
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-dismissed();
@@ -200,6 +201,7 @@ export component MainWindow inherits Window {
         live-requested => { root.live-requested(); }
         pointer-activity => { root.pointer-activity(); }
         controls-hovered(hovered) => { root.controls-hovered(hovered); }
+        interacting-changed(interacting) => { root.interacting-changed(interacting); }
         sources-toggled => { root.toggle-sources(); }
     }
 

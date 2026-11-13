@@ -46,6 +46,7 @@ impl Shell {
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let controls_hovered = Rc::new(Cell::new(false));
+        let controls_interacting = Rc::new(Cell::new(false));
 
         // mpv draws the video into the part of the window below the top bar.
         // The weak handle is the only thing the render thread touches, so it
@@ -234,6 +235,10 @@ impl Shell {
             let controls_hovered = Rc::clone(&controls_hovered);
             ui.on_controls_hovered(move |hovered| controls_hovered.set(hovered));
         }
+        {
+            let controls_interacting = Rc::clone(&controls_interacting);
+            ui.on_interacting_changed(move |interacting| controls_interacting.set(interacting));
+        }
 
         // A timer keeps the interface in sync with the player.
         let timer = Timer::default();
@@ -243,6 +248,7 @@ impl Shell {
             let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             let controls_hovered = Rc::clone(&controls_hovered);
+            let controls_interacting = Rc::clone(&controls_interacting);
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
@@ -252,6 +258,7 @@ impl Shell {
                 let visible = ui.sources_open()
                     || (ui.has_media()
                         && (controls_hovered.get()
+                            || controls_interacting.get()
                             || Instant::now().duration_since(last_pointer_activity.get())
                                 < Duration::from_secs(4)));
                 ui.set_controls_visible(visible);

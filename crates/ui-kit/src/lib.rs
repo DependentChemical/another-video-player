@@ -375,6 +375,11 @@ impl PlayerUi {
         self.window.on_controls_hovered(handler);
     }
 
+    /// Called when an interaction with the control bar starts or ends.
+    pub fn on_interacting_changed(&self, handler: impl Fn(bool) + 'static) {
+        self.window.on_interacting_changed(handler);
+    }
+
     /// Called when the user asks to play the pending media right away.
     pub fn on_pending_play(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_play_requested(handler);
