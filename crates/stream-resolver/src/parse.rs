@@ -135,17 +135,53 @@ fn build(raw: RawInfo) -> MediaSource {
     video_streams.sort_by_key(|stream| std::cmp::Reverse(stream.rank()));
     audio_streams.sort_by_key(|stream| std::cmp::Reverse(stream.rank()));
 
+    let is_live = raw.is_live.unwrap_or(false) || raw.live_status.as_deref() == Some("is_live");
+    let title = raw.title.unwrap_or_else(|| "Untitled".to_string());
+
     MediaSource {
         id: raw.id.unwrap_or_default(),
-        title: raw.title.unwrap_or_else(|| "Untitled".to_string()),
+        title: without_live_timestamp(&title).to_string(),
         uploader: raw.uploader.or(raw.channel),
         duration: raw.duration,
         thumbnail: raw.thumbnail,
         webpage_url: raw.webpage_url,
         extractor: raw.extractor_key.or(raw.extractor),
-        is_live: raw.is_live.unwrap_or(false) || raw.live_status.as_deref() == Some("is_live"),
+        is_live,
         video_streams,
         audio_streams,
+    }
+}
+
+/// Removes yt-dlp's trailing local start time from a broadcast title.
+fn without_live_timestamp(title: &str) -> &str {
+    let Some((prefix, time)) = title.rsplit_once(' ') else {
+        return title;
+    };
+    let Some((clean_title, date)) = prefix.rsplit_once(' ') else {
+        return title;
+    };
+    let Some((year, month_day)) = date.split_once('-') else {
+        return title;
+    };
+    let Some((month, day)) = month_day.split_once('-') else {
+        return title;
+    };
+    let Some((hour, minute)) = time.split_once(':') else {
+        return title;
+    };
+    let numeric = [year, month, day, hour, minute]
+        .iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if numeric
+        && year.len() == 4
+        && month.len() == 2
+        && day.len() == 2
+        && hour.len() == 2
+        && minute.len() == 2
+    {
+        clean_title
+    } else {
+        title
     }
 }
 
