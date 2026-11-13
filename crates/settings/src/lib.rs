@@ -67,23 +67,21 @@ impl Settings {
             .document
             .get("Video-Settings")
             .ok_or_else(|| Error::Invalid("missing Video-Settings".into()))?;
+        let global = settings
+            .pointer("/global/sources-default")
+            .ok_or_else(|| Error::Invalid("missing global sources-default".into()))?;
         if let Some(items) = settings.pointer("/per-site/main-list").and_then(Value::as_object) {
             for item in items.values() {
                 let Some(pattern) = item.get("regex").and_then(Value::as_str) else { continue };
                 let Ok(regex) = Regex::new(pattern) else { continue };
                 if regex.is_match(url) {
-                    if let Some(defaults) = item.get("sources-default")
-                        && let Some(selection) = choose(source, defaults)
-                    {
+                    let merged = merge_defaults(global, item.get("sources-default"));
+                    if let Some(selection) = choose(source, &merged) {
                         return Ok(selection);
                     }
-                    break;
                 }
             }
         }
-        let global = settings
-            .pointer("/global/sources-default")
-            .ok_or_else(|| Error::Invalid("missing global sources-default".into()))?;
         choose(source, global).ok_or(Error::NoStream)
     }
 }
@@ -100,20 +98,35 @@ fn preferences(value: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+fn merge_defaults(global: &Value, site: Option<&Value>) -> Value {
+    let mut merged = serde_json::Map::new();
+    for key in ["video", "audio", "combined"] {
+        let site_value =
+            site.and_then(|value| value.get(key)).and_then(Value::as_str).unwrap_or_default();
+        let value = if site_value.split(',').any(|part| !part.trim().is_empty()) {
+            site.and_then(|value| value.get(key)).cloned().unwrap_or(Value::Null)
+        } else {
+            global.get(key).cloned().unwrap_or(Value::Null)
+        };
+        merged.insert(key.to_string(), value);
+    }
+    Value::Object(merged)
+}
+
 fn choose(source: &MediaSource, defaults: &Value) -> Option<Quality> {
     let videos = preferences(defaults, "video");
     let audios = preferences(defaults, "audio");
     let combined = preferences(defaults, "combined");
 
-    // Try configured video/audio pairs first, honoring video preference order.
+    // Exact configured choices are exhausted before numeric size fallback.
     for video_pref in &videos {
-        let Some(video) =
-            pick_video(source.video_streams.iter().filter(|stream| !stream.has_audio), video_pref)
-        else {
-            continue;
-        };
+        let video = pick_video_exact(
+            source.video_streams.iter().filter(|stream| !stream.has_audio),
+            video_pref,
+        );
+        let Some(video) = video else { continue };
         for audio_pref in &audios {
-            if let Some(audio) = pick_audio(source.audio_streams.iter(), audio_pref) {
+            if let Some(audio) = pick_audio_exact(source.audio_streams.iter(), audio_pref) {
                 return Some(Quality::Streams {
                     video: Some(video.format_id.clone()),
                     audio: Some(audio.format_id.clone()),
@@ -122,31 +135,63 @@ fn choose(source: &MediaSource, defaults: &Value) -> Option<Quality> {
         }
     }
 
+    let video_only = videos.iter().find_map(|pref| {
+        pick_video_exact(source.video_streams.iter().filter(|stream| !stream.has_audio), pref)
+    });
+    let audio_only =
+        audios.iter().find_map(|pref| pick_audio_exact(source.audio_streams.iter(), pref));
+    let video_fallback = video_only.or_else(|| {
+        pick_video_fallback(
+            source.video_streams.iter().filter(|stream| !stream.has_audio),
+            last_resolution(&videos),
+        )
+    });
+    let audio_fallback = audio_only
+        .or_else(|| pick_audio_fallback(source.audio_streams.iter(), last_bitrate(&audios)));
+    if let (Some(video), Some(audio)) = (video_fallback, audio_fallback) {
+        return Some(Quality::Streams {
+            video: Some(video.format_id.clone()),
+            audio: Some(audio.format_id.clone()),
+        });
+    }
+
     // If a pair cannot be built, use a combined stream before single tracks.
     for pref in &combined {
         if let Some(video) =
-            pick_video(source.video_streams.iter().filter(|stream| stream.has_audio), pref)
+            pick_video_exact(source.video_streams.iter().filter(|stream| stream.has_audio), pref)
         {
             return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
         }
+    }
+    if let Some(video) = pick_video_fallback(
+        source.video_streams.iter().filter(|stream| stream.has_audio),
+        last_resolution(&combined),
+    ) {
+        return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
     }
 
-    for pref in &videos {
-        if let Some(video) =
-            pick_video(source.video_streams.iter().filter(|stream| !stream.has_audio), pref)
-        {
-            return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
-        }
+    if let Some(video) = video_fallback {
+        let audio = audio_fallback.filter(|_| !video.has_audio);
+        return Some(Quality::Streams {
+            video: Some(video.format_id.clone()),
+            audio: audio.map(|stream| stream.format_id.clone()),
+        });
     }
-    for pref in &audios {
-        if let Some(audio) = pick_audio(source.audio_streams.iter(), pref) {
-            return Some(Quality::Streams { video: None, audio: Some(audio.format_id.clone()) });
-        }
+    if let Some(video) = source.video_streams.iter().max_by_key(|stream| stream.rank()) {
+        let audio = (!video.has_audio)
+            .then(|| source.audio_streams.iter().max_by_key(|stream| stream.rank()))
+            .flatten();
+        return Some(Quality::Streams {
+            video: Some(video.format_id.clone()),
+            audio: audio.map(|stream| stream.format_id.clone()),
+        });
     }
-    None
+    audio_fallback
+        .or_else(|| source.audio_streams.iter().max_by_key(|stream| stream.rank()))
+        .map(|audio| Quality::Streams { video: None, audio: Some(audio.format_id.clone()) })
 }
 
-fn pick_video<'a>(
+fn pick_video_exact<'a>(
     streams: impl Iterator<Item = &'a VideoStream>,
     pref: &str,
 ) -> Option<&'a VideoStream> {
@@ -162,21 +207,37 @@ fn pick_video<'a>(
                 .into_iter()
                 .filter_map(|stream| stream.height.map(|height| (height, stream)))
                 .collect();
-            let exact = sized
+            sized
                 .iter()
                 .filter(|(height, _)| *height == target)
-                .max_by_key(|(_, stream)| stream.rank());
-            let lower = sized
-                .iter()
-                .filter(|(height, _)| *height < target)
-                .max_by_key(|(height, stream)| (*height, stream.rank()));
-            let higher = sized
-                .iter()
-                .filter(|(height, _)| *height > target)
-                .min_by_key(|(height, stream)| (*height, std::cmp::Reverse(stream.rank())));
-            exact.or(lower).or(higher).map(|(_, stream)| *stream)
+                .max_by_key(|(_, stream)| stream.rank())
+                .map(|(_, stream)| *stream)
         }
     }
+}
+
+fn last_resolution(preferences: &[String]) -> Option<u32> {
+    preferences.iter().filter_map(|pref| resolution(pref)).next_back()
+}
+
+fn pick_video_fallback<'a>(
+    streams: impl Iterator<Item = &'a VideoStream>,
+    target: Option<u32>,
+) -> Option<&'a VideoStream> {
+    let target = target?;
+    let sized: Vec<_> =
+        streams.filter_map(|stream| stream.height.map(|height| (height, stream))).collect();
+    sized
+        .iter()
+        .filter(|(height, _)| *height < target)
+        .max_by_key(|(height, stream)| (*height, stream.rank()))
+        .or_else(|| {
+            sized
+                .iter()
+                .filter(|(height, _)| *height > target)
+                .min_by_key(|(height, stream)| (*height, std::cmp::Reverse(stream.rank())))
+        })
+        .map(|(_, stream)| *stream)
 }
 
 fn resolution(value: &str) -> Option<u32> {
@@ -189,7 +250,7 @@ fn resolution(value: &str) -> Option<u32> {
     }
 }
 
-fn pick_audio<'a>(
+fn pick_audio_exact<'a>(
     streams: impl Iterator<Item = &'a AudioStream>,
     pref: &str,
 ) -> Option<&'a AudioStream> {
@@ -205,21 +266,40 @@ fn pick_audio<'a>(
                 .into_iter()
                 .filter_map(|stream| stream.bitrate.map(|rate| (rate, stream)))
                 .collect();
-            let exact = sized
+            sized
                 .iter()
                 .filter(|(rate, _)| *rate == target)
-                .max_by_key(|(_, stream)| stream.rank());
-            let lower = sized
-                .iter()
-                .filter(|(rate, _)| *rate < target)
-                .max_by_key(|(rate, stream)| (*rate, stream.rank()));
-            let higher = sized
-                .iter()
-                .filter(|(rate, _)| *rate > target)
-                .min_by_key(|(rate, stream)| (*rate, std::cmp::Reverse(stream.rank())));
-            exact.or(lower).or(higher).map(|(_, stream)| *stream)
+                .max_by_key(|(_, stream)| stream.rank())
+                .map(|(_, stream)| *stream)
         }
     }
+}
+
+fn last_bitrate(preferences: &[String]) -> Option<u64> {
+    preferences
+        .iter()
+        .filter_map(|pref| pref.strip_suffix("kbps").unwrap_or(pref).parse().ok())
+        .next_back()
+}
+
+fn pick_audio_fallback<'a>(
+    streams: impl Iterator<Item = &'a AudioStream>,
+    target: Option<u64>,
+) -> Option<&'a AudioStream> {
+    let target = target?;
+    let sized: Vec<_> =
+        streams.filter_map(|stream| stream.bitrate.map(|rate| (rate, stream))).collect();
+    sized
+        .iter()
+        .filter(|(rate, _)| *rate < target)
+        .max_by_key(|(rate, stream)| (*rate, stream.rank()))
+        .or_else(|| {
+            sized
+                .iter()
+                .filter(|(rate, _)| *rate > target)
+                .min_by_key(|(rate, stream)| (*rate, std::cmp::Reverse(stream.rank())))
+        })
+        .map(|(_, stream)| *stream)
 }
 
 #[cfg(test)]
@@ -236,7 +316,7 @@ mod tests {
             webpage_url: None,
             extractor: None,
             is_live: false,
-            video_streams: [1080, 720, 360]
+            video_streams: [1080, 720, 600, 480, 360]
                 .into_iter()
                 .map(|height| VideoStream {
                     format_id: height.to_string(),
@@ -267,7 +347,7 @@ mod tests {
                     note: None,
                 }))
                 .collect(),
-            audio_streams: [64, 128]
+            audio_streams: [64, 96, 128]
                 .into_iter()
                 .map(|bitrate| AudioStream {
                     format_id: bitrate.to_string(),
@@ -305,22 +385,70 @@ mod tests {
     fn resolution_prefers_exact_then_lower_then_higher() {
         let source = source();
         assert_eq!(
-            pick_video(source.video_streams.iter().filter(|s| !s.has_audio), "720")
+            pick_video_exact(source.video_streams.iter().filter(|s| !s.has_audio), "480")
                 .unwrap()
                 .format_id,
-            "720"
+            "480"
         );
         assert_eq!(
-            pick_video(source.video_streams.iter().filter(|s| !s.has_audio), "800")
+            pick_video_fallback(source.video_streams.iter().filter(|s| !s.has_audio), Some(500))
                 .unwrap()
                 .format_id,
-            "720"
+            "480"
         );
         assert_eq!(
-            pick_video(source.video_streams.iter().filter(|s| !s.has_audio), "240")
+            pick_video_fallback(source.video_streams.iter().filter(|s| !s.has_audio), Some(200))
                 .unwrap()
                 .format_id,
             "360"
         );
+    }
+
+    #[test]
+    fn later_exact_video_and_audio_choices_beat_earlier_numeric_fallbacks() {
+        let source = source();
+        let settings = serde_json::json!({"video":"900,480", "audio":"160,96", "combined":""});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("480".into()), audio: Some("96".into()) })
+        );
+    }
+
+    #[test]
+    fn numeric_fallback_uses_the_last_requested_size_and_bitrate() {
+        let source = source();
+        let settings = serde_json::json!({"video":"900,500", "audio":"160,100", "combined":""});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("480".into()), audio: Some("96".into()) })
+        );
+    }
+
+    #[test]
+    fn partial_and_empty_site_values_inherit_the_global_preferences() {
+        let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"default,best","combined":"best"}},"per-site":{"main-list":{"Site":{"regex":"example\\.com","sources-default":{"video":"720","audio":"","combined":""}}}}}}"#).expect("settings parse");
+        assert_eq!(
+            settings.select(&source(), "https://example.com/watch").expect("selects"),
+            Quality::Streams { video: Some("720".into()), audio: Some("64".into()) }
+        );
+    }
+
+    #[test]
+    fn empty_global_preferences_still_select_any_available_video_then_audio() {
+        let source = source();
+        let settings = serde_json::json!({"video":"", "audio":"", "combined":""});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("1080".into()), audio: Some("128".into()) })
+        );
+    }
+
+    #[test]
+    fn an_empty_catalog_returns_no_stream() {
+        let mut source = source();
+        source.video_streams.clear();
+        source.audio_streams.clear();
+        let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"best","combined":"best"}}}}"#).expect("settings parse");
+        assert!(matches!(settings.select(&source, "https://example.test"), Err(Error::NoStream)));
     }
 }
