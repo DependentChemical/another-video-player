@@ -14,7 +14,8 @@ use std::process::Command;
 /// workspace.
 const RULES: &[(&str, &[&str])] = &[
     ("database", &[]),
-    ("library", &["database", "media-model"]),
+    ("image-process", &["media-model"]),
+    ("library", &["database", "media-model", "image-process"]),
     ("media-model", &[]),
     ("settings", &["media-model"]),
     ("playback-engine", &[]),

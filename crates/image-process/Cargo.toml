@@ -1,0 +1,17 @@
+[package]
+name = "image-process"
+version = "0.3.4"
+edition = "2024"
+license = "MIT"
+description = "Converts downloaded thumbnails to JPEG so the UI can render them."
+
+[dependencies]
+# --- internal crates ---------------------------------------------------------
+media-model = { path = "../media-model" }
+
+# --- external crates ---------------------------------------------------------
+image = { version = "0.25", features = ["jpeg", "png", "gif", "webp"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -10,11 +10,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
+use image_process::{jpeg_path_for, normalize_to_jpeg};
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
-
-/// The extensions a cached thumbnail may keep.
-const KNOWN_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 
 /// The directory downloaded thumbnails are kept in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +37,8 @@ impl ThumbnailCache {
     /// request never hits the network again. The download lands in a scratch
     /// file first and is moved into place afterwards, so an interrupted
     /// download never leaves a broken image behind.
+    ///
+    /// The cached thumbnail is always normalized to JPEG so the UI can render it.
     pub fn fetch(&self, url: &str) -> Result<PathBuf, Error> {
         let path = self.path_for(url);
         if path.is_file() {
@@ -62,10 +62,15 @@ impl ThumbnailCache {
             let _ = fs::remove_file(&temporary);
             return Err(Error::Io(error));
         }
-        Ok(path)
+
+        // Normalize to JPEG (converts if needed, cleans up original)
+        let jpeg_path = jpeg_path_for(&path);
+        normalize_to_jpeg(&path, &jpeg_path)?;
+
+        Ok(jpeg_path)
     }
 
-    /// The path a thumbnail is cached at.
+    /// The path a thumbnail is cached at (always .jpg).
     pub fn path_for(&self, url: &str) -> PathBuf {
         self.directory.join(file_name_for(url))
     }
@@ -100,25 +105,10 @@ impl ThumbnailCache {
 /// The file name a thumbnail URL is cached under.
 ///
 /// The name is a hash of the URL, so it never carries a character the file
-/// system rejects and two different URLs never collide in practice. The
-/// extension is kept so the image loader can guess the format.
+/// system rejects and two different URLs never collide in practice.
+/// The extension is always .jpg since thumbnails are normalized to JPEG.
 pub fn file_name_for(url: &str) -> String {
-    format!("{:016x}.{}", fnv1a(url.as_bytes()), extension_of(url))
-}
-
-/// The extension to keep from a thumbnail URL, with a sensible fallback.
-fn extension_of(url: &str) -> &str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let candidate = path.rsplit('.').next().unwrap_or_default();
-    if candidate.len() <= 5
-        && !candidate.is_empty()
-        && candidate.chars().all(|c| c.is_ascii_alphanumeric())
-        && KNOWN_EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(candidate))
-    {
-        candidate
-    } else {
-        "jpg"
-    }
+    format!("{:016x}.jpg", fnv1a(url.as_bytes()))
 }
 
 /// A 64 bit FNV-1a hash, used only for cache file names.
@@ -143,21 +133,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_file_name_keeps_a_known_extension() {
+    fn the_file_name_always_ends_with_jpg() {
         assert!(file_name_for("https://example.com/image.jpg").ends_with(".jpg"));
-        assert!(file_name_for("https://example.com/image.png").ends_with(".png"));
-    }
-
-    #[test]
-    fn an_unknown_extension_falls_back_to_jpg() {
+        assert!(file_name_for("https://example.com/image.png").ends_with(".jpg"));
+        assert!(file_name_for("https://example.com/image.webp").ends_with(".jpg"));
         assert!(file_name_for("https://example.com/image").ends_with(".jpg"));
-        assert!(file_name_for("https://example.com/image.avif").ends_with(".jpg"));
-    }
-
-    #[test]
-    fn the_query_string_does_not_confuse_the_extension() {
-        assert_eq!(extension_of("https://example.com/i.jpg?size=large"), "jpg");
-        assert_eq!(extension_of("https://example.com/i.png#fragment"), "png");
     }
 
     #[test]

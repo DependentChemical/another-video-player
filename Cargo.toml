@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/app-core",
     "crates/database",
+    "crates/image-process",
     "crates/library",
     "crates/media-model",
     "crates/settings",
@@ -29,6 +30,7 @@ authors = ["Flatline contributors"]
 # --- internal crates (see AGENTS.md "Crate isolation") -------------------------
 app-core = { path = "crates/app-core" }
 database = { path = "crates/database" }
+image-process = { path = "crates/image-process" }
 library = { path = "crates/library" }
 media-model = { path = "crates/media-model" }
 settings = { path = "crates/settings" }
