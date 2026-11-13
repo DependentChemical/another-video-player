@@ -10,68 +10,65 @@ export component TopBar inherits Rectangle {
     height: Theme.bar-height;
     background: Theme.panel;
 
-    Text {
-        x: 40px;
-        width: 72px;
-        text: root.app-name;
-        color: Theme.fg;
-        font-size: 15px;
-        vertical-alignment: center;
-    }
+    HorizontalLayout {
+        padding: (parent.height - 32px) / 2;
+        spacing: (parent.height - 32px) / 2;
+        cross-axis-alignment: center;
 
-    Image {
-        x: 14px;
-        y: (parent.height - 20px) / 2;
-        width: 20px;
-        height: 20px;
-        source: @image-url("../../../../resources/flatline-32.png");
-        image-fit: contain;
-    }
-
-    url-field := Rectangle {
-        x: 118px;
-        y: (parent.height - 32px) / 2;
-        width: parent.width - 118px - 68px;
-        height: 32px;
-        border-radius: 6px;
-        border-width: 1px;
-        border-color: url-input.has-focus ? Theme.accent : Theme.border;
-        background: Theme.elevated;
-
-        url-placeholder := Text {
-            x: 10px;
-            text: "Paste a video URL and press Enter";
-            color: Theme.muted;
-            font-size: 13px;
-            vertical-alignment: center;
-            visible: url-input.text == "";
+        Image {
+            width: 20px;
+            height: 20px;
+            source: @image_url("../../../../resources/flatline-32.png");
+            image-fit: contain;
         }
 
-        url-input := TextInput {
-            x: 10px;
-            y: 0px;
-            width: parent.width - 20px;
-            height: parent.height;
-            text <=> root.url;
+        Text {
+            text: root.app-name;
             color: Theme.fg;
-            font-size: 13px;
+            font-size: 15px;
             vertical-alignment: center;
-            accepted => {
-                root.load-requested();
+        }
+
+        url-field := Rectangle {
+            horizontal-stretch: 1;
+            height: 32px;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: url-input.has-focus ? Theme.accent : Theme.border;
+            background: Theme.elevated;
+
+            HorizontalLayout {
+                padding: 10px;
+                cross-axis-alignment: center;
+
+                url-placeholder := Text {
+                    text: "Paste a video URL and press Enter";
+                    color: Theme.muted;
+                    font-size: 13px;
+                    visible: url-input.text == "";
+                }
+
+                url-input := TextInput {
+                    horizontal-stretch: 1;
+                    text <=> root.url;
+                    color: Theme.fg;
+                    font-size: 13px;
+                    accepted => {
+                        root.load-requested();
+                    }
+                }
             }
         }
-    }
 
-    load-button := FlatButton {
-        x: parent.width - 56px;
-        y: (parent.height - 32px) / 2;
-        width: 40px;
-        height: 32px;
-        label: "Go";
-        primary: true;
-        pointer-activity => { root.pointer-activity(); }
-        clicked => {
-            root.load-requested();
+        load-button := FlatButton {
+            width: 40px;
+            height: 32px;
+            label: "Go";
+            primary: true;
+            pointer-activity => { root.pointer-activity(); }
+            clicked => {
+                root.load-requested();
+            }
         }
     }
 }
