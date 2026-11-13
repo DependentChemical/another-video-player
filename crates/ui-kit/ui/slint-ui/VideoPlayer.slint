@@ -1,0 +1,82 @@
+import { Theme } from "../theme.slint";
+
+export component VideoPlayer inherits Rectangle {
+    in property <string> status: "";
+    in property <string> status-kind: "info";
+    in property <int> spinner-step: 0;
+    in property <bool> has-media: false;
+    in property <bool> controls-visible: true;
+    in property <length> container-height: 0;
+    callback pointer-activity();
+
+    x: 0px;
+    y: Theme.bar-height;
+    background: transparent;
+
+    TouchArea {
+        width: root.width;
+        height: root.height;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move {
+                root.pointer-activity();
+            }
+        }
+        moved => { root.pointer-activity(); }
+    }
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.container-height;
+
+        if root.status-kind == "busy": Rectangle {
+            x: (root.width - 40px) / 2;
+            y: (root.container-height - 8px) / 2;
+            width: 40px;
+            height: 8px;
+
+            Rectangle {
+                x: 0px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.accent;
+                opacity: root.spinner-step == 0 ? 1.0 : 0.3;
+                animate opacity { duration: 160ms; }
+            }
+
+            Rectangle {
+                x: 16px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.accent;
+                opacity: root.spinner-step == 1 ? 1.0 : 0.3;
+                animate opacity { duration: 160ms; }
+            }
+
+            Rectangle {
+                x: 32px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.accent;
+                opacity: root.spinner-step == 2 ? 1.0 : 0.3;
+                animate opacity { duration: 160ms; }
+            }
+        }
+
+        Text {
+            x: 0px;
+            y: root.status-kind == "busy" ? (root.container-height - 24px) / 2 + 16px : 0px;
+            width: root.width;
+            height: root.status-kind == "busy" ? 24px : root.container-height;
+            text: root.status;
+            color: root.status-kind == "error" ? Theme.danger : Theme.muted;
+            font-size: 14px;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
