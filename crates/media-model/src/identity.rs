@@ -11,10 +11,8 @@ pub fn clean_video_url(url: &str) -> String {
     };
 
     // Remove all query parameters except the video ID parameter
-    let mut pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    let mut pairs: Vec<(String, String)> =
+        parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
     // Keep only known video ID parameters for major platforms
     let video_id_params = ["v", "video_id", "id"];
@@ -24,11 +22,7 @@ pub fn clean_video_url(url: &str) -> String {
     let query = if pairs.is_empty() {
         String::new()
     } else {
-        pairs
-            .into_iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&")
+        pairs.into_iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
     };
 
     parsed.set_query(if query.is_empty() { None } else { Some(&query) });
