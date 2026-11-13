@@ -549,9 +549,7 @@ mod tests {
     #[test]
     fn the_first_pushed_entry_becomes_current() {
         let queue = queue();
-        let entry = queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        let entry = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         assert_eq!(entry.position, 0);
         assert!(entry.current);
         assert_eq!(
@@ -563,11 +561,15 @@ mod tests {
     #[test]
     fn later_entries_are_appended_without_taking_over() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         let second = queue
-            .push("https://example.com/b", "B", Some("/tmp/b.jpg"), Some("http://thumb/b"), Some("Uploader"))
+            .push(
+                "https://example.com/b",
+                "B",
+                Some("/tmp/b.jpg"),
+                Some("http://thumb/b"),
+                Some("Uploader"),
+            )
             .expect("push works");
 
         assert_eq!(second.position, 1);
@@ -586,12 +588,8 @@ mod tests {
     #[test]
     fn replace_with_drops_the_old_queue() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
-        queue
-            .push("https://example.com/b", "B", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
 
         let entry = queue
             .replace_with("https://example.com/c", "C", None, None, None)
@@ -608,12 +606,8 @@ mod tests {
     #[test]
     fn advance_moves_the_current_mark_forward() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
-        queue
-            .push("https://example.com/b", "B", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
 
         let next = queue.advance().expect("advance works").expect("a next entry");
         assert_eq!(next.url, "https://example.com/b");
@@ -624,9 +618,7 @@ mod tests {
     #[test]
     fn advance_past_the_last_entry_clears_the_mark() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
 
         assert!(queue.advance().expect("advance works").is_none());
         assert!(queue.current().expect("current works").is_none());
@@ -636,12 +628,8 @@ mod tests {
     #[test]
     fn advance_on_a_queue_without_a_mark_starts_at_the_head() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
-        queue
-            .push("https://example.com/b", "B", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
         queue
             .db
             .with_connection(|connection| {
@@ -658,9 +646,7 @@ mod tests {
     #[test]
     fn thumbnails_can_be_filled_in_later() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         queue.set_thumbnail(0, Some("/cache/a.jpg")).expect("set works");
         assert_eq!(
             queue.entries().expect("entries work")[0].thumbnail.as_deref(),
@@ -671,12 +657,8 @@ mod tests {
     #[test]
     fn a_resolved_source_is_saved_with_its_freshness_time() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
-        queue
-            .set_resolved_source(0, Some("{\"title\":\"A\"}"), Some(1234))
-            .expect("source saves");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.set_resolved_source(0, Some("{\"title\":\"A\"}"), Some(1234)).expect("source saves");
 
         let current = queue.current().expect("current works").expect("one entry");
         assert_eq!(current.resolved_source.as_deref(), Some("{\"title\":\"A\"}"));
@@ -702,9 +684,7 @@ mod tests {
         .expect("legacy schema created");
         let queue = Queue { db };
         queue.migrate().expect("legacy schema migrates");
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         queue
             .set_resolved_source(0, Some("source"), Some(1234))
             .expect("new columns are available");
@@ -717,9 +697,7 @@ mod tests {
     #[test]
     fn clear_empties_the_queue() {
         let queue = queue();
-        queue
-            .push("https://example.com/a", "A", None, None, None)
-            .expect("push works");
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         queue.clear().expect("clear works");
         assert_eq!(queue.count().expect("count works"), 0);
     }
@@ -734,12 +712,8 @@ mod tests {
 
         {
             let queue = Queue::open(&path).expect("the queue opens");
-            queue
-                .push("https://example.com/a", "A", None, None, None)
-                .expect("push works");
-            queue
-                .push("https://example.com/b", "B", None, None, None)
-                .expect("push works");
+            queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
             queue.advance().expect("advance works");
         }
 
@@ -759,7 +733,13 @@ mod tests {
             .push("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Video 1", None, None, None)
             .expect("push works");
         let entry2 = queue
-            .push("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc&t=30s", "Video 2", None, None, None)
+            .push(
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc&t=30s",
+                "Video 2",
+                None,
+                None,
+                None,
+            )
             .expect("push works");
         assert_eq!(entry1.id_hash, entry2.id_hash);
     }
@@ -769,7 +749,14 @@ mod tests {
         let queue = queue();
         let id_hash = "test_hash_123";
         queue
-            .history_upsert(id_hash, "https://example.com/video", "Test Video", Some("http://thumb"), Some("Uploader"), 42.5)
+            .history_upsert(
+                id_hash,
+                "https://example.com/video",
+                "Test Video",
+                Some("http://thumb"),
+                Some("Uploader"),
+                42.5,
+            )
             .expect("upsert works");
         let entry = queue.history_get(id_hash).expect("get works").expect("entry exists");
         assert_eq!(entry.id_hash, id_hash);
