@@ -1,9 +1,9 @@
 name: Release
 
 # A release is produced when the Build workflow succeeds on `main`. The
-# version of the project is `version.txt`; a release is only published when
-# that version does not have a tag yet. Small changes keep the version and
-# therefore never produce a release.
+# version of the project is `[workspace.package].version` in `Cargo.toml`; a
+# release is only published when that version does not have a tag yet. Small
+# changes keep the version and therefore never produce a release.
 on:
   workflow_run:
     workflows:
@@ -58,18 +58,28 @@ jobs:
             const repo = context.repo.repo;
             const headSha = context.payload.workflow_run.head_sha;
 
-            // `version.txt` is the reference for the version of the project.
-            const versionFile = (await github.rest.repos.getContent({
+            // The workspace version in Cargo.toml is the single source of
+            // truth for the version of the project.
+            const manifestFile = (await github.rest.repos.getContent({
               owner,
               repo,
-              path: 'version.txt',
+              path: 'Cargo.toml',
               ref: headSha,
             })).data;
-            if (!versionFile.content || !versionFile.encoding) {
-              throw new Error('Unable to read version.txt from the release commit.');
+            if (!manifestFile.content || !manifestFile.encoding) {
+              throw new Error('Unable to read Cargo.toml from the release commit.');
             }
-            const version = Buffer.from(versionFile.content, versionFile.encoding)
-              .toString('utf8').trim();
+            const manifest = Buffer.from(manifestFile.content, manifestFile.encoding)
+              .toString('utf8');
+            const workspacePackage = manifest.match(
+              /^\s*\[workspace\.package\]([\s\S]*?)(?=^\s*\[|$)/m,
+            );
+            const versionMatch = workspacePackage
+              && workspacePackage[1].match(/^\s*version\s*=\s*"([^"]+)"/m);
+            if (!versionMatch) {
+              throw new Error('Unable to read [workspace.package].version from Cargo.toml.');
+            }
+            const version = versionMatch[1].trim();
             if (!/^\d+\.\d+\.\d+$/.test(version)) {
               throw new Error(`"${version}" is not a version number.`);
             }

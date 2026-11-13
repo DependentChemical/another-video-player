@@ -15,8 +15,9 @@ To release, first confirm the working tree is clean and `dev` is the current
 branch. Compare `dev` with `main` from their merge base and collect the commit
 subjects since the previous merge. Use those subjects to prepare a concise,
 grouped changelog; do not infer additional changes from diffs or other notes.
-Check that `version.txt` on `dev` is higher than the version on `main`, and
-that the corresponding `v<version>` tag has not already been released.
+Check that `[workspace.package].version` in the root `Cargo.toml` on `dev` is
+higher than the version on `main`, and that the corresponding `v<version>` tag
+has not already been released.
 
 Update this file on `dev` if the release procedure changes, then create a
 `--no-ff` merge commit on `main` whose message contains the prepared
