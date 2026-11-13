@@ -1,0 +1,37 @@
+{
+  "Video-Settings": {
+    "display-name": "Video Settings",
+    "global": {
+      "sources-default": {
+        "video": "best,default",
+        "audio": "default,best",
+        "combined": "default,best"
+      }
+    },
+    "per-site": {
+      "display-name": "Per-Site Settings",
+      "spawnable": {
+        "id-value": {
+          "display-name": "Name of the site",
+          "regex": "Regex for the site source URL",
+          "sources-default": {
+            "display-name": "Defaults for sources",
+            "video": "Default video size",
+            "audio": "Default audio quality",
+            "combined": "Default combined quality"
+          }
+        }
+      },
+      "main-list":{
+      "Youtube": {
+        "regex": "(?i)^(https?://)?(www\\.|m\\.)?(youtube\\.com|youtu\\.be)/",
+        "sources-default": {
+          "video": "720,default,best",
+          "audio": "default,best",
+          "combined": "720,default,best"
+        }
+      }
+    }
+    }
+  }
+}

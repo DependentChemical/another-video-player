@@ -55,6 +55,11 @@ impl AppPaths {
         self.program.join("cookies-youtube.txt")
     }
 
+    /// The bundled settings document beside the executable.
+    pub fn settings(&self) -> PathBuf {
+        self.program.join("settings.json")
+    }
+
     /// Whether the program directory is the one that is written to.
     ///
     /// When this is false the files live in the per user directory instead.

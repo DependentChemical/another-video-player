@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use library::{Queue, ThumbnailCache};
 use media_model::{MediaSource, PlaybackPlan, Quality};
 use playback_engine::{Engine, LoadRequest};
+use settings::Settings;
 use stream_resolver::{CommandSpec, Resolver};
 use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
@@ -143,6 +144,7 @@ struct State {
 pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
+    settings: Settings,
     youtube_cookies: std::path::PathBuf,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
@@ -164,6 +166,8 @@ impl App {
         let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
         let youtube_cookies = paths.youtube_cookies();
         let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
+        let settings =
+            Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -176,6 +180,7 @@ impl App {
         Ok(App {
             engine,
             resolver: Mutex::new(resolver),
+            settings,
             youtube_cookies,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
@@ -415,13 +420,20 @@ impl App {
         {
             crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
         }
-        Some(self.accept_current_source(source))
+        Some(self.accept_current_source(source, url))
     }
 
     /// Builds playback state for the source already authorized by the queue.
-    fn accept_current_source(&self, source: MediaSource) -> Loaded {
+    fn accept_current_source(&self, source: MediaSource, url: &str) -> Loaded {
         let sources = source_lists(&source);
-        let default = stream_resolver::plan(&source, &Quality::Best).ok();
+        let default = self
+            .settings
+            .select(&source, url)
+            .and_then(|quality| {
+                stream_resolver::plan(&source, &quality)
+                    .map_err(|error| settings::Error::Invalid(error.to_string()))
+            })
+            .ok();
         let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
         let loaded = Loaded {
             title: source.title.clone(),
@@ -828,6 +840,8 @@ pub enum Error {
     Engine(String),
     /// The background runtime could not be started.
     Runtime(String),
+    /// The playback settings could not be loaded.
+    Settings(String),
     /// The tools could not be prepared.
     Tools(String),
     /// The library, queue or cache could not be opened.
@@ -840,6 +854,7 @@ impl std::fmt::Display for Error {
             Error::Ui(message) => write!(f, "the user interface failed: {message}"),
             Error::Engine(message) => write!(f, "the player failed: {message}"),
             Error::Runtime(message) => write!(f, "the background runtime failed: {message}"),
+            Error::Settings(message) => write!(f, "{message}"),
             Error::Tools(message) => write!(f, "the tools failed: {message}"),
             Error::Library(message) => write!(f, "the library failed: {message}"),
         }

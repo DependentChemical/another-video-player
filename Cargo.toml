@@ -5,6 +5,7 @@ members = [
     "crates/database",
     "crates/library",
     "crates/media-model",
+    "crates/settings",
     "crates/playback-engine",
     "crates/storyboard",
     "crates/stream-resolver",
@@ -17,7 +18,7 @@ members = [
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -29,6 +30,7 @@ app-core = { path = "crates/app-core" }
 database = { path = "crates/database" }
 library = { path = "crates/library" }
 media-model = { path = "crates/media-model" }
+settings = { path = "crates/settings" }
 playback-engine = { path = "crates/playback-engine" }
 storyboard = { path = "crates/storyboard" }
 stream-resolver = { path = "crates/stream-resolver" }

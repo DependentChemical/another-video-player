@@ -54,7 +54,7 @@ The ladder:
 | Layer | Crates | May depend on |
 | --- | --- | --- |
 | 0 — vocabulary | `media-model` | nothing |
-| 1 — capabilities | `database`, `library`, `playback-engine`, `stream-resolver`, `storyboard`, `ui-kit`, `ytdlp-tool` | `database`/`media-model` at most |
+| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `ytdlp-tool` | `database`/`media-model` at most |
 | 2 — adapter | `video-surface` | `playback-engine` only |
 | 3 — composition root | `app-core` | everything |
 
@@ -104,6 +104,8 @@ for itself when it is missing, and looks for a newer one on every start.
   on top of `database` and the thumbnail cache beside it.
 - `crates/playback-engine` — the libmpv wrapper: transport control, state
   and the OpenGL renderer.
+- `crates/settings` — loads bundled JSON preferences and selects streams
+  from a media catalog.
 - `crates/video-surface` — the adapter that binds the mpv renderer into a
   Slint window.
 - `crates/stream-resolver` — turns a URL into a catalog of streams and
