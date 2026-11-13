@@ -349,6 +349,12 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
 
     drain_engine_events(app, loading);
 
+    // keep-open leaves the completed file loaded, so advance from the
+    // persistent EOF property instead of waiting for the file-unload event.
+    if app.engine().is_eof() && loading.claim_eof() {
+        app.advance();
+    }
+
     loading.observe(app.engine().is_active(), app.engine().is_buffering());
     match loading.status() {
         loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
@@ -386,12 +392,6 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
                 loading.file_ended(failure);
-                // A media that plays to its end moves the queue forward. A
-                // stop or an error is a change the user asked for, so the
-                // queue must not move on its own.
-                if reason == EndReason::Eof {
-                    app.advance();
-                }
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {

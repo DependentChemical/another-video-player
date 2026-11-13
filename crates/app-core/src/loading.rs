@@ -44,11 +44,18 @@ pub struct Loading {
     // Set when mpv starts the file that belongs to the current load, so a
     // file that belonged to an earlier load never disturbs the indicator.
     current_file: bool,
+    /// Prevents a persistent mpv EOF state from advancing on every UI tick.
+    eof_consumed: bool,
 }
 
 impl Default for Loading {
     fn default() -> Self {
-        Loading { phase: Phase::Idle, status: Status::Info(String::new()), current_file: false }
+        Loading {
+            phase: Phase::Idle,
+            status: Status::Info(String::new()),
+            current_file: false,
+            eof_consumed: false,
+        }
     }
 }
 
@@ -119,6 +126,16 @@ impl Loading {
     /// mpv began loading the file that belongs to the current load.
     pub fn file_started(&mut self) {
         self.current_file = true;
+        self.eof_consumed = false;
+    }
+
+    /// Claims an observed EOF once, until the next file starts.
+    pub fn claim_eof(&mut self) -> bool {
+        if self.eof_consumed {
+            return false;
+        }
+        self.eof_consumed = true;
+        true
     }
 
     /// Playback of a file ended.
@@ -279,6 +296,18 @@ mod tests {
 
         loading.file_ended(Some("boom".to_string()));
         assert_eq!(loading.status(), &Status::Error("boom".to_string()));
+    }
+
+    #[test]
+    fn an_eof_is_claimed_once_per_file() {
+        let mut loading = Loading::new();
+        loading.file_started();
+
+        assert!(loading.claim_eof());
+        assert!(!loading.claim_eof());
+
+        loading.file_started();
+        assert!(loading.claim_eof());
     }
 
     #[test]
