@@ -1,0 +1,100 @@
+import { Theme } from "../theme.slint";
+import { FlatButton } from "../widgets.slint";
+
+export component PendingDialog inherits Rectangle {
+    in property <string> pending-title: "";
+    in property <image> pending-thumbnail;
+    in-out property <bool> pending-open: false;
+    callback pending-play-requested();
+    callback pending-queue-requested();
+    callback pending-dismissed();
+
+    x: 0px;
+    y: 0px;
+    background: #00000088;
+
+    TouchArea {
+        clicked => {
+            root.pending-open = false;
+            root.pending-dismissed();
+        }
+    }
+
+    pending-panel := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: min(root.width - 40px, 420px);
+        height: min(root.height - 40px, 440px);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000c0;
+
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            Rectangle {
+                height: 200px;
+                border-radius: 8px;
+                background: Theme.elevated;
+                clip: true;
+
+                Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.pending-thumbnail;
+                    image-fit: contain;
+                }
+            }
+
+            Text {
+                height: 44px;
+                text: root.pending-title;
+                color: Theme.fg;
+                font-size: 15px;
+                font-weight: 600;
+                wrap: word-wrap;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: "What do you want to do with this video?";
+                color: Theme.muted;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+
+                FlatButton {
+                    width: 130px;
+                    height: 34px;
+                    label: "Add to queue";
+                    clicked => {
+                        root.pending-open = false;
+                        root.pending-queue-requested();
+                    }
+                }
+
+                FlatButton {
+                    width: 110px;
+                    height: 34px;
+                    label: "Play now";
+                    primary: true;
+                    clicked => {
+                        root.pending-open = false;
+                        root.pending-play-requested();
+                    }
+                }
+            }
+        }
+    }
+}

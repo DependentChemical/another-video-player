@@ -1,103 +1,14 @@
-import { ScrollView } from "std-widgets.slint";
+import { Button, ProgressIndicator, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
-
-/// One row of the source picker.
-export struct StreamItem {
-    id: string,
-    label: string,
-    detail: string,
-}
-
-// One column of the source picker.
-//
-// A row toggles its stream; the selected row is highlighted and the picker
-// turns the three columns into one selection when the user applies it.
-component SourceColumn inherits Rectangle {
-    in property <string> heading: "";
-    in property <[StreamItem]> items: [];
-    in property <string> selected: "";
-    callback picked(string);
-
-    background: transparent;
-
-    VerticalLayout {
-        spacing: 6px;
-
-        Text {
-            height: 18px;
-            text: root.heading;
-            color: Theme.muted;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-
-        Rectangle {
-            vertical-stretch: 1;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.elevated;
-            clip: true;
-
-            ScrollView {
-                VerticalLayout {
-                    padding: 4px;
-                    spacing: 2px;
-
-                    if root.items.length == 0: Text {
-                        height: 36px;
-                        text: "None available";
-                        color: Theme.muted;
-                        font-size: 12px;
-                        vertical-alignment: center;
-                        horizontal-alignment: center;
-                    }
-
-                    for item in root.items: Rectangle {
-                        height: 44px;
-                        border-radius: 4px;
-                        background: touch.pressed
-                            ? Theme.border
-                            : (root.selected == item.id ? #4c8bf540 : transparent);
-
-                        VerticalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            spacing: 1px;
-                            alignment: center;
-
-                            Text {
-                                height: 16px;
-                                text: item.label;
-                                color: root.selected == item.id ? Theme.accent : Theme.fg;
-                                font-size: 13px;
-                                font-weight: 600;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-
-                            Text {
-                                height: 14px;
-                                text: item.detail;
-                                color: Theme.muted;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                        }
-
-                        touch := TouchArea {
-                            clicked => {
-                                root.picked(item.id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+import { TopBar } from "slint-ui/TopBar.slint";
+import { VideoPlayer } from "slint-ui/VideoPlayer.slint";
+import { PlayerControls } from "slint-ui/PlayerControls.slint";
+import { SourcePicker } from "slint-ui/SourcePicker.slint";
+import { PendingDialog } from "slint-ui/PendingDialog.slint";
+import { Toast } from "slint-ui/Toast.slint";
+import { SourceColumn } from "slint-ui/SourceColumn.slint";
+import { StreamItem } from "slint-ui/types.slint";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -105,7 +16,7 @@ component SourceColumn inherits Rectangle {
 // the window before Slint renders this scene, and every part of the scene
 // that stays transparent lets that frame through.
 export component MainWindow inherits Window {
-    title: root.has-media ? root.media-title + " — Flatline" : "Flatline";
+    title: root.has-media ? root.media-title + " \u{2014} Flatline" : "Flatline";
     preferred-width: 1100px;
     preferred-height: 680px;
     min-width: 560px;
@@ -143,6 +54,20 @@ export component MainWindow inherits Window {
     in property <bool> at-live-edge: true;
     // Whether the window is in full screen.
     in property <bool> fullscreen: false;
+    // The small note in the corner, shown while a URL is parsed in the
+    // background.
+    in-out property <bool> toast-visible: false;
+    in property <string> toast-text: "";
+    // The dialog that asks what to do with a media that was resolved while
+    // another one already plays.
+    in-out property <bool> pending-open: false;
+    in property <string> pending-title: "";
+    in property <image> pending-thumbnail;
+    in-out property <bool> update-open: false;
+    in property <string> update-version: "";
+    in property <string> update-notes: "";
+    in-out property <bool> update-installing: false;
+    in property <string> update-error: "";
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -155,6 +80,11 @@ export component MainWindow inherits Window {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback pending-play-requested();
+    callback pending-queue-requested();
+    callback pending-dismissed();
+    callback update-accepted();
+    callback update-dismissed();
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -219,419 +149,119 @@ export component MainWindow inherits Window {
         }
     }
 
-    // --------------------------------------------------------- top bar ----
-    Rectangle {
-        x: 0px;
-        y: 0px;
+    // Top bar with URL field
+    TopBar {
+        x: 0;
+        y: 0;
         width: parent.width;
-        height: Theme.bar-height;
-        background: Theme.panel;
-
-        Text {
-            x: 40px;
-            width: 72px;
-            text: "Flatline";
-            color: Theme.fg;
-            font-size: 15px;
-            vertical-alignment: center;
-        }
-
-        Image {
-            x: 14px;
-            y: (parent.height - 20px) / 2;
-            width: 20px;
-            height: 20px;
-            source: @image-url("../../../resources/flatline-32.png");
-            image-fit: contain;
-        }
-
-        url-field := Rectangle {
-            x: 124px;
-            y: (parent.height - 32px) / 2;
-            width: parent.width - 124px - 68px;
-            height: 32px;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: url-input.has-focus ? Theme.accent : Theme.border;
-            background: Theme.elevated;
-
-            url-placeholder := Text {
-                x: 10px;
-                text: "Paste a video URL and press Enter";
-                color: Theme.muted;
-                font-size: 13px;
-                vertical-alignment: center;
-                visible: url-input.text == "";
-            }
-
-            url-input := TextInput {
-                x: 10px;
-                y: 0px;
-                width: parent.width - 20px;
-                height: parent.height;
-                text <=> root.url;
-                color: Theme.fg;
-                font-size: 13px;
-                vertical-alignment: center;
-                accepted => {
-                    root.load-requested();
-                }
-            }
-        }
-
-        load-button := FlatButton {
-            x: parent.width - 56px;
-            y: (parent.height - 32px) / 2;
-            width: 40px;
-            height: 32px;
-            label: "Go";
-            primary: true;
-            pointer-activity => { root.pointer-activity(); }
-            clicked => {
-                root.load-requested();
-            }
-        }
+        url <=> root.url;
+        load-requested => { root.load-requested(); }
+        pointer-activity => { root.pointer-activity(); }
     }
 
-    // ------------------------------------------------------- video area ----
-    Rectangle {
-        x: 0px;
+    // Video area with status display
+    VideoPlayer {
+        x: 0;
         y: Theme.bar-height;
         width: parent.width;
         height: parent.height - Theme.bar-height;
-        background: transparent;
-
-        TouchArea {
-            width: parent.width;
-            height: parent.height;
-            pointer-event(event) => {
-                if event.kind == PointerEventKind.move {
-                    root.pointer-activity();
-                }
-            }
-            moved => { root.pointer-activity(); }
-        }
-
-        // A centred message, used for errors and for hints.
-        Rectangle {
-            x: 0px;
-            y: (parent.height - 48px) / 2;
-            width: parent.width;
-            height: 48px;
-
-            // Three dots that take turns lighting up while the player waits.
-            if root.status-kind == "busy": Rectangle {
-                x: (parent.width - 40px) / 2;
-                y: parent.height / 2 - 16px;
-                width: 40px;
-                height: 8px;
-
-                Rectangle {
-                    x: 0px;
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Theme.accent;
-                    opacity: root.spinner-step == 0 ? 1.0 : 0.3;
-                    animate opacity { duration: 160ms; }
-                }
-
-                Rectangle {
-                    x: 16px;
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Theme.accent;
-                    opacity: root.spinner-step == 1 ? 1.0 : 0.3;
-                    animate opacity { duration: 160ms; }
-                }
-
-                Rectangle {
-                    x: 32px;
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Theme.accent;
-                    opacity: root.spinner-step == 2 ? 1.0 : 0.3;
-                    animate opacity { duration: 160ms; }
-                }
-            }
-
-            Text {
-                width: parent.width;
-                y: root.status-kind == "busy" ? parent.height / 2 + 8px : 0px;
-                height: root.status-kind == "busy" ? 24px : parent.height;
-                text: root.status;
-                color: root.status-kind == "error" ? Theme.danger : Theme.muted;
-                font-size: 14px;
-                horizontal-alignment: center;
-                wrap: word-wrap;
-            }
-        }
-
-        // The control bar, floating over the video.
-        Rectangle {
-            x: 0px;
-            y: root.controls-visible ? parent.height - Theme.controls-height : parent.height;
-            width: parent.width;
-            height: Theme.controls-height;
-            background: #000000a6;
-            opacity: root.controls-visible ? 1 : 0;
-            animate y { duration: 180ms; easing: ease-out; }
-            animate opacity { duration: 140ms; }
-
-            TouchArea {
-                width: parent.width;
-                height: parent.height;
-                changed has-hover => {
-                    root.controls-hovered(self.has-hover);
-                }
-            }
-
-            PlayPauseButton {
-                x: 12px;
-                y: (parent.height - 32px) / 2;
-                width: 44px;
-                height: 32px;
-                playing: root.playing;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.play-toggled();
-                }
-            }
-
-            // The live button is only there while a live stream plays.
-            LiveButton {
-                x: 60px;
-                y: (parent.height - 32px) / 2;
-                width: 82px;
-                height: 32px;
-                visible: root.live;
-                at-edge: root.at-live-edge;
-                label: root.time-text;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.live-requested();
-                }
-            }
-
-            Text {
-                x: 68px;
-                width: 64px;
-                visible: !root.live;
-                text: root.time-text;
-                color: Theme.fg;
-                font-size: 12px;
-                vertical-alignment: center;
-            }
-
-            seek := SeekBar {
-                x: root.live ? 152px : 140px;
-                y: (parent.height - 18px) / 2;
-                width: parent.width - (root.live ? 152px : 140px) - 220px;
-                height: 18px;
-                value: root.position;
-                maximum: root.duration;
-                pointer-activity => { root.pointer-activity(); }
-                moved(value) => {
-                    root.seek-requested(value);
-                }
-            }
-
-            GearButton {
-                x: parent.width - 212px;
-                y: (parent.height - 32px) / 2;
-                width: 32px;
-                height: 32px;
-                active: root.sources-open;
-                enabled: root.has-media;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.toggle-sources();
-                }
-            }
-
-            Rectangle {
-                x: parent.width - 40px - 90px - 20px - 26px;
-                y: (parent.height - 24px) / 2;
-                width: 24px;
-                height: 24px;
-                border-radius: 4px;
-                background: volume-touch.pressed ? Theme.elevated : transparent;
-
-                if root.volume <= 0: VolumeOffIcon {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                }
-                if root.volume > 0: VolumeIcon {
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                }
-
-                volume-touch := TouchArea {
-                    x: 0px;
-                    y: 0px;
-                    width: parent.width;
-                    height: parent.height;
-                    pointer-event(event) => {
-                        if event.kind == PointerEventKind.move { root.pointer-activity(); }
-                    }
-                    clicked => {
-                        root.volume-toggled();
-                    }
-                }
-            }
-
-            volume := SeekBar {
-                x: parent.width - 40px - 90px - 20px;
-                y: (parent.height - 18px) / 2;
-                width: 90px;
-                height: 18px;
-                value: root.volume;
-                maximum: 200;
-                moved(value) => {
-                    root.volume-requested(value);
-                }
-            }
-
-            FullscreenButton {
-                x: parent.width - 40px - 12px;
-                y: (parent.height - 32px) / 2;
-                width: 40px;
-                height: 32px;
-                fullscreen: root.fullscreen;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.fullscreen-toggled();
-                }
-            }
-        }
+        container-height: parent.height - Theme.bar-height;
+        status: root.status;
+        status-kind: root.status-kind;
+        spinner-step: root.spinner-step;
+        has-media: root.has-media;
+        controls-visible: root.controls-visible;
+        pointer-activity => { root.pointer-activity(); }
     }
 
-    // --------------------------------------------------- source picker ----
-    if root.sources-open: Rectangle {
-        x: 0px;
-        y: 0px;
+    // Control bar
+    PlayerControls {
+        x: 0;
+        y: parent.height - Theme.controls-height;
+        width: parent.width;
+        height: Theme.controls-height;
+        container-height: parent.height - Theme.bar-height;
+        playing: root.playing;
+        position: root.position;
+        duration: root.duration;
+        volume: root.volume;
+        time-text: root.time-text;
+        live: root.live;
+        at-live-edge: root.at-live-edge;
+        fullscreen: root.fullscreen;
+        sources-open: root.sources-open;
+        has-media: root.has-media;
+        controls-visible: root.controls-visible;
+        play-toggled => { root.play-toggled(); }
+        seek-requested(value) => { root.seek-requested(value); }
+        volume-requested(value) => { root.volume-requested(value); }
+        volume-toggled => { root.volume-toggled(); }
+        fullscreen-toggled => { root.fullscreen-toggled(); }
+        live-requested => { root.live-requested(); }
+        pointer-activity => { root.pointer-activity(); }
+        controls-hovered(hovered) => { root.controls-hovered(hovered); }
+        sources-toggled => { root.toggle-sources(); }
+    }
+
+    // Toast notification
+    Toast {
+        toast-text: root.toast-text;
+        toast-visible: root.toast-visible;
+        controls-height: Theme.controls-height;
+    }
+
+    // Source picker
+    if root.sources-open: SourcePicker {
         width: parent.width;
         height: parent.height;
-        background: #00000066;
-
-        TouchArea {
-            clicked => {
-                root.sources-open = false;
-            }
+        video-sources: root.video-sources;
+        audio-sources: root.audio-sources;
+        muxed-sources: root.muxed-sources;
+        selected-video-id <=> root.draft-video;
+        selected-audio-id <=> root.draft-audio;
+        selected-muxed-id <=> root.draft-muxed;
+        sources-open <=> root.sources-open;
+        sources-applied(v, a, m) => {
+            root.selected-video-id = v;
+            root.selected-audio-id = a;
+            root.selected-muxed-id = m;
+            root.sources-applied(v, a, m);
         }
+        pointer-activity => { root.pointer-activity(); }
+    }
 
-        panel := Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: min(parent.width - 40px, 820px);
-            height: min(parent.height - 40px, 440px);
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.panel;
-            drop-shadow-blur: 24px;
-            drop-shadow-color: #000000c0;
+    // Pending dialog
+    if root.pending-open: PendingDialog {
+        width: parent.width;
+        height: parent.height;
+        pending-title: root.pending-title;
+        pending-thumbnail: root.pending-thumbnail;
+        pending-open <=> root.pending-open;
+        pending-play-requested => { root.pending-play-requested(); }
+        pending-queue-requested => { root.pending-queue-requested(); }
+        pending-dismissed => { root.pending-dismissed(); }
+    }
 
-            // Keep clicks on the panel from reaching the backdrop.
-            TouchArea { }
-
+    if root.update-open: Rectangle {
+        width: parent.width; height: parent.height;
+        background: #00000099;
+        Rectangle {
+            x: (parent.width - min(560px, parent.width - 40px)) / 2;
+            y: (parent.height - min(440px, parent.height - 40px)) / 2;
+            width: min(560px, parent.width - 40px); height: min(440px, parent.height - 40px);
+            background: Theme.panel; border-radius: 12px; border-width: 1px; border-color: Theme.border;
             VerticalLayout {
-                padding: 16px;
-                spacing: 12px;
-
+                padding: 22px; spacing: 12px;
+                Text { text: root.update-installing ? "Installing update…" : "Flatline update available"; color: Theme.fg; font-size: 20px; }
+                Text { text: "Version " + root.update-version; color: Theme.muted; }
+                ScrollView { height: 260px; Text { text: root.update-notes; color: Theme.fg; wrap: word-wrap; } }
+                if root.update-error != "": Text { text: root.update-error; color: Theme.danger; wrap: word-wrap; }
                 HorizontalLayout {
-                    spacing: 8px;
-
-                    Text {
-                        text: "Sources";
-                        color: Theme.fg;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-
-                    Text {
-                        horizontal-stretch: 1;
-                        text: "Pick a video and an audio track, or one combined stream.";
-                        color: Theme.muted;
-                        font-size: 12px;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 10px;
-                    vertical-stretch: 1;
-
-                    SourceColumn {
-                        heading: "Video only";
-                        items: root.video-sources;
-                        selected: root.draft-video;
-                        picked(id) => {
-                            root.toggle-video(id);
-                        }
-                    }
-
-                    SourceColumn {
-                        heading: "Audio only";
-                        items: root.audio-sources;
-                        selected: root.draft-audio;
-                        picked(id) => {
-                            root.toggle-audio(id);
-                        }
-                    }
-
-                    SourceColumn {
-                        heading: "Video + audio";
-                        items: root.muxed-sources;
-                        selected: root.draft-muxed;
-                        picked(id) => {
-                            root.toggle-muxed(id);
-                        }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    Text {
-                        horizontal-stretch: 1;
-                        text: "Selecting a combined stream clears the other two columns.";
-                        color: Theme.muted;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-
-                    FlatButton {
-                        width: 80px;
-                        height: 30px;
-                        label: "Cancel";
-                        clicked => {
-                            root.sources-open = false;
-                        }
-                    }
-
-                    FlatButton {
-                        width: 80px;
-                        height: 30px;
-                        label: "Apply";
-                        primary: true;
-                        enabled: root.can-apply;
-                        clicked => {
-                            root.selected-video-id = root.draft-video;
-                            root.selected-audio-id = root.draft-audio;
-                            root.selected-muxed-id = root.draft-muxed;
-                            root.sources-applied(
-                                root.draft-video,
-                                root.draft-audio,
-                                root.draft-muxed
-                            );
-                            root.sources-open = false;
-                        }
-                    }
+                    alignment: end; spacing: 8px;
+                    if !root.update-installing && root.update-error == "": Button { text: "No"; clicked => { root.update-open = false; root.update-dismissed(); } }
+                    if !root.update-installing && root.update-error == "": Button { text: "Yes, download and install"; clicked => { root.update-installing = true; root.update-accepted(); } }
+                    if root.update-installing: ProgressIndicator { indeterminate: true; }
+                    if root.update-error != "": Button { text: "Close"; clicked => { root.update-open = false; root.update-dismissed(); } }
                 }
             }
         }

@@ -5,11 +5,15 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use library::{Queue, ThumbnailCache};
 use media_model::{MediaSource, PlaybackPlan, Quality};
 use playback_engine::{Engine, LoadRequest};
+use settings::Settings;
 use stream_resolver::{CommandSpec, Resolver};
 use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
@@ -20,12 +24,49 @@ use crate::timeline::{LiveAxis, Timeline};
 /// Something the background work wants to tell the user interface.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// A URL was resolved into a catalog of streams.
-    Resolved(Result<MediaSource, String>),
+    /// A URL was resolved and can start playing.
+    Resolved(Result<ResolvedMedia, String>),
+    /// A URL was resolved while something else plays, so the user decides.
+    Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
     ToolUpdated(String),
+    /// A newer application release is available.
+    UpdateAvailable(updater::Update),
+    /// An accepted application update could not be prepared for installation.
+    UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+}
+
+/// A URL that was resolved and is ready to play.
+#[derive(Debug, Clone)]
+pub struct ResolvedMedia {
+    /// The URL the media was asked for.
+    pub url: String,
+    /// The thumbnail of the resolved media, for the queue.
+    pub thumbnail: Option<String>,
+    /// The time the stream URLs were resolved.
+    pub resolved_at: i64,
+    /// The resolved source.
+    pub source: MediaSource,
+}
+
+/// A URL that was resolved while another media plays.
+///
+/// The user chooses what happens next: the media is either appended to the
+/// active queue or it replaces the queue and plays right away.
+#[derive(Debug, Clone)]
+pub struct PendingMedia {
+    /// The URL the media was asked for.
+    pub url: String,
+    /// Human readable title, for the dialog.
+    pub title: String,
+    /// The cached thumbnail, when one could be downloaded.
+    pub thumbnail: Option<PathBuf>,
+    /// The time the stream URLs were resolved.
+    pub resolved_at: i64,
+    /// The resolved source.
+    pub source: MediaSource,
 }
 
 /// What the user interface has to show after a media was accepted.
@@ -45,6 +86,21 @@ pub struct Loaded {
     pub muxed: Option<String>,
     /// Whether the media is a live stream.
     pub is_live: bool,
+    /// The thumbnail URL as reported by the extractor.
+    pub thumbnail_url: Option<String>,
+    /// The uploader / channel name as reported by the extractor.
+    pub uploader: Option<String>,
+}
+
+/// How long a persisted resolver result may be reused before it is refreshed.
+const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
+
+/// Seconds since the Unix epoch for persisted resolver freshness checks.
+fn unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,12 +146,25 @@ struct State {
     selected_muxed: Option<String>,
     is_live: bool,
     pending_restore: PendingRestore,
+    /// The id_hash of the currently playing video, for history tracking.
+    current_id_hash: Option<String>,
+    /// The url of the currently playing video, for history tracking.
+    current_url: Option<String>,
+    /// The title of the currently playing video, for history tracking.
+    current_title: Option<String>,
+    /// The thumbnail_url of the currently playing video, for history tracking.
+    current_thumbnail_url: Option<String>,
+    /// The uploader of the currently playing video, for history tracking.
+    current_uploader: Option<String>,
+    /// Last time we saved history position (to throttle saves to ~20s intervals).
+    last_history_save: Option<Instant>,
 }
 
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
+    settings: Settings,
     youtube_cookies: std::path::PathBuf,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
@@ -103,6 +172,12 @@ pub struct App {
     state: Mutex<State>,
     /// The time axis of a live stream.
     live: Mutex<LiveAxis>,
+    /// The active queue Flatline keeps between runs.
+    queue: Queue,
+    /// The thumbnails shown before a media is accepted.
+    cache: ThumbnailCache,
+    /// The media the user still has to decide about.
+    pending: Mutex<Option<PendingMedia>>,
 }
 
 impl App {
@@ -111,6 +186,10 @@ impl App {
         let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
         let youtube_cookies = paths.youtube_cookies();
         let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
+        let settings =
+            Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
+        let queue =
+            Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -121,12 +200,16 @@ impl App {
         Ok(App {
             engine,
             resolver: Mutex::new(resolver),
+            settings,
             youtube_cookies,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
+            queue,
+            cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
+            pending: Mutex::new(None),
         })
     }
 
@@ -135,7 +218,12 @@ impl App {
         &self.engine
     }
 
-    /// Resolves a URL and plays it.
+    /// Takes a URL from the user.
+    ///
+    /// When nothing plays, the URL is resolved and played right away and
+    /// becomes the active queue. When a media is already playing, playback is
+    /// left alone: the URL is resolved in the background and the user is
+    /// asked what to do with it through the pending dialog.
     ///
     /// The work happens in the background; the result arrives through
     /// [`App::poll`].
@@ -144,24 +232,258 @@ impl App {
         if url.is_empty() {
             return;
         }
+        if self.has_media() {
+            self.resolve_pending(url);
+        } else {
+            self.prepare_current(&url, "", None, None, None);
+            self.consume_current();
+        }
+    }
+
+    /// Whether a media is loaded in the player.
+    pub fn has_media(&self) -> bool {
+        self.state.lock().expect("the state is not poisoned").source.is_some()
+    }
+
+    /// Resolves the URL read from the active queue in the background.
+    fn resolve_play(&self, url: String) {
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
         let outbox = Arc::clone(&self.outbox);
+        let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string());
+            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
+                let thumbnail = source
+                    .thumbnail
+                    .as_deref()
+                    .and_then(|url| cache.fetch(url).ok())
+                    .map(|path| path.to_string_lossy().into_owned());
+                ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
+            });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
 
-    /// Accepts a resolved source and starts playing it.
+    /// Resolves a URL in the background, caches its thumbnail and waits for
+    /// the user to decide.
+    fn resolve_pending(&self, url: String) {
+        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let outbox = Arc::clone(&self.outbox);
+        let cache = self.cache.clone();
+        let runtime = self.runtime.handle().clone();
+
+        runtime.spawn_blocking(move || {
+            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
+                let thumbnail = source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
+                PendingMedia {
+                    url,
+                    title: source.title.clone(),
+                    source,
+                    thumbnail,
+                    resolved_at: unix_time(),
+                }
+            });
+            let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
+        });
+    }
+
+    /// Stores the pending media so the user can decide what to do with it.
+    pub fn set_pending(&self, pending: PendingMedia) {
+        *self.pending.lock().expect("the pending media is not poisoned") = Some(pending);
+    }
+
+    /// Plays the pending media right away, replacing the active queue.
+    pub fn play_pending(&self) -> Option<(String, Loaded)> {
+        let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
+        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        let thumbnail_url = pending.source.thumbnail.clone();
+        let uploader = pending.source.uploader.clone();
+        self.prepare_current(
+            &pending.url,
+            &pending.title,
+            thumbnail.as_deref(),
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+        );
+        let loaded = self.consume_resolved(
+            &pending.url,
+            pending.source,
+            thumbnail.as_deref(),
+            pending.resolved_at,
+        )?;
+        Some((pending.url, loaded))
+    }
+
+    /// Appends the pending media to the active queue.
+    pub fn queue_pending(&self) -> bool {
+        let Some(pending) = self.pending.lock().expect("the pending media is not poisoned").take()
+        else {
+            return false;
+        };
+        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        let thumbnail_url = pending.source.thumbnail.clone();
+        let uploader = pending.source.uploader.clone();
+        let entry = match self.queue.push(
+            &pending.url,
+            &pending.title,
+            thumbnail.as_deref(),
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                return false;
+            }
+        };
+        if let Ok(source) = serde_json::to_string(&pending.source)
+            && let Err(error) = self.queue.set_resolved_source(
+                entry.position,
+                Some(&source),
+                Some(pending.resolved_at),
+            )
+        {
+            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
+        }
+        true
+    }
+
+    /// Forgets the pending media without doing anything with it.
+    pub fn dismiss_pending(&self) {
+        self.pending.lock().expect("the pending media is not poisoned").take();
+    }
+
+    /// Puts a freshly resolved media in the active queue before it is loaded.
+    pub fn prepare_current(
+        &self,
+        url: &str,
+        title: &str,
+        thumbnail: Option<&str>,
+        thumbnail_url: Option<&str>,
+        uploader: Option<&str>,
+    ) {
+        let thumbnail_path = thumbnail.map(PathBuf::from);
+        if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
+            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
+        }
+        if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
+        {
+            crate::diag::note(&format!("the active queue could not be written: {error}"));
+        }
+    }
+
+    /// Plays the media that plays next in the queue, if there is one.
     ///
-    /// The best streams start playing straight away: the best video with the
-    /// best audio next to it, a combined stream, or an audio-only stream for
-    /// media that has no picture.
-    pub fn accept(&self, source: MediaSource) -> Loaded {
+    /// This is what a finished media calls: the current mark moves forward
+    /// and the entry it lands on is resolved again, because an extractor may
+    /// have changed since the entry was added.
+    pub fn advance(&self) -> bool {
+        match self.queue.advance() {
+            Ok(Some(_)) => {
+                self.consume_current();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
+            }
+        }
+    }
+
+    /// Starts the media the queue left as current, if there is one.
+    ///
+    /// This is what the program calls on startup so a queue that was filled
+    /// in an earlier run picks up where it left off.
+    pub fn resume(&self) -> bool {
+        match self.queue.current() {
+            Ok(Some(_)) => {
+                self.consume_current();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
+            }
+        }
+    }
+
+    /// Asks the current queue entry to be consumed.
+    ///
+    /// The URL is read from the queue, so callers cannot supply a player URL.
+    pub fn consume_current(&self) {
+        match self.queue.current() {
+            Ok(Some(entry)) => {
+                if let (Some(json), Some(resolved_at)) =
+                    (entry.resolved_source.as_deref(), entry.resolved_at)
+                    && unix_time().saturating_sub(resolved_at) <= RESOLVED_SOURCE_MAX_AGE
+                    && let Ok(source) = serde_json::from_str::<MediaSource>(json)
+                {
+                    let message = Message::Resolved(Ok(ResolvedMedia {
+                        url: entry.url,
+                        thumbnail: entry.thumbnail,
+                        resolved_at,
+                        source,
+                    }));
+                    let _ = self.outbox.lock().map(|sender| sender.send(Box::new(message)));
+                } else {
+                    self.resolve_play(entry.url);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+            }
+        }
+    }
+
+    /// Finishes resolving the queue's current item, ignoring stale results.
+    pub fn consume_resolved(
+        &self,
+        url: &str,
+        source: MediaSource,
+        thumbnail: Option<&str>,
+        resolved_at: i64,
+    ) -> Option<Loaded> {
+        let current = match self.queue.current() {
+            Ok(Some(entry)) if entry.url == url => entry,
+            Ok(_) => return None,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                return None;
+            }
+        };
+        if let Err(error) = self.queue.update_details(
+            current.position,
+            &source.title,
+            thumbnail,
+            source.thumbnail.as_deref(),
+            source.uploader.as_deref(),
+        ) {
+            crate::diag::note(&format!("the active queue entry could not be updated: {error}"));
+        }
+        if let Ok(json) = serde_json::to_string(&source)
+            && let Err(error) =
+                self.queue.set_resolved_source(current.position, Some(&json), Some(resolved_at))
+        {
+            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
+        }
+        Some(self.accept_current_source(source, url))
+    }
+
+    /// Builds playback state for the source already authorized by the queue.
+    fn accept_current_source(&self, source: MediaSource, url: &str) -> Loaded {
         let sources = source_lists(&source);
-        let default = stream_resolver::plan(&source, &Quality::Best).ok();
+        let default = self
+            .settings
+            .select(&source, url)
+            .and_then(|quality| {
+                stream_resolver::plan(&source, &quality)
+                    .map_err(|error| settings::Error::Invalid(error.to_string()))
+            })
+            .ok();
         let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
         let loaded = Loaded {
             title: source.title.clone(),
@@ -171,6 +493,18 @@ impl App {
             audio: audio.clone(),
             muxed: muxed.clone(),
             is_live: source.is_live,
+            thumbnail_url: source.thumbnail.clone(),
+            uploader: source.uploader.clone(),
+        };
+
+        // Compute id_hash for history tracking
+        let id_hash = media_model::video_id_hash(url);
+
+        // Check history for saved playback position (only for non-live videos)
+        let history_position = if !source.is_live {
+            self.queue.history_get(&id_hash).ok().flatten().map(|entry| entry.position_seconds)
+        } else {
+            None
         };
 
         {
@@ -180,7 +514,14 @@ impl App {
             state.selected_audio = audio;
             state.selected_muxed = muxed;
             state.is_live = loaded.is_live;
-            state.pending_restore.begin(None);
+            state.pending_restore.begin(history_position.map(PendingSeek::Position));
+            // Store metadata for history tracking
+            state.current_id_hash = Some(id_hash.clone());
+            state.current_url = Some(url.to_string());
+            state.current_title = Some(loaded.title.clone());
+            state.current_thumbnail_url = loaded.thumbnail_url.clone(); // We'll need to add this to Loaded
+            state.current_uploader = loaded.uploader.clone(); // We'll need to add this to Loaded
+            state.last_history_save = None;
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -188,6 +529,8 @@ impl App {
             Some(plan) => {
                 if let Err(error) = self.start(&plan) {
                     self.report(error);
+                } else if let Err(error) = self.engine.play() {
+                    self.report(error.to_string());
                 }
             }
             None => self.report("this source has no playable stream".to_string()),
@@ -372,6 +715,39 @@ impl App {
         });
     }
 
+    /// Checks GitHub for a newer Flatline release in the background.
+    pub fn check_app_update(&self) {
+        let outbox = Arc::clone(&self.outbox);
+        self.runtime.handle().spawn_blocking(move || match updater::check(crate::VERSION) {
+            Ok(Some(update)) => {
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateAvailable(update))));
+            }
+            Ok(None) => crate::diag::note("Flatline is up to date"),
+            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
+        });
+    }
+
+    /// Downloads and prepares an accepted application update in the background.
+    pub fn install_app_update(
+        &self,
+        update: updater::Update,
+        directory: PathBuf,
+        executable: PathBuf,
+    ) {
+        let outbox = Arc::clone(&self.outbox);
+        self.runtime.handle().spawn_blocking(move || {
+            if let Err(error) = updater::install(&update, &directory, &executable) {
+                let message = error.to_string();
+                crate::diag::note(&format!("the Flatline update failed: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateFailed(message))));
+            }
+        });
+    }
+
     /// Marks the start of a replacement file so an older load event is ignored.
     pub fn on_file_started(&self) {
         let mut state = self.state.lock().expect("the state is not poisoned");
@@ -396,6 +772,69 @@ impl App {
                 self.live.lock().expect("the live axis is not poisoned").anchor();
             }
             None => {}
+        }
+    }
+
+    /// Saves the current playback position to history (throttled to ~20s intervals).
+    pub fn save_history_position(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        if state.is_live {
+            return; // Don't save history for live streams
+        }
+        let Some(id_hash) = state.current_id_hash.take() else {
+            return;
+        };
+        // Put it back after checking
+        state.current_id_hash = Some(id_hash.clone());
+
+        let now = Instant::now();
+        let should_save = state
+            .last_history_save
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(20));
+
+        if !should_save {
+            return;
+        }
+
+        let position = self.engine.position().max(0.0);
+        let Some(url) = state.current_url.clone() else {
+            return;
+        };
+        let Some(title) = state.current_title.clone() else {
+            return;
+        };
+        let thumbnail_url = state.current_thumbnail_url.clone();
+        let uploader = state.current_uploader.clone();
+
+        drop(state); // Release lock before DB operation
+
+        if let Err(error) = self.queue.history_upsert(
+            &id_hash,
+            &url,
+            &title,
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+            position,
+        ) {
+            crate::diag::note(&format!("failed to save history position: {error}"));
+        } else {
+            // Update last save time
+            if let Ok(mut state) = self.state.lock() {
+                state.last_history_save = Some(now);
+            }
+        }
+    }
+
+    /// Resets the history position to 0 (called when video finishes).
+    pub fn reset_history_position(&self) {
+        let state = self.state.lock().expect("the state is not poisoned");
+        let Some(id_hash) = state.current_id_hash.clone() else {
+            return;
+        };
+        drop(state);
+
+        if let Err(error) = self.queue.history_reset_position(&id_hash) {
+            crate::diag::note(&format!("failed to reset history position: {error}"));
         }
     }
 
@@ -566,8 +1005,12 @@ pub enum Error {
     Engine(String),
     /// The background runtime could not be started.
     Runtime(String),
+    /// The playback settings could not be loaded.
+    Settings(String),
     /// The tools could not be prepared.
     Tools(String),
+    /// The library, queue or cache could not be opened.
+    Library(String),
 }
 
 impl std::fmt::Display for Error {
@@ -576,7 +1019,9 @@ impl std::fmt::Display for Error {
             Error::Ui(message) => write!(f, "the user interface failed: {message}"),
             Error::Engine(message) => write!(f, "the player failed: {message}"),
             Error::Runtime(message) => write!(f, "the background runtime failed: {message}"),
+            Error::Settings(message) => write!(f, "{message}"),
             Error::Tools(message) => write!(f, "the tools failed: {message}"),
+            Error::Library(message) => write!(f, "the library failed: {message}"),
         }
     }
 }

@@ -1,0 +1,39 @@
+import { Theme } from "../theme.slint";
+
+export component Toast inherits Rectangle {
+    in property <string> toast-text: "";
+    in property <bool> toast-visible: false;
+    in property <length> controls-height: 56px;
+
+    if root.toast-visible: Rectangle {
+        x: parent.width - self.width - 20px;
+        y: parent.height - self.height - root.controls-height - 12px;
+        width: 220px;
+        height: 42px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000a0;
+
+        Rectangle {
+            x: 12px;
+            y: (parent.height - 8px) / 2;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.accent;
+        }
+
+        Text {
+            x: 30px;
+            width: parent.width - 42px;
+            text: root.toast-text;
+            color: Theme.fg;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}

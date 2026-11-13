@@ -19,9 +19,9 @@ pub use render::{GlProcAddress, VideoRenderer};
 
 /// The loudest volume the player accepts, in percent.
 ///
-/// mpv's default ceiling is 130; Flatline raises it so the slider can go to
-/// 200 percent without the player clipping the value.
-pub const MAX_VOLUME: f64 = 200.0;
+/// mpv's default ceiling is 130; Flatline raises it to 100 so the slider
+/// reaches unity gain at 100%.
+pub const MAX_VOLUME: f64 = 100.0;
 
 /// Keeps a volume inside the range the player accepts.
 fn clamp_volume(volume: f64) -> f64 {
@@ -147,6 +147,15 @@ impl Engine {
             .set_property("title", "Flatline")?
             .set_property("volume-max", MAX_VOLUME)?
             .build()?;
+
+        // mpv does not deliver file lifecycle events until they are requested.
+        for event in [
+            rsmpv::sys::MPV_EVENT_START_FILE,
+            rsmpv::sys::MPV_EVENT_FILE_LOADED,
+            rsmpv::sys::MPV_EVENT_END_FILE,
+        ] {
+            mpv.request_event(event, true)?;
+        }
 
         Ok(Engine { core: std::sync::Arc::new(mpv) })
     }

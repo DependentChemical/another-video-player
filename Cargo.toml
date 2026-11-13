@@ -1,21 +1,25 @@
-[workspace]
+﻿[workspace]
 resolver = "3"
 members = [
     "crates/app-core",
+    "crates/database",
+    "crates/library",
     "crates/media-model",
+    "crates/settings",
     "crates/playback-engine",
     "crates/storyboard",
     "crates/stream-resolver",
     "crates/ui-kit",
     "crates/video-surface",
     "crates/ytdlp-tool",
+    "crates/updater",
     "xtask",
 ]
 # `cargo run` / `cargo build` at the workspace root operate on the primary crate.
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -24,13 +28,17 @@ authors = ["Flatline contributors"]
 [workspace.dependencies]
 # --- internal crates (see AGENTS.md "Crate isolation") -------------------------
 app-core = { path = "crates/app-core" }
+database = { path = "crates/database" }
+library = { path = "crates/library" }
 media-model = { path = "crates/media-model" }
+settings = { path = "crates/settings" }
 playback-engine = { path = "crates/playback-engine" }
 storyboard = { path = "crates/storyboard" }
 stream-resolver = { path = "crates/stream-resolver" }
 ui-kit = { path = "crates/ui-kit" }
 video-surface = { path = "crates/video-surface" }
 ytdlp-tool = { path = "crates/ytdlp-tool" }
+updater = { path = "crates/updater" }
 
 # --- external crates ---------------------------------------------------------
 slint = { version = "1.18", default-features = false, features = [
@@ -43,15 +51,19 @@ slint = { version = "1.18", default-features = false, features = [
 ] }
 slint-build = "1.18"
 rsmpv = { version = "0.2.1", features = ["render"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ttf-parser = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ureq = { version = "3", features = ["json"] }
 zip = "8"
+md5 = "0.7"
+url = "2"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+

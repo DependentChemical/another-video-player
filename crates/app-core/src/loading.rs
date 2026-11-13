@@ -18,6 +18,8 @@ pub enum Status {
 
 /// The text shown while a URL is being resolved.
 const RESOLVING: &str = "Resolving video...";
+/// The text shown while the next active-queue item is being prepared.
+const PARSING_NEXT: &str = "Parsing next video...";
 /// The text shown while the player is waiting for data.
 const BUFFERING: &str = "Buffering...";
 
@@ -44,11 +46,18 @@ pub struct Loading {
     // Set when mpv starts the file that belongs to the current load, so a
     // file that belonged to an earlier load never disturbs the indicator.
     current_file: bool,
+    /// Prevents a persistent mpv EOF state from advancing on every UI tick.
+    eof_consumed: bool,
 }
 
 impl Default for Loading {
     fn default() -> Self {
-        Loading { phase: Phase::Idle, status: Status::Info(String::new()), current_file: false }
+        Loading {
+            phase: Phase::Idle,
+            status: Status::Info(String::new()),
+            current_file: false,
+            eof_consumed: false,
+        }
     }
 }
 
@@ -79,6 +88,13 @@ impl Loading {
     pub fn resolved(&mut self) {
         self.phase = Phase::Starting;
         self.status = Status::Busy(BUFFERING);
+        self.current_file = false;
+    }
+
+    /// Shows progress while the next item in the active queue is prepared.
+    pub fn parsing_next(&mut self) {
+        self.phase = Phase::Resolving;
+        self.status = Status::Busy(PARSING_NEXT);
         self.current_file = false;
     }
 
@@ -119,6 +135,15 @@ impl Loading {
     /// mpv began loading the file that belongs to the current load.
     pub fn file_started(&mut self) {
         self.current_file = true;
+    }
+
+    /// Claims an EOF once and rearms after mpv clears the EOF property.
+    pub fn observe_eof(&mut self, reached: bool) -> bool {
+        if !reached {
+            self.eof_consumed = false;
+            return false;
+        }
+        !std::mem::replace(&mut self.eof_consumed, true)
     }
 
     /// Playback of a file ended.
@@ -179,6 +204,15 @@ mod tests {
         loading.resolve_started();
 
         assert_eq!(loading.status(), &Status::Busy(RESOLVING));
+        assert!(loading.is_busy());
+    }
+
+    #[test]
+    fn next_queue_item_shows_parsing_status() {
+        let mut loading = Loading::new();
+        loading.parsing_next();
+
+        assert_eq!(loading.status(), &Status::Busy("Parsing next video..."));
         assert!(loading.is_busy());
     }
 
@@ -279,6 +313,20 @@ mod tests {
 
         loading.file_ended(Some("boom".to_string()));
         assert_eq!(loading.status(), &Status::Error("boom".to_string()));
+    }
+
+    #[test]
+    fn an_eof_is_claimed_once_until_mpv_clears_it() {
+        let mut loading = Loading::new();
+        loading.file_started();
+
+        assert!(loading.observe_eof(true));
+        assert!(!loading.observe_eof(true));
+
+        loading.file_started();
+        assert!(!loading.observe_eof(true));
+        assert!(!loading.observe_eof(false));
+        assert!(loading.observe_eof(true));
     }
 
     #[test]

@@ -6,11 +6,14 @@
 //! them works inside.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use playback_engine::{EndReason, EngineEvent};
+#[cfg(target_os = "windows")]
+use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
 use ui_kit::{PlayerUi, StatusKind};
@@ -20,10 +23,6 @@ use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
-/// Attenuation range represented by the lower half of the slider.
-const VOLUME_ATTENUATION_DB: f64 = 60.0;
-/// Boost range represented by the upper half of the slider.
-const VOLUME_BOOST_DB: f64 = 20.0 * std::f64::consts::LOG10_2;
 
 /// The window of the player, together with everything it is wired to.
 pub struct Shell {
@@ -37,8 +36,13 @@ pub struct Shell {
 
 impl Shell {
     /// Builds the window and connects it to the application.
-    pub fn new(app: Arc<App>) -> Result<Shell, Error> {
+    pub fn new(app: Arc<App>, program_dir: PathBuf) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
+        let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
+            .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
+            .into_rgba8();
+        let icon = slint::winit_030::winit::window::Icon::from_rgba(icon.into_raw(), 256, 256)
+            .map_err(|error| Error::Ui(format!("the window icon is invalid: {error}")))?;
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let controls_hovered = Rc::new(Cell::new(false));
@@ -66,13 +70,47 @@ impl Shell {
         .map_err(|error| Error::Ui(error.to_string()))?;
 
         let loading = Rc::new(RefCell::new(Loading::new()));
+        let update = Rc::new(RefCell::new(None));
+        {
+            let update = Rc::clone(&update);
+            let app = Arc::clone(&app);
+            let install_dir = program_dir.clone();
+            ui.on_update_accepted(move || {
+                if let Some(update) = update.borrow().clone() {
+                    let directory = install_dir.clone();
+                    let executable = std::env::current_exe().unwrap_or_else(|_| {
+                        directory.join(if cfg!(windows) { "flatline.exe" } else { "flatline" })
+                    });
+                    app.install_app_update(update, directory, executable);
+                }
+            });
+        }
+        {
+            let update = Rc::clone(&update);
+            ui.on_update_dismissed(move || {
+                update.borrow_mut().take();
+            });
+        }
 
         // Window exit is distinct from pointer movement within the client area.
         {
             let window = ui.window().window();
             let ui_for_events = Rc::clone(&ui);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
-            window.on_winit_window_event(move |_, event| {
+            let mut window_icon = Some(icon);
+            window.on_winit_window_event(move |slint_window, event| {
+                if let Some(icon) = window_icon.take() {
+                    let applied = slint_window.with_winit_window(|native_window| {
+                        native_window.set_window_icon(Some(icon.clone()));
+                        #[cfg(target_os = "windows")]
+                        native_window.set_taskbar_icon(Some(icon));
+                    });
+                    if applied.is_none() {
+                        crate::diag::note(
+                            "the native window was not ready when its icon was applied",
+                        );
+                    }
+                }
                 match event {
                     winit::event::WindowEvent::CursorLeft { .. } => {
                         last_pointer_activity.set(Instant::now() - Duration::from_secs(5));
@@ -94,11 +132,52 @@ impl Shell {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            let ui_for_load = Rc::clone(&ui);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
-                loading.borrow_mut().resolve_started();
+                if ui_for_load.has_media() {
+                    // Something plays already, so the new URL must not
+                    // interrupt it. A toast says the background is working
+                    // and the dialog appears once the media is resolved.
+                    ui_for_load.show_toast("Parsing video");
+                } else {
+                    loading.borrow_mut().resolve_started();
+                }
                 app.load(url);
             });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_pending_play(move || {
+                if let Some((_, loaded)) = app.play_pending() {
+                    ui_for_pending.hide_toast();
+                    ui_for_pending.set_media_title(&loaded.title);
+                    ui_for_pending.set_sources(&loaded.sources);
+                    ui_for_pending.set_selected_sources(
+                        loaded.video.as_deref(),
+                        loaded.audio.as_deref(),
+                        loaded.muxed.as_deref(),
+                    );
+                    ui_for_pending.set_has_media(true);
+                    ui_for_pending.set_live(loaded.is_live);
+                    loading.borrow_mut().resolved();
+                    if let Some(duration) = loaded.duration {
+                        ui_for_pending.set_duration(duration);
+                    }
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            ui.on_pending_queue(move || {
+                let _ = app.queue_pending();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            ui.on_pending_dismissed(move || app.dismiss_pending());
         }
         {
             let app = Arc::clone(&app);
@@ -167,7 +246,7 @@ impl Shell {
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
-                tick(&ui, &app, &mut loading);
+                tick(&ui, &app, &mut loading, &update);
                 spinner_step.set((spinner_step.get() + 1) % 3);
                 ui.set_spinner_step(spinner_step.get());
                 let visible = ui.sources_open()
@@ -196,6 +275,13 @@ impl Shell {
         self.app.load(url.to_string());
     }
 
+    /// Continues the active queue that was filled in an earlier run.
+    pub fn resume(&self) {
+        if self.app.resume() {
+            self.loading.borrow_mut().resolve_started();
+        }
+    }
+
     /// The application behind the window.
     pub fn app(&self) -> &Arc<App> {
         &self.app
@@ -218,38 +304,47 @@ fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
     volume
 }
 
-/// Converts the UI's audio-tapered slider value to mpv's linear gain percent.
+/// Converts the UI slider value to mpv's linear gain percent.
+///
+/// The slider uses a perceptual scale (quadratic) where 100% is unity gain
+/// and 0% is mute. The quadratic curve matches human loudness perception.
 fn slider_to_player_volume(slider: f64) -> f64 {
-    let slider = slider.clamp(0.0, 200.0);
-    if slider == 0.0 {
+    let slider = slider.clamp(0.0, 100.0);
+    if slider <= 0.0 {
         0.0
-    } else if slider <= 100.0 {
-        let position = slider / 100.0;
-        100.0 * 10.0_f64.powf(-VOLUME_ATTENUATION_DB * (1.0 - position) / 20.0)
     } else {
-        let position = (slider - 100.0) / 100.0;
-        100.0 * 10.0_f64.powf(VOLUME_BOOST_DB * position / 20.0)
+        // Perceptual taper: quadratic curve for gradual attenuation.
+        let position = slider / 100.0;
+        100.0 * position * position
     }
 }
 
-/// Converts mpv's linear gain percent back to the audio-tapered UI position.
+/// Converts mpv's linear gain percent back to the UI slider position.
 fn player_to_slider_volume(volume: f64) -> f64 {
-    let volume = volume.clamp(0.0, 200.0);
-    if volume == 0.0 {
-        0.0
-    } else if volume <= 100.0 {
-        100.0 * (1.0 + 20.0 * (volume / 100.0).log10() / VOLUME_ATTENUATION_DB)
-    } else {
-        100.0 + 100.0 * 20.0 * (volume / 100.0).log10() / VOLUME_BOOST_DB
-    }
+    let volume = volume.clamp(0.0, 100.0);
+    if volume <= 0.0 { 0.0 } else { 100.0 * (volume / 100.0).sqrt() }
 }
 
 /// Brings the interface and the player back in sync.
-fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
+fn tick(
+    ui: &PlayerUi,
+    app: &App,
+    loading: &mut Loading,
+    update_slot: &Rc<RefCell<Option<updater::Update>>>,
+) {
     for message in app.poll() {
         match message {
-            Message::Resolved(Ok(source)) => {
-                let loaded = app.accept(source);
+            Message::Resolved(Ok(media)) => {
+                let crate::app::ResolvedMedia { url, thumbnail, resolved_at, source } = media;
+                let Some(loaded) =
+                    app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at)
+                else {
+                    crate::diag::note(
+                        "discarded a resolved video that is no longer current in the active queue",
+                    );
+                    continue;
+                };
+                ui.hide_toast();
                 ui.set_media_title(&loaded.title);
                 ui.set_sources(&loaded.sources);
                 ui.set_selected_sources(
@@ -264,17 +359,43 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => loading.resolve_failed(error),
+            Message::Resolved(Err(error)) => {
+                ui.hide_toast();
+                loading.resolve_failed(error);
+            }
+            Message::Pending(Ok(pending)) => {
+                ui.hide_toast();
+                ui.show_pending(&pending.title, pending.thumbnail.as_deref());
+                app.set_pending(pending);
+            }
+            Message::Pending(Err(error)) => {
+                ui.hide_toast();
+                loading.problem(error);
+            }
             Message::ToolUpdated(path) => {
                 if !loading.tool_updated(&path) {
                     crate::diag::note(&format!("yt-dlp was updated ({path})"));
                 }
             }
+            Message::UpdateAvailable(update) => {
+                ui.show_update(&update.version, &update.notes);
+                *update_slot.borrow_mut() = Some(update);
+            }
+            Message::UpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => loading.problem(text),
         }
     }
 
     drain_engine_events(app, loading);
+
+    // Save playback position to history periodically (for non-live videos)
+    app.save_history_position();
+
+    // keep-open leaves the completed file loaded, so advance from the
+    // persistent EOF property instead of waiting for the file-unload event.
+    if loading.observe_eof(app.engine().is_eof()) && app.advance() {
+        loading.parsing_next();
+    }
 
     loading.observe(app.engine().is_active(), app.engine().is_buffering());
     match loading.status() {
@@ -313,6 +434,10 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
                 loading.file_ended(failure);
+                // Reset history position when video finishes normally (not error/stop)
+                if reason == EndReason::Eof {
+                    app.reset_history_position();
+                }
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {
@@ -367,19 +492,22 @@ mod tests {
     }
 
     #[test]
-    fn audio_taper_keeps_mute_unity_and_double_gain_anchors() {
+    fn volume_slider_maps_zero_to_mute_and_hundred_to_unity() {
         assert_eq!(slider_to_player_volume(0.0), 0.0);
         assert!((slider_to_player_volume(100.0) - 100.0).abs() < 1e-10);
-        assert!((slider_to_player_volume(200.0) - 200.0).abs() < 1e-10);
         assert!((player_to_slider_volume(100.0) - 100.0).abs() < 1e-10);
+        assert!((player_to_slider_volume(0.0) - 0.0).abs() < 1e-10);
     }
 
     #[test]
-    fn audio_taper_round_trips_volume_values() {
-        for slider in [1.0, 25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 175.0, 200.0] {
+    fn volume_slider_round_trips_perceptually() {
+        for slider in [1.0, 25.0, 50.0, 75.0, 100.0] {
             let player = slider_to_player_volume(slider);
             assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
         }
-        assert!(slider_to_player_volume(50.0) < 10.0);
+        // Below unity the volume should fall off gradually, not collapse instantly.
+        assert!((slider_to_player_volume(50.0) - 25.0).abs() < 1e-9);
+        assert!(slider_to_player_volume(50.0) < slider_to_player_volume(75.0));
+        assert!(slider_to_player_volume(25.0) > 0.0);
     }
 }

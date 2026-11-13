@@ -49,6 +49,9 @@ pub fn package() -> Result<PathBuf, String> {
     // The tool that resolves the URLs, so the folder works offline.
     copy_ytdlp(&staging, platform)?;
 
+    // Files bundled with the player, placed next to the executable.
+    copy_includes(&root, &staging)?;
+
     let archive = distribution.join(format!("{FOLDER}-{version}-{}.zip", platform.archive_name()));
     compress(&staging, &archive)?;
 
@@ -176,6 +179,30 @@ fn add_directory(
             writer.start_file(name, options).map_err(|error| error.to_string())?;
             let mut source = std::fs::File::open(&path).map_err(|error| error.to_string())?;
             std::io::copy(&mut source, writer).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies bundled files from `includes/` into the staged package.
+fn copy_includes(root: &Path, staging: &Path) -> Result<(), String> {
+    let source = root.join("includes");
+    if !source.is_dir() {
+        return Ok(());
+    }
+    copy_directory_contents(&source, staging)
+}
+
+/// Recursively copies the contents of a directory into another directory.
+fn copy_directory_contents(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|error| error.to_string())?;
+    for entry in std::fs::read_dir(from).map_err(|error| error.to_string())?.flatten() {
+        let path = entry.path();
+        let destination = to.join(path.file_name().unwrap_or_default());
+        if path.is_dir() {
+            copy_directory_contents(&path, &destination)?;
+        } else if path.is_file() {
+            copy(&path, &destination)?;
         }
     }
     Ok(())

@@ -1,0 +1,155 @@
+import { Theme } from "../theme.slint";
+import { FlatButton } from "../widgets.slint";
+import { SourceColumn } from "SourceColumn.slint";
+import { StreamItem } from "types.slint";
+
+export component SourcePicker inherits Rectangle {
+    in property <[StreamItem]> video-sources: [];
+    in property <[StreamItem]> audio-sources: [];
+    in property <[StreamItem]> muxed-sources: [];
+    in-out property <string> selected-video-id: "";
+    in-out property <string> selected-audio-id: "";
+    in-out property <string> selected-muxed-id: "";
+    in-out property <bool> sources-open: false;
+    callback sources-applied(string, string, string);
+    callback pointer-activity();
+
+    private property <string> draft-video: "";
+    private property <string> draft-audio: "";
+    private property <string> draft-muxed: "";
+
+    private property <bool> can-apply: root.draft-video != ""
+        || root.draft-audio != ""
+        || root.draft-muxed != "";
+
+    x: 0px;
+    y: 0px;
+    background: #00000066;
+
+    TouchArea {
+        clicked => {
+            root.sources-open = false;
+        }
+    }
+
+    panel := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: min(root.width - 40px, 820px);
+        height: min(root.height - 40px, 440px);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000c0;
+
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "Sources";
+                    color: Theme.fg;
+                    font-size: 16px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Pick a video and an audio track, or one combined stream.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                vertical-stretch: 1;
+
+                SourceColumn {
+                    heading: "Video only";
+                    items: root.video-sources;
+                    selected: root.draft-video;
+                    picked(id) => {
+                        root.draft-muxed = "";
+                        root.draft-video = root.draft-video == id ? "" : id;
+                    }
+                }
+
+                SourceColumn {
+                    heading: "Audio only";
+                    items: root.audio-sources;
+                    selected: root.draft-audio;
+                    picked(id) => {
+                        root.draft-muxed = "";
+                        root.draft-audio = root.draft-audio == id ? "" : id;
+                    }
+                }
+
+                SourceColumn {
+                    heading: "Video + audio";
+                    items: root.muxed-sources;
+                    selected: root.draft-muxed;
+                    picked(id) => {
+                        if (root.draft-muxed == id) {
+                            root.draft-muxed = "";
+                        } else {
+                            root.draft-muxed = id;
+                            root.draft-video = "";
+                            root.draft-audio = "";
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Selecting a combined stream clears the other two columns.";
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                FlatButton {
+                    width: 80px;
+                    height: 30px;
+                    label: "Cancel";
+                    clicked => {
+                        root.sources-open = false;
+                    }
+                }
+
+                FlatButton {
+                    width: 80px;
+                    height: 30px;
+                    label: "Apply";
+                    primary: true;
+                    enabled: root.can-apply;
+                    clicked => {
+                        root.selected-video-id = root.draft-video;
+                        root.selected-audio-id = root.draft-audio;
+                        root.selected-muxed-id = root.draft-muxed;
+                        root.sources-applied(
+                            root.draft-video,
+                            root.draft-audio,
+                            root.draft-muxed
+                        );
+                        root.sources-open = false;
+                    }
+                }
+            }
+        }
+    }
+}

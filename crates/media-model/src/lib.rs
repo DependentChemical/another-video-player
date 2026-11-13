@@ -17,9 +17,11 @@
 //!   **not** belong here.
 
 pub mod catalog;
+pub mod identity;
 pub mod plan;
 pub mod quality;
 
 pub use catalog::{AudioStream, MediaSource, VideoStream, best_audio, best_video};
+pub use identity::{clean_video_url, video_id_hash};
 pub use plan::PlaybackPlan;
 pub use quality::Quality;

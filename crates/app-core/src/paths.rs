@@ -55,6 +55,11 @@ impl AppPaths {
         self.program.join("cookies-youtube.txt")
     }
 
+    /// The bundled settings document beside the executable.
+    pub fn settings(&self) -> PathBuf {
+        self.program.join("settings.json")
+    }
+
     /// Whether the program directory is the one that is written to.
     ///
     /// When this is false the files live in the per user directory instead.
@@ -77,6 +82,16 @@ impl AppPaths {
         self.root.join("thumbnails")
     }
 
+    /// The SQLite database with the queue and, later, the rest of the library.
+    pub fn database(&self) -> PathBuf {
+        self.root.join("app.db")
+    }
+
+    /// The directory downloaded thumbnails are cached in.
+    pub fn cache(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
     /// The file the diagnostics are written to.
     pub fn log_file(&self) -> PathBuf {
         self.root.join("flatline.log")
@@ -86,6 +101,7 @@ impl AppPaths {
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.tools())?;
         std::fs::create_dir_all(self.thumbnails())?;
+        std::fs::create_dir_all(self.cache())?;
         Ok(())
     }
 }
@@ -161,6 +177,8 @@ mod tests {
         let paths = AppPaths::with_root("/tmp/flatline");
         assert_eq!(paths.tools(), PathBuf::from("/tmp/flatline").join("tools"));
         assert_eq!(paths.thumbnails(), PathBuf::from("/tmp/flatline").join("thumbnails"));
+        assert_eq!(paths.database(), PathBuf::from("/tmp/flatline").join("app.db"));
+        assert_eq!(paths.cache(), PathBuf::from("/tmp/flatline").join("cache"));
         assert_eq!(paths.log_file(), PathBuf::from("/tmp/flatline").join("flatline.log"));
         assert_eq!(
             paths.youtube_cookies(),

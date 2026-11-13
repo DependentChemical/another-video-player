@@ -43,13 +43,15 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
     };
 
     let app = Arc::new(App::new(&ytdlp, &paths)?);
-    let shell = Shell::new(Arc::clone(&app))?;
+    let shell = Shell::new(Arc::clone(&app), paths.program().to_path_buf())?;
 
     // Look for a newer yt-dlp while the player is already running.
     app.check_tool_update(&ytdlp, &paths);
+    app.check_app_update();
 
-    if let Some(url) = url {
-        shell.load(url);
+    match url {
+        Some(url) => shell.load(url),
+        None => shell.resume(),
     }
 
     shell.run();

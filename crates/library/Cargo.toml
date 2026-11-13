@@ -1,0 +1,15 @@
+﻿[package]
+name = "library"
+description = "Flatline's on-disk library: the persistent queue and the cached assets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1: models on top of the database. Knows nothing about playback or UI.
+[dependencies]
+database = { workspace = true }
+media-model = { workspace = true }
+rusqlite = { workspace = true }
+ureq = { workspace = true }
