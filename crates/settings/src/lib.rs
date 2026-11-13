@@ -163,8 +163,12 @@ fn video_choices<'a>(
             push_unique_video(&mut choices, stream);
         }
     }
-    if let Some(stream) = pick_video_fallback(streams.iter().copied(), last_resolution(preferences))
-    {
+    let fallback = if preferences.last().is_some_and(|pref| pref == "default") {
+        streams.iter().copied().max_by_key(|stream| stream.rank())
+    } else {
+        pick_video_fallback(streams.iter().copied(), last_resolution(preferences))
+    };
+    if let Some(stream) = fallback {
         push_unique_video(&mut choices, stream);
     }
     // A symbolic-only list such as `default` still resolves when the source
@@ -198,7 +202,12 @@ fn audio_choices<'a>(
             push_unique_audio(&mut choices, stream);
         }
     }
-    if let Some(stream) = pick_audio_fallback(streams.iter().copied(), last_bitrate(preferences)) {
+    let fallback = if preferences.last().is_some_and(|pref| pref == "default") {
+        streams.iter().copied().max_by_key(|stream| stream.rank())
+    } else {
+        pick_audio_fallback(streams.iter().copied(), last_bitrate(preferences))
+    };
+    if let Some(stream) = fallback {
         push_unique_audio(&mut choices, stream);
     }
     if choices.is_empty()
@@ -478,6 +487,20 @@ mod tests {
         assert_eq!(
             choose(&source, &settings),
             Some(Quality::Streams { video: Some("480".into()), audio: Some("96".into()) })
+        );
+    }
+
+    #[test]
+    fn a_failed_final_default_uses_best_as_the_fallback_for_video_and_audio() {
+        let mut source = source();
+        for stream in &mut source.audio_streams {
+            stream.note = None;
+        }
+        let settings =
+            serde_json::json!({"video":"650,default", "audio":"100,default", "combined":""});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("1080".into()), audio: Some("128".into()) })
         );
     }
 
