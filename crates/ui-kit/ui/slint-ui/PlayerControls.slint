@@ -110,12 +110,16 @@ export component PlayerControls inherits Rectangle {
             background: volume-touch.pressed ? Theme.elevated : transparent;
 
             if root.volume <= 0: VolumeOffIcon {
-                x: (root.width - self.width) / 2;
-                y: (root.height - self.height) / 2;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 24px;
+                height: 24px;
             }
             if root.volume > 0: VolumeIcon {
-                x: (root.width - self.width) / 2;
-                y: (root.height - self.height) / 2;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 24px;
+                height: 24px;
             }
 
             volume-touch := TouchArea {
