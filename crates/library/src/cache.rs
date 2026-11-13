@@ -10,9 +10,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use image_process::{jpeg_path_for, normalize_to_jpeg};
+use image_process::normalize_to_jpeg;
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
+
+/// The extensions a downloaded thumbnail may have (used for the temp file).
+const DOWNLOAD_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 
 /// The directory downloaded thumbnails are kept in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +43,19 @@ impl ThumbnailCache {
     ///
     /// The cached thumbnail is always normalized to JPEG so the UI can render it.
     pub fn fetch(&self, url: &str) -> Result<PathBuf, Error> {
-        let path = self.path_for(url);
-        if path.is_file() {
-            return Ok(path);
+        let jpeg_path = self.path_for(url);
+        if jpeg_path.is_file() {
+            return Ok(jpeg_path);
         }
 
         fs::create_dir_all(&self.directory)?;
-        let temporary = temporary_path(&path);
+
+        // Download to a temp file with the original extension (so the image crate
+        // can detect the format), then normalize to JPEG.
+        let download_ext = download_extension_of(url);
+        let temp_name = format!("{:016x}.{}.part", fnv1a(url.as_bytes()), download_ext);
+        let temporary = self.directory.join(temp_name);
+
         {
             let mut response = ureq::get(url)
                 .header("User-Agent", USER_AGENT)
@@ -58,14 +67,8 @@ impl ThumbnailCache {
             file.sync_all()?;
         }
 
-        if let Err(error) = fs::rename(&temporary, &path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(Error::Io(error));
-        }
-
-        // Normalize to JPEG (converts if needed, cleans up original)
-        let jpeg_path = jpeg_path_for(&path);
-        normalize_to_jpeg(&path, &jpeg_path)?;
+        // Normalize to JPEG (converts if needed, cleans up original temp file)
+        normalize_to_jpeg(&temporary, &jpeg_path)?;
 
         Ok(jpeg_path)
     }
@@ -102,13 +105,24 @@ impl ThumbnailCache {
     }
 }
 
-/// The file name a thumbnail URL is cached under.
-///
-/// The name is a hash of the URL, so it never carries a character the file
-/// system rejects and two different URLs never collide in practice.
-/// The extension is always .jpg since thumbnails are normalized to JPEG.
+/// The file name a thumbnail URL is cached under (always .jpg).
 pub fn file_name_for(url: &str) -> String {
     format!("{:016x}.jpg", fnv1a(url.as_bytes()))
+}
+
+/// The extension to use for the temporary download file.
+fn download_extension_of(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let candidate = path.rsplit('.').next().unwrap_or_default();
+    if candidate.len() <= 5
+        && !candidate.is_empty()
+        && candidate.chars().all(|c| c.is_ascii_alphanumeric())
+        && DOWNLOAD_EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(candidate))
+    {
+        candidate
+    } else {
+        "jpg"
+    }
 }
 
 /// A 64 bit FNV-1a hash, used only for cache file names.
@@ -119,13 +133,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// Path of the scratch file used while downloading.
-fn temporary_path(destination: &Path) -> PathBuf {
-    let mut name = destination.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
-    destination.with_file_name(name)
 }
 
 #[cfg(test)]
