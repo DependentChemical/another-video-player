@@ -10,3 +10,5 @@ authors.workspace = true
 # Layer 0 of the isolation ladder: pure vocabulary, no internal dependencies.
 [dependencies]
 serde = { workspace = true }
+md5 = { workspace = true }
+url = { workspace = true }

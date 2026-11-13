@@ -224,7 +224,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "app-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "image",
  "library",
@@ -1055,7 +1055,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "database"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rusqlite",
 ]
@@ -2668,9 +2668,10 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "library"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "database",
+ "media-model",
  "rusqlite",
  "ureq",
 ]
@@ -2836,10 +2837,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef1d73c59a56771343712b22ea5615092c612c16ba291c0979e3105dfeec4890"
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "media-model"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
+ "md5",
  "serde",
+ "url",
 ]
 
 [[package]]
@@ -3647,7 +3656,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "rsmpv",
 ]
@@ -4257,7 +4266,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "media-model",
  "regex",
@@ -4610,11 +4619,11 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storyboard"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "stream-resolver"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "media-model",
  "serde",
@@ -5095,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "slint",
  "slint-build",
@@ -5287,7 +5296,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-surface"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "playback-engine",
  "slint",
@@ -6183,7 +6192,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6235,7 +6244,7 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-tool"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",

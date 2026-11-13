@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use library::{Queue, ThumbnailCache};
 use media_model::{MediaSource, PlaybackPlan, Quality};
@@ -82,6 +82,10 @@ pub struct Loaded {
     pub muxed: Option<String>,
     /// Whether the media is a live stream.
     pub is_live: bool,
+    /// The thumbnail URL as reported by the extractor.
+    pub thumbnail_url: Option<String>,
+    /// The uploader / channel name as reported by the extractor.
+    pub uploader: Option<String>,
 }
 
 /// How long a persisted resolver result may be reused before it is refreshed.
@@ -138,6 +142,18 @@ struct State {
     selected_muxed: Option<String>,
     is_live: bool,
     pending_restore: PendingRestore,
+    /// The id_hash of the currently playing video, for history tracking.
+    current_id_hash: Option<String>,
+    /// The url of the currently playing video, for history tracking.
+    current_url: Option<String>,
+    /// The title of the currently playing video, for history tracking.
+    current_title: Option<String>,
+    /// The thumbnail_url of the currently playing video, for history tracking.
+    current_thumbnail_url: Option<String>,
+    /// The uploader of the currently playing video, for history tracking.
+    current_uploader: Option<String>,
+    /// Last time we saved history position (to throttle saves to ~20s intervals).
+    last_history_save: Option<Instant>,
 }
 
 /// The application, without a user interface.
@@ -215,7 +231,7 @@ impl App {
         if self.has_media() {
             self.resolve_pending(url);
         } else {
-            self.prepare_current(&url, "", None);
+            self.prepare_current(&url, "", None, None, None);
             self.consume_current();
         }
     }
@@ -277,7 +293,9 @@ impl App {
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
-        self.prepare_current(&pending.url, &pending.title, thumbnail.as_deref());
+        let thumbnail_url = pending.source.thumbnail.clone();
+        let uploader = pending.source.uploader.clone();
+        self.prepare_current(&pending.url, &pending.title, thumbnail.as_deref(), thumbnail_url.as_deref(), uploader.as_deref());
         let loaded = self.consume_resolved(
             &pending.url,
             pending.source,
@@ -294,7 +312,9 @@ impl App {
             return false;
         };
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
-        let entry = match self.queue.push(&pending.url, &pending.title, thumbnail.as_deref()) {
+        let thumbnail_url = pending.source.thumbnail.clone();
+        let uploader = pending.source.uploader.clone();
+        let entry = match self.queue.push(&pending.url, &pending.title, thumbnail.as_deref(), thumbnail_url.as_deref(), uploader.as_deref()) {
             Ok(entry) => entry,
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be written: {error}"));
@@ -319,12 +339,12 @@ impl App {
     }
 
     /// Puts a freshly resolved media in the active queue before it is loaded.
-    pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>) {
+    pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>, thumbnail_url: Option<&str>, uploader: Option<&str>) {
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
         }
-        if let Err(error) = self.queue.replace_with(url, title, thumbnail) {
+        if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader) {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
         }
     }
@@ -411,7 +431,13 @@ impl App {
                 return None;
             }
         };
-        if let Err(error) = self.queue.update_details(current.position, &source.title, thumbnail) {
+        if let Err(error) = self.queue.update_details(
+            current.position,
+            &source.title,
+            thumbnail,
+            source.thumbnail.as_deref(),
+            source.uploader.as_deref(),
+        ) {
             crate::diag::note(&format!("the active queue entry could not be updated: {error}"));
         }
         if let Ok(json) = serde_json::to_string(&source)
@@ -443,6 +469,21 @@ impl App {
             audio: audio.clone(),
             muxed: muxed.clone(),
             is_live: source.is_live,
+            thumbnail_url: source.thumbnail.clone(),
+            uploader: source.uploader.clone(),
+        };
+
+        // Compute id_hash for history tracking
+        let id_hash = media_model::video_id_hash(url);
+
+        // Check history for saved playback position (only for non-live videos)
+        let history_position = if !source.is_live {
+            self.queue.history_get(&id_hash)
+                .ok()
+                .flatten()
+                .map(|entry| entry.position_seconds)
+        } else {
+            None
         };
 
         {
@@ -452,7 +493,14 @@ impl App {
             state.selected_audio = audio;
             state.selected_muxed = muxed;
             state.is_live = loaded.is_live;
-            state.pending_restore.begin(None);
+            state.pending_restore.begin(history_position.map(PendingSeek::Position));
+            // Store metadata for history tracking
+            state.current_id_hash = Some(id_hash.clone());
+            state.current_url = Some(url.to_string());
+            state.current_title = Some(loaded.title.clone());
+            state.current_thumbnail_url = loaded.thumbnail_url.clone(); // We'll need to add this to Loaded
+            state.current_uploader = loaded.uploader.clone(); // We'll need to add this to Loaded
+            state.last_history_save = None;
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -670,6 +718,62 @@ impl App {
                 self.live.lock().expect("the live axis is not poisoned").anchor();
             }
             None => {}
+        }
+    }
+
+    /// Saves the current playback position to history (throttled to ~20s intervals).
+    pub fn save_history_position(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        if state.is_live {
+            return; // Don't save history for live streams
+        }
+        let Some(id_hash) = state.current_id_hash.take() else {
+            return;
+        };
+        // Put it back after checking
+        state.current_id_hash = Some(id_hash.clone());
+
+        let now = Instant::now();
+        let should_save = state.last_history_save.is_none_or(|last| {
+            now.duration_since(last) >= Duration::from_secs(20)
+        });
+
+        if !should_save {
+            return;
+        }
+
+        let position = self.engine.position().max(0.0);
+        let Some(url) = state.current_url.clone() else {
+            return;
+        };
+        let Some(title) = state.current_title.clone() else {
+            return;
+        };
+        let thumbnail_url = state.current_thumbnail_url.clone();
+        let uploader = state.current_uploader.clone();
+
+        drop(state); // Release lock before DB operation
+
+        if let Err(error) = self.queue.history_upsert(&id_hash, &url, &title, thumbnail_url.as_deref(), uploader.as_deref(), position) {
+            crate::diag::note(&format!("failed to save history position: {error}"));
+        } else {
+            // Update last save time
+            if let Ok(mut state) = self.state.lock() {
+                state.last_history_save = Some(now);
+            }
+        }
+    }
+
+    /// Resets the history position to 0 (called when video finishes).
+    pub fn reset_history_position(&self) {
+        let state = self.state.lock().expect("the state is not poisoned");
+        let Some(id_hash) = state.current_id_hash.clone() else {
+            return;
+        };
+        drop(state);
+
+        if let Err(error) = self.queue.history_reset_position(&id_hash) {
+            crate::diag::note(&format!("failed to reset history position: {error}"));
         }
     }
 

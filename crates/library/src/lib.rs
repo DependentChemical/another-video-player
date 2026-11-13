@@ -11,7 +11,7 @@ pub mod cache;
 pub mod store;
 
 pub use cache::ThumbnailCache;
-pub use store::{Queue, QueueEntry};
+pub use store::{HistoryEntry, Queue, QueueEntry};
 
 /// Everything that can go wrong while using the library.
 #[derive(Debug)]

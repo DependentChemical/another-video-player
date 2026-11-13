@@ -138,7 +138,7 @@ export component PlayerControls inherits Rectangle {
             width: 90px;
             height: 18px;
             value: root.volume;
-            maximum: 200;
+            maximum: 100;
             moved(value) => {
                 root.pointer-activity();
                 root.volume-requested(value);

@@ -284,15 +284,23 @@ fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
 
 /// Converts the UI slider value to mpv's linear gain percent.
 ///
-/// The slider uses a linear scale where 50% is unity gain, 0% is mute, and
-/// 100% is double gain.
+/// The slider uses a perceptual scale (quadratic) where 100% is unity gain
+/// and 0% is mute. The quadratic curve matches human loudness perception.
 fn slider_to_player_volume(slider: f64) -> f64 {
-    (slider.clamp(0.0, 200.0)) * 2.0
+    let slider = slider.clamp(0.0, 100.0);
+    if slider <= 0.0 {
+        0.0
+    } else {
+        // Perceptual taper: quadratic curve for gradual attenuation.
+        let position = slider / 100.0;
+        100.0 * position * position
+    }
 }
 
 /// Converts mpv's linear gain percent back to the UI slider position.
 fn player_to_slider_volume(volume: f64) -> f64 {
-    (volume.clamp(0.0, 200.0)) / 2.0
+    let volume = volume.clamp(0.0, 100.0);
+    if volume <= 0.0 { 0.0 } else { 100.0 * (volume / 100.0).sqrt() }
 }
 
 /// Brings the interface and the player back in sync.
@@ -348,6 +356,9 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
 
     drain_engine_events(app, loading);
 
+    // Save playback position to history periodically (for non-live videos)
+    app.save_history_position();
+
     // keep-open leaves the completed file loaded, so advance from the
     // persistent EOF property instead of waiting for the file-unload event.
     if loading.observe_eof(app.engine().is_eof()) && app.advance() {
@@ -391,6 +402,10 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
                 loading.file_ended(failure);
+                // Reset history position when video finishes normally (not error/stop)
+                if reason == EndReason::Eof {
+                    app.reset_history_position();
+                }
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {
@@ -445,21 +460,22 @@ mod tests {
     }
 
     #[test]
-    fn volume_slider_maps_half_to_unity_and_full_to_double_gain() {
+    fn volume_slider_maps_zero_to_mute_and_hundred_to_unity() {
         assert_eq!(slider_to_player_volume(0.0), 0.0);
-        assert!((slider_to_player_volume(50.0) - 100.0).abs() < 1e-10);
-        assert!((slider_to_player_volume(100.0) - 200.0).abs() < 1e-10);
-        assert!((player_to_slider_volume(100.0) - 50.0).abs() < 1e-10);
-        assert!((player_to_slider_volume(200.0) - 100.0).abs() < 1e-10);
+        assert!((slider_to_player_volume(100.0) - 100.0).abs() < 1e-10);
+        assert!((player_to_slider_volume(100.0) - 100.0).abs() < 1e-10);
+        assert!((player_to_slider_volume(0.0) - 0.0).abs() < 1e-10);
     }
 
     #[test]
-    fn volume_slider_round_trips_linearly() {
-        for slider in [1.0, 15.0, 25.0, 30.0, 50.0, 75.0, 100.0] {
+    fn volume_slider_round_trips_perceptually() {
+        for slider in [1.0, 25.0, 50.0, 75.0, 100.0] {
             let player = slider_to_player_volume(slider);
             assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
         }
-        assert!((slider_to_player_volume(30.0) - 60.0).abs() < 1e-9);
-        assert!((slider_to_player_volume(15.0) - 30.0).abs() < 1e-9);
+        // Below unity the volume should fall off gradually, not collapse instantly.
+        assert!((slider_to_player_volume(50.0) - 25.0).abs() < 1e-9);
+        assert!(slider_to_player_volume(50.0) < slider_to_player_volume(75.0));
+        assert!(slider_to_player_volume(25.0) > 0.0);
     }
 }
