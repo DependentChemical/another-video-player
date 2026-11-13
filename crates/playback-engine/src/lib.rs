@@ -148,6 +148,15 @@ impl Engine {
             .set_property("volume-max", MAX_VOLUME)?
             .build()?;
 
+        // mpv does not deliver file lifecycle events until they are requested.
+        for event in [
+            rsmpv::sys::MPV_EVENT_START_FILE,
+            rsmpv::sys::MPV_EVENT_FILE_LOADED,
+            rsmpv::sys::MPV_EVENT_END_FILE,
+        ] {
+            mpv.request_event(event, true)?;
+        }
+
         Ok(Engine { core: std::sync::Arc::new(mpv) })
     }
 
