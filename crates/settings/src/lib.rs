@@ -118,77 +118,101 @@ fn choose(source: &MediaSource, defaults: &Value) -> Option<Quality> {
     let audios = preferences(defaults, "audio");
     let combined = preferences(defaults, "combined");
 
-    // Exact configured choices are exhausted before numeric size fallback.
-    for video_pref in &videos {
-        let video = pick_video_exact(
-            source.video_streams.iter().filter(|stream| !stream.has_audio),
-            video_pref,
-        );
-        let Some(video) = video else { continue };
-        for audio_pref in &audios {
-            if let Some(audio) = pick_audio_exact(source.audio_streams.iter(), audio_pref) {
-                return Some(Quality::Streams {
-                    video: Some(video.format_id.clone()),
-                    audio: Some(audio.format_id.clone()),
-                });
-            }
-        }
-    }
-
-    let video_only = videos.iter().find_map(|pref| {
-        pick_video_exact(source.video_streams.iter().filter(|stream| !stream.has_audio), pref)
-    });
-    let audio_only =
-        audios.iter().find_map(|pref| pick_audio_exact(source.audio_streams.iter(), pref));
-    let video_fallback = video_only.or_else(|| {
-        pick_video_fallback(
-            source.video_streams.iter().filter(|stream| !stream.has_audio),
-            last_resolution(&videos),
-        )
-    });
-    let audio_fallback = audio_only
-        .or_else(|| pick_audio_fallback(source.audio_streams.iter(), last_bitrate(&audios)));
-    if let (Some(video), Some(audio)) = (video_fallback, audio_fallback) {
+    // The pair tier exhausts both ordered lists, including each size fallback.
+    let split_video =
+        video_choices(source.video_streams.iter().filter(|stream| !stream.has_audio), &videos);
+    let split_audio = audio_choices(source.audio_streams.iter(), &audios);
+    if let (Some(video), Some(audio)) = (split_video.first(), split_audio.first()) {
         return Some(Quality::Streams {
             video: Some(video.format_id.clone()),
             audio: Some(audio.format_id.clone()),
         });
     }
 
-    // If a pair cannot be built, use a combined stream before single tracks.
-    for pref in &combined {
-        if let Some(video) =
-            pick_video_exact(source.video_streams.iter().filter(|stream| stream.has_audio), pref)
-        {
-            return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
-        }
-    }
-    if let Some(video) = pick_video_fallback(
-        source.video_streams.iter().filter(|stream| stream.has_audio),
-        last_resolution(&combined),
-    ) {
+    // A combined stream is its own tier and never gets a second audio track.
+    let combined_choices =
+        video_choices(source.video_streams.iter().filter(|stream| stream.has_audio), &combined);
+    if let Some(video) = combined_choices.first() {
         return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
     }
 
-    if let Some(video) = video_fallback {
-        let audio = audio_fallback.filter(|_| !video.has_audio);
-        return Some(Quality::Streams {
-            video: Some(video.format_id.clone()),
-            audio: audio.map(|stream| stream.format_id.clone()),
-        });
+    // The video-only tier may pick a muxed stream, but never pairs audio itself.
+    let video_choices = video_choices(source.video_streams.iter(), &videos);
+    if let Some(video) = video_choices.first() {
+        return Some(Quality::Streams { video: Some(video.format_id.clone()), audio: None });
     }
-    if let Some(video) = source.video_streams.iter().max_by_key(|stream| stream.rank()) {
-        let audio = (!video.has_audio)
-            .then(|| source.audio_streams.iter().max_by_key(|stream| stream.rank()))
-            .flatten();
-        return Some(Quality::Streams {
-            video: Some(video.format_id.clone()),
-            audio: audio.map(|stream| stream.format_id.clone()),
-        });
-    }
-    audio_fallback
-        .or_else(|| source.audio_streams.iter().max_by_key(|stream| stream.rank()))
+
+    let audio_choices = audio_choices(source.audio_streams.iter(), &audios);
+    audio_choices
+        .first()
         .map(|audio| Quality::Streams { video: None, audio: Some(audio.format_id.clone()) })
+}
+
+fn video_choices<'a>(
+    streams: impl Iterator<Item = &'a VideoStream>,
+    preferences: &[String],
+) -> Vec<&'a VideoStream> {
+    let streams: Vec<_> = streams.collect();
+    if preferences.is_empty() || streams.is_empty() {
+        return Vec::new();
+    }
+
+    let mut choices = Vec::new();
+    for preference in preferences {
+        if let Some(stream) = pick_video_exact(streams.iter().copied(), preference) {
+            push_unique_video(&mut choices, stream);
+        }
+    }
+    if let Some(stream) = pick_video_fallback(streams.iter().copied(), last_resolution(preferences))
+    {
+        push_unique_video(&mut choices, stream);
+    }
+    // A symbolic-only list such as `default` still resolves when the source
+    // has no default-marked format.
+    if choices.is_empty()
+        && let Some(stream) = streams.iter().copied().max_by_key(|stream| stream.rank())
+    {
+        choices.push(stream);
+    }
+    choices
+}
+
+fn push_unique_video<'a>(choices: &mut Vec<&'a VideoStream>, candidate: &'a VideoStream) {
+    if !choices.iter().any(|stream| stream.format_id == candidate.format_id) {
+        choices.push(candidate);
+    }
+}
+
+fn audio_choices<'a>(
+    streams: impl Iterator<Item = &'a AudioStream>,
+    preferences: &[String],
+) -> Vec<&'a AudioStream> {
+    let streams: Vec<_> = streams.collect();
+    if preferences.is_empty() || streams.is_empty() {
+        return Vec::new();
+    }
+
+    let mut choices = Vec::new();
+    for preference in preferences {
+        if let Some(stream) = pick_audio_exact(streams.iter().copied(), preference) {
+            push_unique_audio(&mut choices, stream);
+        }
+    }
+    if let Some(stream) = pick_audio_fallback(streams.iter().copied(), last_bitrate(preferences)) {
+        push_unique_audio(&mut choices, stream);
+    }
+    if choices.is_empty()
+        && let Some(stream) = streams.iter().copied().max_by_key(|stream| stream.rank())
+    {
+        choices.push(stream);
+    }
+    choices
+}
+
+fn push_unique_audio<'a>(choices: &mut Vec<&'a AudioStream>, candidate: &'a AudioStream) {
+    if !choices.iter().any(|stream| stream.format_id == candidate.format_id) {
+        choices.push(candidate);
+    }
 }
 
 fn pick_video_exact<'a>(
@@ -382,6 +406,39 @@ mod tests {
     }
 
     #[test]
+    fn combined_is_tried_before_the_unpaired_video_tier() {
+        let mut source = source();
+        source.audio_streams.clear();
+        let settings = serde_json::json!({"video":"best", "audio":"best", "combined":"720"});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("muxed".into()), audio: None })
+        );
+    }
+
+    #[test]
+    fn video_tier_never_attaches_audio_when_pairing_was_not_selected() {
+        let source = source();
+        let settings = serde_json::json!({"video":"best", "audio":"", "combined":""});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: Some("1080".into()), audio: None })
+        );
+    }
+
+    #[test]
+    fn audio_only_sources_follow_the_configured_audio_preferences() {
+        let mut source = source();
+        source.video_streams.clear();
+        let settings =
+            serde_json::json!({"video":"best", "audio":"default,best", "combined":"best"});
+        assert_eq!(
+            choose(&source, &settings),
+            Some(Quality::Streams { video: None, audio: Some("64".into()) })
+        );
+    }
+
+    #[test]
     fn resolution_prefers_exact_then_lower_then_higher() {
         let source = source();
         assert_eq!(
@@ -434,13 +491,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_global_preferences_still_select_any_available_video_then_audio() {
+    fn empty_preferences_do_not_select_streams_outside_the_settings_policy() {
         let source = source();
         let settings = serde_json::json!({"video":"", "audio":"", "combined":""});
-        assert_eq!(
-            choose(&source, &settings),
-            Some(Quality::Streams { video: Some("1080".into()), audio: Some("128".into()) })
-        );
+        assert_eq!(choose(&source, &settings), None);
     }
 
     #[test]
