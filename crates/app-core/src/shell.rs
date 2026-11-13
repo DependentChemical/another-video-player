@@ -20,8 +20,6 @@ use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
-/// Attenuation range represented by the lower half of the slider.
-const VOLUME_ATTENUATION_DB: f64 = 60.0;
 /// Boost range represented by the upper half of the slider.
 const VOLUME_BOOST_DB: f64 = 20.0 * std::f64::consts::LOG10_2;
 
@@ -275,11 +273,12 @@ fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
 /// Converts the UI's audio-tapered slider value to mpv's linear gain percent.
 fn slider_to_player_volume(slider: f64) -> f64 {
     let slider = slider.clamp(0.0, 200.0);
-    if slider == 0.0 {
+    if slider <= 0.0 {
         0.0
     } else if slider <= 100.0 {
+        // Perceptual taper below unity: quadratic curve for gradual attenuation.
         let position = slider / 100.0;
-        100.0 * 10.0_f64.powf(-VOLUME_ATTENUATION_DB * (1.0 - position) / 20.0)
+        100.0 * position * position
     } else {
         let position = (slider - 100.0) / 100.0;
         100.0 * 10.0_f64.powf(VOLUME_BOOST_DB * position / 20.0)
@@ -289,10 +288,10 @@ fn slider_to_player_volume(slider: f64) -> f64 {
 /// Converts mpv's linear gain percent back to the audio-tapered UI position.
 fn player_to_slider_volume(volume: f64) -> f64 {
     let volume = volume.clamp(0.0, 200.0);
-    if volume == 0.0 {
+    if volume <= 0.0 {
         0.0
     } else if volume <= 100.0 {
-        100.0 * (1.0 + 20.0 * (volume / 100.0).log10() / VOLUME_ATTENUATION_DB)
+        100.0 * (volume / 100.0).sqrt()
     } else {
         100.0 + 100.0 * 20.0 * (volume / 100.0).log10() / VOLUME_BOOST_DB
     }
@@ -461,6 +460,9 @@ mod tests {
             let player = slider_to_player_volume(slider);
             assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
         }
-        assert!(slider_to_player_volume(50.0) < 10.0);
+        // Below unity the volume should fall off gradually, not collapse instantly.
+        assert!((slider_to_player_volume(50.0) - 25.0).abs() < 1e-9);
+        assert!(slider_to_player_volume(50.0) < slider_to_player_volume(75.0));
+        assert!(slider_to_player_volume(25.0) > 0.0);
     }
 }
