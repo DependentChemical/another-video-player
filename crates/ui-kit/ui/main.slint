@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+﻿import { ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 
@@ -105,7 +105,7 @@ component SourceColumn inherits Rectangle {
 // the window before Slint renders this scene, and every part of the scene
 // that stays transparent lets that frame through.
 export component MainWindow inherits Window {
-    title: root.has-media ? root.media-title + " — Flatline" : "Flatline";
+    title: root.has-media ? root.media-title + " â€” Flatline" : "Flatline";
     preferred-width: 1100px;
     preferred-height: 680px;
     min-width: 560px;
@@ -143,6 +143,15 @@ export component MainWindow inherits Window {
     in property <bool> at-live-edge: true;
     // Whether the window is in full screen.
     in property <bool> fullscreen: false;
+    // The small note in the corner, shown while a URL is parsed in the
+    // background.
+    in-out property <bool> toast-visible: false;
+    in property <string> toast-text: "";
+    // The dialog that asks what to do with a media that was resolved while
+    // another one already plays.
+    in-out property <bool> pending-open: false;
+    in property <string> pending-title: "";
+    in property <image> pending-thumbnail;
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -155,6 +164,9 @@ export component MainWindow inherits Window {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback pending-play-requested();
+    callback pending-queue-requested();
+    callback pending-dismissed();
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -508,6 +520,42 @@ export component MainWindow inherits Window {
         }
     }
 
+    // ------------------------------------------------------------ toast ----
+    //
+    // A short note in the lower right corner, above the control bar. It
+    // tells the user that a URL is being parsed without touching playback.
+    if root.toast-visible: Rectangle {
+        x: parent.width - self.width - 20px;
+        y: parent.height - self.height - Theme.controls-height - 12px;
+        width: 220px;
+        height: 42px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #000000a0;
+
+        Rectangle {
+            x: 12px;
+            y: (parent.height - 8px) / 2;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.accent;
+        }
+
+        Text {
+            x: 30px;
+            width: parent.width - 42px;
+            text: root.toast-text;
+            color: Theme.fg;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
     // --------------------------------------------------- source picker ----
     if root.sources-open: Rectangle {
         x: 0px;
@@ -636,4 +684,104 @@ export component MainWindow inherits Window {
             }
         }
     }
+
+    // -------------------------------------------------- pending dialog ----
+    //
+    // A URL that was entered while something plays is not played right away.
+    // The dialog shows what was found and lets the user either append it to
+    // the active queue or replace the queue with it.
+    if root.pending-open: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #00000088;
+
+        TouchArea {
+            clicked => {
+                root.pending-open = false;
+                root.pending-dismissed();
+            }
+        }
+
+        pending-panel := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 40px, 420px);
+            height: min(parent.height - 40px, 440px);
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.panel;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #000000c0;
+
+            // Keep clicks on the panel from reaching the backdrop.
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Rectangle {
+                    height: 200px;
+                    border-radius: 8px;
+                    background: Theme.elevated;
+                    clip: true;
+
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.pending-thumbnail;
+                        image-fit: contain;
+                    }
+                }
+
+                Text {
+                    height: 44px;
+                    text: root.pending-title;
+                    color: Theme.fg;
+                    font-size: 15px;
+                    font-weight: 600;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "What do you want to do with this video?";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    FlatButton {
+                        width: 130px;
+                        height: 34px;
+                        label: "Add to queue";
+                        clicked => {
+                            root.pending-open = false;
+                            root.pending-queue-requested();
+                        }
+                    }
+
+                    FlatButton {
+                        width: 110px;
+                        height: 34px;
+                        label: "Play now";
+                        primary: true;
+                        clicked => {
+                            root.pending-open = false;
+                            root.pending-play-requested();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
+

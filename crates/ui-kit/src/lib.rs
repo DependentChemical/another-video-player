@@ -10,6 +10,8 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
+use std::path::Path;
+
 use slint::ComponentHandle;
 
 slint::include_modules!();
@@ -259,6 +261,34 @@ impl PlayerUi {
         self.window.get_sources_open()
     }
 
+    /// Shows a short note in the corner of the window.
+    pub fn show_toast(&self, text: &str) {
+        self.window.set_toast_text(text.into());
+        self.window.set_toast_visible(true);
+    }
+
+    /// Hides the note in the corner of the window.
+    pub fn hide_toast(&self) {
+        self.window.set_toast_visible(false);
+    }
+
+    /// Opens the dialog that asks what to do with a resolved media.
+    ///
+    /// The thumbnail is read from disk; when it is missing or cannot be
+    /// decoded the dialog simply shows no picture.
+    pub fn show_pending(&self, title: &str, thumbnail: Option<&Path>) {
+        self.window.set_pending_title(title.into());
+        let image =
+            thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
+        self.window.set_pending_thumbnail(image);
+        self.window.set_pending_open(true);
+    }
+
+    /// Closes the pending dialog.
+    pub fn hide_pending(&self) {
+        self.window.set_pending_open(false);
+    }
+
     // ------------------------------------------------------------ events --
 
     /// Called when the user asks for the URL to be loaded.
@@ -323,6 +353,21 @@ impl PlayerUi {
     /// Called when the pointer enters or leaves the control bar.
     pub fn on_controls_hovered(&self, handler: impl Fn(bool) + 'static) {
         self.window.on_controls_hovered(handler);
+    }
+
+    /// Called when the user asks to play the pending media right away.
+    pub fn on_pending_play(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_play_requested(handler);
+    }
+
+    /// Called when the user asks to append the pending media to the queue.
+    pub fn on_pending_queue(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_queue_requested(handler);
+    }
+
+    /// Called when the user dismisses the pending dialog.
+    pub fn on_pending_dismissed(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_dismissed(handler);
     }
 }
 

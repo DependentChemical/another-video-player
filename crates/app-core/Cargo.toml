@@ -9,6 +9,7 @@ authors.workspace = true
 
 # Layer 3: the composition root. The only crate that wires capabilities together.
 [dependencies]
+library = { workspace = true }
 media-model = { workspace = true }
 playback-engine = { workspace = true }
 storyboard = { workspace = true }

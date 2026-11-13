@@ -1,0 +1,12 @@
+﻿[package]
+name = "database"
+description = "Flatline's SQLite database: opening, creating and giving access to app.db."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1: standalone capability. Knows nothing about any other Flatline crate.
+[dependencies]
+rusqlite = { workspace = true }

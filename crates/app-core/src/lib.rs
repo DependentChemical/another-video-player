@@ -48,8 +48,9 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
     // Look for a newer yt-dlp while the player is already running.
     app.check_tool_update(&ytdlp, &paths);
 
-    if let Some(url) = url {
-        shell.load(url);
+    match url {
+        Some(url) => shell.load(url),
+        None => shell.resume(),
     }
 
     shell.run();

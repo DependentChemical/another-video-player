@@ -5,9 +5,11 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
+use library::{Queue, ThumbnailCache};
 use media_model::{MediaSource, PlaybackPlan, Quality};
 use playback_engine::{Engine, LoadRequest};
 use stream_resolver::{CommandSpec, Resolver};
@@ -20,12 +22,44 @@ use crate::timeline::{LiveAxis, Timeline};
 /// Something the background work wants to tell the user interface.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// A URL was resolved into a catalog of streams.
-    Resolved(Result<MediaSource, String>),
+    /// A URL was resolved and can start playing.
+    Resolved(Result<ResolvedMedia, String>),
+    /// A URL was resolved while something else plays, so the user decides.
+    Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
     ToolUpdated(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+}
+
+/// A URL that was resolved and is ready to play.
+#[derive(Debug, Clone)]
+pub struct ResolvedMedia {
+    /// The URL the media was asked for.
+    pub url: String,
+    /// Whether this media replaces the active queue (a fresh play) or only
+    /// fills the current mark the queue already advanced to.
+    pub replace_queue: bool,
+    /// The thumbnail of the resolved media, for the queue.
+    pub thumbnail: Option<String>,
+    /// The resolved source.
+    pub source: MediaSource,
+}
+
+/// A URL that was resolved while another media plays.
+///
+/// The user chooses what happens next: the media is either appended to the
+/// active queue or it replaces the queue and plays right away.
+#[derive(Debug, Clone)]
+pub struct PendingMedia {
+    /// The URL the media was asked for.
+    pub url: String,
+    /// Human readable title, for the dialog.
+    pub title: String,
+    /// The cached thumbnail, when one could be downloaded.
+    pub thumbnail: Option<PathBuf>,
+    /// The resolved source.
+    pub source: MediaSource,
 }
 
 /// What the user interface has to show after a media was accepted.
@@ -103,6 +137,12 @@ pub struct App {
     state: Mutex<State>,
     /// The time axis of a live stream.
     live: Mutex<LiveAxis>,
+    /// The active queue Flatline keeps between runs.
+    queue: Queue,
+    /// The thumbnails shown before a media is accepted.
+    cache: ThumbnailCache,
+    /// The media the user still has to decide about.
+    pending: Mutex<Option<PendingMedia>>,
 }
 
 impl App {
@@ -111,6 +151,8 @@ impl App {
         let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
         let youtube_cookies = paths.youtube_cookies();
         let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
+        let queue =
+            Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -127,6 +169,9 @@ impl App {
             inbox: Mutex::new(receiver),
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
+            queue,
+            cache: ThumbnailCache::new(paths.cache()),
+            pending: Mutex::new(None),
         })
     }
 
@@ -135,7 +180,12 @@ impl App {
         &self.engine
     }
 
-    /// Resolves a URL and plays it.
+    /// Takes a URL from the user.
+    ///
+    /// When nothing plays, the URL is resolved and played right away and
+    /// becomes the active queue. When a media is already playing, playback is
+    /// left alone: the URL is resolved in the background and the user is
+    /// asked what to do with it through the pending dialog.
     ///
     /// The work happens in the background; the result arrives through
     /// [`App::poll`].
@@ -144,14 +194,133 @@ impl App {
         if url.is_empty() {
             return;
         }
+        if self.has_media() {
+            self.resolve_pending(url);
+        } else {
+            self.resolve_play(url, true);
+        }
+    }
+
+    /// Whether a media is loaded in the player.
+    pub fn has_media(&self) -> bool {
+        self.state.lock().expect("the state is not poisoned").source.is_some()
+    }
+
+    /// Resolves a URL in the background and plays it when it arrives.
+    ///
+    /// `replace_queue` marks a fresh play, which takes over the active queue;
+    /// the queue's own next entries call this with `false` so advancing never
+    /// rewrites the queue it is walking through.
+    fn resolve_play(&self, url: String, replace_queue: bool) {
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
         let outbox = Arc::clone(&self.outbox);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string());
+            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
+                ResolvedMedia {
+                    url: url.clone(),
+                    replace_queue,
+                    thumbnail: source.thumbnail.clone(),
+                    source,
+                }
+            });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
+    }
+
+    /// Resolves a URL in the background, caches its thumbnail and waits for
+    /// the user to decide.
+    fn resolve_pending(&self, url: String) {
+        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let outbox = Arc::clone(&self.outbox);
+        let cache = self.cache.clone();
+        let runtime = self.runtime.handle().clone();
+
+        runtime.spawn_blocking(move || {
+            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
+                let thumbnail = source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
+                PendingMedia { url, title: source.title.clone(), source, thumbnail }
+            });
+            let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
+        });
+    }
+
+    /// Stores the pending media so the user can decide what to do with it.
+    pub fn set_pending(&self, pending: PendingMedia) {
+        *self.pending.lock().expect("the pending media is not poisoned") = Some(pending);
+    }
+
+    /// Plays the pending media right away, replacing the active queue.
+    pub fn play_pending(&self) -> Option<(String, Loaded)> {
+        let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
+        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        if let Err(error) =
+            self.queue.replace_with(&pending.url, &pending.title, thumbnail.as_deref())
+        {
+            crate::diag::note(&format!("the active queue could not be written: {error}"));
+        }
+        let loaded = self.accept(pending.source);
+        Some((pending.url, loaded))
+    }
+
+    /// Appends the pending media to the active queue.
+    pub fn queue_pending(&self) -> bool {
+        let Some(pending) = self.pending.lock().expect("the pending media is not poisoned").take()
+        else {
+            return false;
+        };
+        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        if let Err(error) = self.queue.push(&pending.url, &pending.title, thumbnail.as_deref()) {
+            crate::diag::note(&format!("the active queue could not be written: {error}"));
+            return false;
+        }
+        true
+    }
+
+    /// Forgets the pending media without doing anything with it.
+    pub fn dismiss_pending(&self) {
+        self.pending.lock().expect("the pending media is not poisoned").take();
+    }
+
+    /// Remembers the media that just started as the active queue.
+    pub fn remember_current(&self, url: &str, loaded: &Loaded, thumbnail: Option<&str>) {
+        if let Err(error) = self.queue.replace_with(url, &loaded.title, thumbnail) {
+            crate::diag::note(&format!("the active queue could not be written: {error}"));
+        }
+    }
+
+    /// Plays the media that plays next in the queue, if there is one.
+    ///
+    /// This is what a finished media calls: the current mark moves forward
+    /// and the entry it lands on is resolved again, because an extractor may
+    /// have changed since the entry was added.
+    pub fn advance(&self) {
+        match self.queue.advance() {
+            Ok(Some(entry)) => self.resolve_play(entry.url, false),
+            Ok(None) => {}
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"))
+            }
+        }
+    }
+
+    /// Starts the media the queue left as current, if there is one.
+    ///
+    /// This is what the program calls on startup so a queue that was filled
+    /// in an earlier run picks up where it left off.
+    pub fn resume(&self) -> bool {
+        match self.queue.current() {
+            Ok(Some(entry)) => {
+                self.resolve_play(entry.url, false);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
+            }
+        }
     }
 
     /// Accepts a resolved source and starts playing it.
@@ -568,6 +737,8 @@ pub enum Error {
     Runtime(String),
     /// The tools could not be prepared.
     Tools(String),
+    /// The library, queue or cache could not be opened.
+    Library(String),
 }
 
 impl std::fmt::Display for Error {
@@ -577,6 +748,7 @@ impl std::fmt::Display for Error {
             Error::Engine(message) => write!(f, "the player failed: {message}"),
             Error::Runtime(message) => write!(f, "the background runtime failed: {message}"),
             Error::Tools(message) => write!(f, "the tools failed: {message}"),
+            Error::Library(message) => write!(f, "the library failed: {message}"),
         }
     }
 }

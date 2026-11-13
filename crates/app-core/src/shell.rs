@@ -42,15 +42,9 @@ impl Shell {
         let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
             .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
             .into_rgba8();
-        let icon = slint::winit_030::winit::window::Icon::from_rgba(
-            icon.into_raw(),
-            256,
-            256,
-        )
-        .map_err(|error| Error::Ui(format!("the window icon is invalid: {error}")))?;
-        ui.window()
-            .window()
-            .with_winit_window(|window| window.set_window_icon(Some(icon)));
+        let icon = slint::winit_030::winit::window::Icon::from_rgba(icon.into_raw(), 256, 256)
+            .map_err(|error| Error::Ui(format!("the window icon is invalid: {error}")))?;
+        ui.window().window().with_winit_window(|window| window.set_window_icon(Some(icon)));
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let controls_hovered = Rc::new(Cell::new(false));
@@ -106,11 +100,52 @@ impl Shell {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
+            let ui_for_load = Rc::clone(&ui);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
-                loading.borrow_mut().resolve_started();
+                if ui_for_load.has_media() {
+                    // Something plays already, so the new URL must not
+                    // interrupt it. A toast says the background is working
+                    // and the dialog appears once the media is resolved.
+                    ui_for_load.show_toast("Parsing video");
+                } else {
+                    loading.borrow_mut().resolve_started();
+                }
                 app.load(url);
             });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_pending_play(move || {
+                if let Some((_, loaded)) = app.play_pending() {
+                    ui_for_pending.hide_toast();
+                    ui_for_pending.set_media_title(&loaded.title);
+                    ui_for_pending.set_sources(&loaded.sources);
+                    ui_for_pending.set_selected_sources(
+                        loaded.video.as_deref(),
+                        loaded.audio.as_deref(),
+                        loaded.muxed.as_deref(),
+                    );
+                    ui_for_pending.set_has_media(true);
+                    ui_for_pending.set_live(loaded.is_live);
+                    loading.borrow_mut().resolved();
+                    if let Some(duration) = loaded.duration {
+                        ui_for_pending.set_duration(duration);
+                    }
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            ui.on_pending_queue(move || {
+                let _ = app.queue_pending();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            ui.on_pending_dismissed(move || app.dismiss_pending());
         }
         {
             let app = Arc::clone(&app);
@@ -208,6 +243,13 @@ impl Shell {
         self.app.load(url.to_string());
     }
 
+    /// Continues the active queue that was filled in an earlier run.
+    pub fn resume(&self) {
+        if self.app.resume() {
+            self.loading.borrow_mut().resolve_started();
+        }
+    }
+
     /// The application behind the window.
     pub fn app(&self) -> &Arc<App> {
         &self.app
@@ -260,8 +302,13 @@ fn player_to_slider_volume(volume: f64) -> f64 {
 fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
         match message {
-            Message::Resolved(Ok(source)) => {
+            Message::Resolved(Ok(media)) => {
+                let crate::app::ResolvedMedia { url, replace_queue, thumbnail, source } = media;
                 let loaded = app.accept(source);
+                if replace_queue {
+                    app.remember_current(&url, &loaded, thumbnail.as_deref());
+                }
+                ui.hide_toast();
                 ui.set_media_title(&loaded.title);
                 ui.set_sources(&loaded.sources);
                 ui.set_selected_sources(
@@ -276,7 +323,19 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => loading.resolve_failed(error),
+            Message::Resolved(Err(error)) => {
+                ui.hide_toast();
+                loading.resolve_failed(error);
+            }
+            Message::Pending(Ok(pending)) => {
+                ui.hide_toast();
+                ui.show_pending(&pending.title, pending.thumbnail.as_deref());
+                app.set_pending(pending);
+            }
+            Message::Pending(Err(error)) => {
+                ui.hide_toast();
+                loading.problem(error);
+            }
             Message::ToolUpdated(path) => {
                 if !loading.tool_updated(&path) {
                     crate::diag::note(&format!("yt-dlp was updated ({path})"));
@@ -325,6 +384,12 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
                 loading.file_ended(failure);
+                // A media that plays to its end moves the queue forward. A
+                // stop or an error is a change the user asked for, so the
+                // queue must not move on its own.
+                if reason == EndReason::Eof {
+                    app.advance();
+                }
             }
             EngineEvent::Log { level, text } => {
                 if level == "error" {

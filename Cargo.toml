@@ -1,7 +1,9 @@
-[workspace]
+﻿[workspace]
 resolver = "3"
 members = [
     "crates/app-core",
+    "crates/database",
+    "crates/library",
     "crates/media-model",
     "crates/playback-engine",
     "crates/storyboard",
@@ -15,7 +17,7 @@ members = [
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -24,6 +26,8 @@ authors = ["Flatline contributors"]
 [workspace.dependencies]
 # --- internal crates (see AGENTS.md "Crate isolation") -------------------------
 app-core = { path = "crates/app-core" }
+database = { path = "crates/database" }
+library = { path = "crates/library" }
 media-model = { path = "crates/media-model" }
 playback-engine = { path = "crates/playback-engine" }
 storyboard = { path = "crates/storyboard" }
@@ -43,6 +47,7 @@ slint = { version = "1.18", default-features = false, features = [
 ] }
 slint-build = "1.18"
 rsmpv = { version = "0.2.1", features = ["render"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ttf-parser = "0.25"
@@ -55,3 +60,4 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+

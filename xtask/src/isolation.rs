@@ -13,6 +13,8 @@ use std::process::Command;
 /// A crate that is not listed here may not depend on any other crate of the
 /// workspace.
 const RULES: &[(&str, &[&str])] = &[
+    ("database", &[]),
+    ("library", &["database"]),
     ("media-model", &[]),
     ("playback-engine", &[]),
     ("storyboard", &[]),
@@ -23,6 +25,7 @@ const RULES: &[(&str, &[&str])] = &[
     (
         "app-core",
         &[
+            "library",
             "media-model",
             "playback-engine",
             "stream-resolver",
