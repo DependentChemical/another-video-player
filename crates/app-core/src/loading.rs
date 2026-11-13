@@ -18,6 +18,8 @@ pub enum Status {
 
 /// The text shown while a URL is being resolved.
 const RESOLVING: &str = "Resolving video...";
+/// The text shown while the next active-queue item is being prepared.
+const PARSING_NEXT: &str = "Parsing next video...";
 /// The text shown while the player is waiting for data.
 const BUFFERING: &str = "Buffering...";
 
@@ -86,6 +88,13 @@ impl Loading {
     pub fn resolved(&mut self) {
         self.phase = Phase::Starting;
         self.status = Status::Busy(BUFFERING);
+        self.current_file = false;
+    }
+
+    /// Shows progress while the next item in the active queue is prepared.
+    pub fn parsing_next(&mut self) {
+        self.phase = Phase::Resolving;
+        self.status = Status::Busy(PARSING_NEXT);
         self.current_file = false;
     }
 
@@ -195,6 +204,15 @@ mod tests {
         loading.resolve_started();
 
         assert_eq!(loading.status(), &Status::Busy(RESOLVING));
+        assert!(loading.is_busy());
+    }
+
+    #[test]
+    fn next_queue_item_shows_parsing_status() {
+        let mut loading = Loading::new();
+        loading.parsing_next();
+
+        assert_eq!(loading.status(), &Status::Busy("Parsing next video..."));
         assert!(loading.is_busy());
     }
 

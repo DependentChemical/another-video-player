@@ -303,8 +303,10 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(media)) => {
-                let crate::app::ResolvedMedia { url, thumbnail, source } = media;
-                let Some(loaded) = app.consume_resolved(&url, source, thumbnail.as_deref()) else {
+                let crate::app::ResolvedMedia { url, thumbnail, resolved_at, source } = media;
+                let Some(loaded) =
+                    app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at)
+                else {
                     crate::diag::note(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
@@ -351,8 +353,8 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
 
     // keep-open leaves the completed file loaded, so advance from the
     // persistent EOF property instead of waiting for the file-unload event.
-    if loading.observe_eof(app.engine().is_eof()) {
-        app.advance();
+    if loading.observe_eof(app.engine().is_eof()) && app.advance() {
+        loading.parsing_next();
     }
 
     loading.observe(app.engine().is_active(), app.engine().is_buffering());

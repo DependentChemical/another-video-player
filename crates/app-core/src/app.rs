@@ -5,10 +5,10 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use library::{Queue, ThumbnailCache};
 use media_model::{MediaSource, PlaybackPlan, Quality};
@@ -40,6 +40,8 @@ pub struct ResolvedMedia {
     pub url: String,
     /// The thumbnail of the resolved media, for the queue.
     pub thumbnail: Option<String>,
+    /// The time the stream URLs were resolved.
+    pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
 }
@@ -56,6 +58,8 @@ pub struct PendingMedia {
     pub title: String,
     /// The cached thumbnail, when one could be downloaded.
     pub thumbnail: Option<PathBuf>,
+    /// The time the stream URLs were resolved.
+    pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
 }
@@ -79,10 +83,15 @@ pub struct Loaded {
     pub is_live: bool,
 }
 
-/// A resolved queue item kept ready while the current item is playing.
-struct PreparedMedia {
-    source: MediaSource,
-    thumbnail: Option<String>,
+/// How long a persisted resolver result may be reused before it is refreshed.
+const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
+
+/// Seconds since the Unix epoch for persisted resolver freshness checks.
+fn unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,8 +152,6 @@ pub struct App {
     live: Mutex<LiveAxis>,
     /// The active queue Flatline keeps between runs.
     queue: Queue,
-    /// Sources already resolved when their entries were added to the queue.
-    prepared: Mutex<HashMap<i64, PreparedMedia>>,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
     /// The media the user still has to decide about.
@@ -176,7 +183,6 @@ impl App {
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
             queue,
-            prepared: Mutex::new(HashMap::new()),
             cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
             pending: Mutex::new(None),
         })
@@ -228,7 +234,7 @@ impl App {
                     .as_deref()
                     .and_then(|url| cache.fetch(url).ok())
                     .map(|path| path.to_string_lossy().into_owned());
-                ResolvedMedia { url: url.clone(), thumbnail, source }
+                ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
             });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
@@ -245,7 +251,13 @@ impl App {
         runtime.spawn_blocking(move || {
             let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
                 let thumbnail = source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
-                PendingMedia { url, title: source.title.clone(), source, thumbnail }
+                PendingMedia {
+                    url,
+                    title: source.title.clone(),
+                    source,
+                    thumbnail,
+                    resolved_at: unix_time(),
+                }
             });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
@@ -261,7 +273,12 @@ impl App {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
         self.prepare_current(&pending.url, &pending.title, thumbnail.as_deref());
-        let loaded = self.consume_resolved(&pending.url, pending.source, thumbnail.as_deref())?;
+        let loaded = self.consume_resolved(
+            &pending.url,
+            pending.source,
+            thumbnail.as_deref(),
+            pending.resolved_at,
+        )?;
         Some((pending.url, loaded))
     }
 
@@ -279,10 +296,15 @@ impl App {
                 return false;
             }
         };
-        self.prepared
-            .lock()
-            .expect("prepared queue media is not poisoned")
-            .insert(entry.position, PreparedMedia { source: pending.source, thumbnail });
+        if let Ok(source) = serde_json::to_string(&pending.source)
+            && let Err(error) = self.queue.set_resolved_source(
+                entry.position,
+                Some(&source),
+                Some(pending.resolved_at),
+            )
+        {
+            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
+        }
         true
     }
 
@@ -293,7 +315,6 @@ impl App {
 
     /// Puts a freshly resolved media in the active queue before it is loaded.
     pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>) {
-        self.prepared.lock().expect("prepared queue media is not poisoned").clear();
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
@@ -308,12 +329,16 @@ impl App {
     /// This is what a finished media calls: the current mark moves forward
     /// and the entry it lands on is resolved again, because an extractor may
     /// have changed since the entry was added.
-    pub fn advance(&self) {
+    pub fn advance(&self) -> bool {
         match self.queue.advance() {
-            Ok(Some(_)) => self.consume_current(),
-            Ok(None) => {}
+            Ok(Some(_)) => {
+                self.consume_current();
+                true
+            }
+            Ok(None) => false,
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"))
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
             }
         }
     }
@@ -342,16 +367,16 @@ impl App {
     pub fn consume_current(&self) {
         match self.queue.current() {
             Ok(Some(entry)) => {
-                let prepared = self
-                    .prepared
-                    .lock()
-                    .expect("prepared queue media is not poisoned")
-                    .remove(&entry.position);
-                if let Some(prepared) = prepared {
+                if let (Some(json), Some(resolved_at)) =
+                    (entry.resolved_source.as_deref(), entry.resolved_at)
+                    && unix_time().saturating_sub(resolved_at) <= RESOLVED_SOURCE_MAX_AGE
+                    && let Ok(source) = serde_json::from_str::<MediaSource>(json)
+                {
                     let message = Message::Resolved(Ok(ResolvedMedia {
                         url: entry.url,
-                        thumbnail: prepared.thumbnail,
-                        source: prepared.source,
+                        thumbnail: entry.thumbnail,
+                        resolved_at,
+                        source,
                     }));
                     let _ = self.outbox.lock().map(|sender| sender.send(Box::new(message)));
                 } else {
@@ -371,6 +396,7 @@ impl App {
         url: &str,
         source: MediaSource,
         thumbnail: Option<&str>,
+        resolved_at: i64,
     ) -> Option<Loaded> {
         let current = match self.queue.current() {
             Ok(Some(entry)) if entry.url == url => entry,
@@ -382,6 +408,12 @@ impl App {
         };
         if let Err(error) = self.queue.update_details(current.position, &source.title, thumbnail) {
             crate::diag::note(&format!("the active queue entry could not be updated: {error}"));
+        }
+        if let Ok(json) = serde_json::to_string(&source)
+            && let Err(error) =
+                self.queue.set_resolved_source(current.position, Some(&json), Some(resolved_at))
+        {
+            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
         }
         Some(self.accept_current_source(source))
     }
@@ -416,6 +448,8 @@ impl App {
             Some(plan) => {
                 if let Err(error) = self.start(&plan) {
                     self.report(error);
+                } else if let Err(error) = self.engine.play() {
+                    self.report(error.to_string());
                 }
             }
             None => self.report("this source has no playable stream".to_string()),

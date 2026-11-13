@@ -19,6 +19,7 @@ video-surface = { workspace = true }
 ytdlp-tool = { workspace = true }
 slint = { workspace = true }
 tokio = { workspace = true }
+serde_json = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]

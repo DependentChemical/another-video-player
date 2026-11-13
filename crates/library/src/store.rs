@@ -7,7 +7,7 @@ use crate::Error;
 
 /// The columns every queue query reads, in the order [`entry_from_row`]
 /// expects.
-const COLUMNS: &str = "position, url, title, thumbnail, current";
+const COLUMNS: &str = "position, url, title, thumbnail, current, resolved_source, resolved_at";
 
 /// One item of the active queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,10 @@ pub struct QueueEntry {
     pub thumbnail: Option<String>,
     /// Whether this entry is the one playing now.
     pub current: bool,
+    /// A serialized resolver result that may be reused while it remains fresh.
+    pub resolved_source: Option<String>,
+    /// Unix timestamp when the resolver result was created.
+    pub resolved_at: Option<i64>,
 }
 
 /// The active queue, stored in a SQLite database.
@@ -61,11 +65,15 @@ impl Queue {
                         url TEXT NOT NULL,
                         title TEXT NOT NULL DEFAULT '',
                         thumbnail TEXT,
-                        current INTEGER NOT NULL DEFAULT 0
+                        current INTEGER NOT NULL DEFAULT 0,
+                        resolved_source TEXT,
+                        resolved_at INTEGER
                     );
                     CREATE INDEX IF NOT EXISTS active_queue_position
                         ON active_queue(position);",
-                )
+                )?;
+                ensure_column(connection, "resolved_source", "TEXT")?;
+                ensure_column(connection, "resolved_at", "INTEGER")
             })
             .map_err(Error::from)
     }
@@ -110,7 +118,15 @@ impl Queue {
                     [],
                     |row| row.get(0),
                 )?;
-                let entry = QueueEntry { position, url, title, thumbnail, current: count == 0 };
+                let entry = QueueEntry {
+                    position,
+                    url,
+                    title,
+                    thumbnail,
+                    current: count == 0,
+                    resolved_source: None,
+                    resolved_at: None,
+                };
                 connection.execute(
                     "INSERT INTO active_queue (position, url, title, thumbnail, current)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -143,7 +159,15 @@ impl Queue {
         self.db
             .with_connection(|connection| {
                 connection.execute("DELETE FROM active_queue", [])?;
-                let entry = QueueEntry { position: 0, url, title, thumbnail, current: true };
+                let entry = QueueEntry {
+                    position: 0,
+                    url,
+                    title,
+                    thumbnail,
+                    current: true,
+                    resolved_source: None,
+                    resolved_at: None,
+                };
                 connection.execute(
                     "INSERT INTO active_queue (position, url, title, thumbnail, current)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -247,6 +271,25 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Saves or clears the resolver result associated with an entry.
+    pub fn set_resolved_source(
+        &self,
+        position: i64,
+        source: Option<&str>,
+        resolved_at: Option<i64>,
+    ) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE active_queue
+                     SET resolved_source = ?2, resolved_at = ?3 WHERE position = ?1",
+                    params![position, source, resolved_at],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
     /// How many entries the queue holds.
     pub fn count(&self) -> Result<i64, Error> {
         self.db
@@ -280,6 +323,22 @@ fn current_in(connection: &Connection) -> Result<Option<QueueEntry>, rusqlite::E
         .optional()
 }
 
+/// Adds a column to an existing queue database when an older app created it.
+fn ensure_column(
+    connection: &Connection,
+    name: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare("PRAGMA table_info(active_queue)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == name {
+            return Ok(());
+        }
+    }
+    connection.execute_batch(&format!("ALTER TABLE active_queue ADD COLUMN {name} {definition}"))
+}
+
 /// Turns a row of [`COLUMNS`] into an entry.
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
     Ok(QueueEntry {
@@ -288,6 +347,8 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
         title: row.get(2)?,
         thumbnail: row.get(3)?,
         current: row.get::<_, i64>(4)? != 0,
+        resolved_source: row.get(5)?,
+        resolved_at: row.get(6)?,
     })
 }
 
@@ -399,6 +460,46 @@ mod tests {
         assert_eq!(
             queue.entries().expect("entries work")[0].thumbnail.as_deref(),
             Some("/cache/a.jpg")
+        );
+    }
+
+    #[test]
+    fn a_resolved_source_is_saved_with_its_freshness_time() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None).expect("push works");
+        queue.set_resolved_source(0, Some("{\"title\":\"A\"}"), Some(1234)).expect("source saves");
+
+        let current = queue.current().expect("current works").expect("one entry");
+        assert_eq!(current.resolved_source.as_deref(), Some("{\"title\":\"A\"}"));
+        assert_eq!(current.resolved_at, Some(1234));
+    }
+
+    #[test]
+    fn an_existing_queue_database_gains_source_columns() {
+        let db = database::Database::in_memory().expect("database opens");
+        db.with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TABLE active_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position INTEGER NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    thumbnail TEXT,
+                    current INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            Ok(())
+        })
+        .expect("legacy schema created");
+        let queue = Queue { db };
+        queue.migrate().expect("legacy schema migrates");
+        queue.push("https://example.com/a", "A", None).expect("push works");
+        queue
+            .set_resolved_source(0, Some("source"), Some(1234))
+            .expect("new columns are available");
+        assert_eq!(
+            queue.current().expect("current works").expect("one entry").resolved_at,
+            Some(1234)
         );
     }
 

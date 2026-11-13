@@ -230,6 +230,7 @@ dependencies = [
  "library",
  "media-model",
  "playback-engine",
+ "serde_json",
  "slint",
  "storyboard",
  "stream-resolver",
