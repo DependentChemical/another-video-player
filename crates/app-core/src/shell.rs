@@ -303,11 +303,13 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(media)) => {
-                let crate::app::ResolvedMedia { url, replace_queue, thumbnail, source } = media;
-                let loaded = app.accept(source);
-                if replace_queue {
-                    app.remember_current(&url, &loaded, thumbnail.as_deref());
-                }
+                let crate::app::ResolvedMedia { url, thumbnail, source } = media;
+                let Some(loaded) = app.consume_resolved(&url, source, thumbnail.as_deref()) else {
+                    crate::diag::note(
+                        "discarded a resolved video that is no longer current in the active queue",
+                    );
+                    continue;
+                };
                 ui.hide_toast();
                 ui.set_media_title(&loaded.title);
                 ui.set_sources(&loaded.sources);

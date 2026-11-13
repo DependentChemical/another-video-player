@@ -229,6 +229,24 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Updates the displayed details of a queue entry after URL resolution.
+    pub fn update_details(
+        &self,
+        position: i64,
+        title: &str,
+        thumbnail: Option<&str>,
+    ) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE active_queue SET title = ?2, thumbnail = ?3 WHERE position = ?1",
+                    params![position, title, thumbnail],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
     /// How many entries the queue holds.
     pub fn count(&self) -> Result<i64, Error> {
         self.db

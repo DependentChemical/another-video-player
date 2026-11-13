@@ -69,6 +69,32 @@ impl ThumbnailCache {
     pub fn path_for(&self, url: &str) -> PathBuf {
         self.directory.join(file_name_for(url))
     }
+
+    /// Removes cached thumbnails when the active queue is replaced.
+    pub fn clear(&self) -> Result<(), Error> {
+        match fs::remove_dir_all(&self.directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    /// Removes cached thumbnails other than the one being put in the new queue.
+    pub fn retain(&self, thumbnail: Option<&Path>) -> Result<(), Error> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if thumbnail != Some(path.as_path()) && entry.file_type()?.is_file() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The file name a thumbnail URL is cached under.

@@ -37,9 +37,6 @@ pub enum Message {
 pub struct ResolvedMedia {
     /// The URL the media was asked for.
     pub url: String,
-    /// Whether this media replaces the active queue (a fresh play) or only
-    /// fills the current mark the queue already advanced to.
-    pub replace_queue: bool,
     /// The thumbnail of the resolved media, for the queue.
     pub thumbnail: Option<String>,
     /// The resolved source.
@@ -170,7 +167,7 @@ impl App {
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
             queue,
-            cache: ThumbnailCache::new(paths.cache()),
+            cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
             pending: Mutex::new(None),
         })
     }
@@ -197,7 +194,8 @@ impl App {
         if self.has_media() {
             self.resolve_pending(url);
         } else {
-            self.resolve_play(url, true);
+            self.prepare_current(&url, "", None);
+            self.consume_current();
         }
     }
 
@@ -206,24 +204,21 @@ impl App {
         self.state.lock().expect("the state is not poisoned").source.is_some()
     }
 
-    /// Resolves a URL in the background and plays it when it arrives.
-    ///
-    /// `replace_queue` marks a fresh play, which takes over the active queue;
-    /// the queue's own next entries call this with `false` so advancing never
-    /// rewrites the queue it is walking through.
-    fn resolve_play(&self, url: String, replace_queue: bool) {
+    /// Resolves the URL read from the active queue in the background.
+    fn resolve_play(&self, url: String) {
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
         let outbox = Arc::clone(&self.outbox);
+        let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
             let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
-                ResolvedMedia {
-                    url: url.clone(),
-                    replace_queue,
-                    thumbnail: source.thumbnail.clone(),
-                    source,
-                }
+                let thumbnail = source
+                    .thumbnail
+                    .as_deref()
+                    .and_then(|url| cache.fetch(url).ok())
+                    .map(|path| path.to_string_lossy().into_owned());
+                ResolvedMedia { url: url.clone(), thumbnail, source }
             });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
@@ -255,12 +250,8 @@ impl App {
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
-        if let Err(error) =
-            self.queue.replace_with(&pending.url, &pending.title, thumbnail.as_deref())
-        {
-            crate::diag::note(&format!("the active queue could not be written: {error}"));
-        }
-        let loaded = self.accept(pending.source);
+        self.prepare_current(&pending.url, &pending.title, thumbnail.as_deref());
+        let loaded = self.consume_resolved(&pending.url, pending.source, thumbnail.as_deref())?;
         Some((pending.url, loaded))
     }
 
@@ -283,9 +274,13 @@ impl App {
         self.pending.lock().expect("the pending media is not poisoned").take();
     }
 
-    /// Remembers the media that just started as the active queue.
-    pub fn remember_current(&self, url: &str, loaded: &Loaded, thumbnail: Option<&str>) {
-        if let Err(error) = self.queue.replace_with(url, &loaded.title, thumbnail) {
+    /// Puts a freshly resolved media in the active queue before it is loaded.
+    pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>) {
+        let thumbnail_path = thumbnail.map(PathBuf::from);
+        if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
+            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
+        }
+        if let Err(error) = self.queue.replace_with(url, title, thumbnail) {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
         }
     }
@@ -297,7 +292,7 @@ impl App {
     /// have changed since the entry was added.
     pub fn advance(&self) {
         match self.queue.advance() {
-            Ok(Some(entry)) => self.resolve_play(entry.url, false),
+            Ok(Some(_)) => self.consume_current(),
             Ok(None) => {}
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"))
@@ -311,8 +306,8 @@ impl App {
     /// in an earlier run picks up where it left off.
     pub fn resume(&self) -> bool {
         match self.queue.current() {
-            Ok(Some(entry)) => {
-                self.resolve_play(entry.url, false);
+            Ok(Some(_)) => {
+                self.consume_current();
                 true
             }
             Ok(None) => false,
@@ -323,12 +318,42 @@ impl App {
         }
     }
 
-    /// Accepts a resolved source and starts playing it.
+    /// Asks the current queue entry to be consumed.
     ///
-    /// The best streams start playing straight away: the best video with the
-    /// best audio next to it, a combined stream, or an audio-only stream for
-    /// media that has no picture.
-    pub fn accept(&self, source: MediaSource) -> Loaded {
+    /// The URL is read from the queue, so callers cannot supply a player URL.
+    pub fn consume_current(&self) {
+        match self.queue.current() {
+            Ok(Some(entry)) => self.resolve_play(entry.url),
+            Ok(None) => {}
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+            }
+        }
+    }
+
+    /// Finishes resolving the queue's current item, ignoring stale results.
+    pub fn consume_resolved(
+        &self,
+        url: &str,
+        source: MediaSource,
+        thumbnail: Option<&str>,
+    ) -> Option<Loaded> {
+        let current = match self.queue.current() {
+            Ok(Some(entry)) if entry.url == url => entry,
+            Ok(_) => return None,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                return None;
+            }
+        };
+        if let Err(error) = self.queue.update_details(current.position, &source.title, thumbnail) {
+            crate::diag::note(&format!("the active queue entry could not be updated: {error}"));
+        }
+        Some(self.accept_current_source(source))
+    }
+
+    /// Builds playback state for the source already authorized by the queue.
+    fn accept_current_source(&self, source: MediaSource) -> Loaded {
         let sources = source_lists(&source);
         let default = stream_resolver::plan(&source, &Quality::Best).ok();
         let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
