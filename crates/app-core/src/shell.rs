@@ -351,7 +351,7 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
 
     // keep-open leaves the completed file loaded, so advance from the
     // persistent EOF property instead of waiting for the file-unload event.
-    if app.engine().is_eof() && loading.claim_eof() {
+    if loading.observe_eof(app.engine().is_eof()) {
         app.advance();
     }
 

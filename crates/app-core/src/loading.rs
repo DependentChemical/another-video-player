@@ -126,16 +126,15 @@ impl Loading {
     /// mpv began loading the file that belongs to the current load.
     pub fn file_started(&mut self) {
         self.current_file = true;
-        self.eof_consumed = false;
     }
 
-    /// Claims an observed EOF once, until the next file starts.
-    pub fn claim_eof(&mut self) -> bool {
-        if self.eof_consumed {
+    /// Claims an EOF once and rearms after mpv clears the EOF property.
+    pub fn observe_eof(&mut self, reached: bool) -> bool {
+        if !reached {
+            self.eof_consumed = false;
             return false;
         }
-        self.eof_consumed = true;
-        true
+        !std::mem::replace(&mut self.eof_consumed, true)
     }
 
     /// Playback of a file ended.
@@ -299,15 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn an_eof_is_claimed_once_per_file() {
+    fn an_eof_is_claimed_once_until_mpv_clears_it() {
         let mut loading = Loading::new();
         loading.file_started();
 
-        assert!(loading.claim_eof());
-        assert!(!loading.claim_eof());
+        assert!(loading.observe_eof(true));
+        assert!(!loading.observe_eof(true));
 
         loading.file_started();
-        assert!(loading.claim_eof());
+        assert!(!loading.observe_eof(true));
+        assert!(!loading.observe_eof(false));
+        assert!(loading.observe_eof(true));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -78,6 +79,12 @@ pub struct Loaded {
     pub is_live: bool,
 }
 
+/// A resolved queue item kept ready while the current item is playing.
+struct PreparedMedia {
+    source: MediaSource,
+    thumbnail: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PendingSeek {
     Position(f64),
@@ -136,6 +143,8 @@ pub struct App {
     live: Mutex<LiveAxis>,
     /// The active queue Flatline keeps between runs.
     queue: Queue,
+    /// Sources already resolved when their entries were added to the queue.
+    prepared: Mutex<HashMap<i64, PreparedMedia>>,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
     /// The media the user still has to decide about.
@@ -167,6 +176,7 @@ impl App {
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
             queue,
+            prepared: Mutex::new(HashMap::new()),
             cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
             pending: Mutex::new(None),
         })
@@ -262,10 +272,17 @@ impl App {
             return false;
         };
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
-        if let Err(error) = self.queue.push(&pending.url, &pending.title, thumbnail.as_deref()) {
-            crate::diag::note(&format!("the active queue could not be written: {error}"));
-            return false;
-        }
+        let entry = match self.queue.push(&pending.url, &pending.title, thumbnail.as_deref()) {
+            Ok(entry) => entry,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                return false;
+            }
+        };
+        self.prepared
+            .lock()
+            .expect("prepared queue media is not poisoned")
+            .insert(entry.position, PreparedMedia { source: pending.source, thumbnail });
         true
     }
 
@@ -276,6 +293,7 @@ impl App {
 
     /// Puts a freshly resolved media in the active queue before it is loaded.
     pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>) {
+        self.prepared.lock().expect("prepared queue media is not poisoned").clear();
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
@@ -323,7 +341,23 @@ impl App {
     /// The URL is read from the queue, so callers cannot supply a player URL.
     pub fn consume_current(&self) {
         match self.queue.current() {
-            Ok(Some(entry)) => self.resolve_play(entry.url),
+            Ok(Some(entry)) => {
+                let prepared = self
+                    .prepared
+                    .lock()
+                    .expect("prepared queue media is not poisoned")
+                    .remove(&entry.position);
+                if let Some(prepared) = prepared {
+                    let message = Message::Resolved(Ok(ResolvedMedia {
+                        url: entry.url,
+                        thumbnail: prepared.thumbnail,
+                        source: prepared.source,
+                    }));
+                    let _ = self.outbox.lock().map(|sender| sender.send(Box::new(message)));
+                } else {
+                    self.resolve_play(entry.url);
+                }
+            }
             Ok(None) => {}
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"));
