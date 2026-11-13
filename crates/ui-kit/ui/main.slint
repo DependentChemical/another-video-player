@@ -1,4 +1,4 @@
-﻿import { ScrollView } from "std-widgets.slint";
+import { Button, ProgressIndicator, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 import { TopBar } from "slint-ui/TopBar.slint";
@@ -63,6 +63,11 @@ export component MainWindow inherits Window {
     in-out property <bool> pending-open: false;
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
+    in-out property <bool> update-open: false;
+    in property <string> update-version: "";
+    in property <string> update-notes: "";
+    in-out property <bool> update-installing: false;
+    in property <string> update-error: "";
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -78,6 +83,8 @@ export component MainWindow inherits Window {
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-dismissed();
+    callback update-accepted();
+    callback update-dismissed();
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -233,5 +240,30 @@ export component MainWindow inherits Window {
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
         pending-dismissed => { root.pending-dismissed(); }
+    }
+
+    if root.update-open: Rectangle {
+        width: parent.width; height: parent.height;
+        background: #00000099;
+        Rectangle {
+            x: (parent.width - min(560px, parent.width - 40px)) / 2;
+            y: (parent.height - min(440px, parent.height - 40px)) / 2;
+            width: min(560px, parent.width - 40px); height: min(440px, parent.height - 40px);
+            background: Theme.panel; border-radius: 12px; border-width: 1px; border-color: Theme.border;
+            VerticalLayout {
+                padding: 22px; spacing: 12px;
+                Text { text: root.update-installing ? "Installing update…" : "Flatline update available"; color: Theme.fg; font-size: 20px; }
+                Text { text: "Version " + root.update-version; color: Theme.muted; }
+                ScrollView { height: 260px; Text { text: root.update-notes; color: Theme.fg; wrap: word-wrap; } }
+                if root.update-error != "": Text { text: root.update-error; color: Theme.danger; wrap: word-wrap; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    if !root.update-installing && root.update-error == "": Button { text: "No"; clicked => { root.update-open = false; root.update-dismissed(); } }
+                    if !root.update-installing && root.update-error == "": Button { text: "Yes, download and install"; clicked => { root.update-installing = true; root.update-accepted(); } }
+                    if root.update-installing: ProgressIndicator { indeterminate: true; }
+                    if root.update-error != "": Button { text: "Close"; clicked => { root.update-open = false; root.update-dismissed(); } }
+                }
+            }
+        }
     }
 }

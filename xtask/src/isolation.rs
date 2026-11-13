@@ -21,6 +21,7 @@ const RULES: &[(&str, &[&str])] = &[
     ("storyboard", &[]),
     ("ui-kit", &[]),
     ("ytdlp-tool", &[]),
+    ("updater", &[]),
     ("stream-resolver", &["media-model"]),
     ("video-surface", &["playback-engine"]),
     (
@@ -35,6 +36,7 @@ const RULES: &[(&str, &[&str])] = &[
             "ui-kit",
             "video-surface",
             "ytdlp-tool",
+            "updater",
         ],
     ),
 ];

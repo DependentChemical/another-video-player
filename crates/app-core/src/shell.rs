@@ -6,6 +6,7 @@
 //! them works inside.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ pub struct Shell {
 
 impl Shell {
     /// Builds the window and connects it to the application.
-    pub fn new(app: Arc<App>) -> Result<Shell, Error> {
+    pub fn new(app: Arc<App>, program_dir: PathBuf) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
         let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
             .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
@@ -69,6 +70,27 @@ impl Shell {
         .map_err(|error| Error::Ui(error.to_string()))?;
 
         let loading = Rc::new(RefCell::new(Loading::new()));
+        let update = Rc::new(RefCell::new(None));
+        {
+            let update = Rc::clone(&update);
+            let app = Arc::clone(&app);
+            let install_dir = program_dir.clone();
+            ui.on_update_accepted(move || {
+                if let Some(update) = update.borrow().clone() {
+                    let directory = install_dir.clone();
+                    let executable = std::env::current_exe().unwrap_or_else(|_| {
+                        directory.join(if cfg!(windows) { "flatline.exe" } else { "flatline" })
+                    });
+                    app.install_app_update(update, directory, executable);
+                }
+            });
+        }
+        {
+            let update = Rc::clone(&update);
+            ui.on_update_dismissed(move || {
+                update.borrow_mut().take();
+            });
+        }
 
         // Window exit is distinct from pointer movement within the client area.
         {
@@ -224,7 +246,7 @@ impl Shell {
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
-                tick(&ui, &app, &mut loading);
+                tick(&ui, &app, &mut loading, &update);
                 spinner_step.set((spinner_step.get() + 1) % 3);
                 ui.set_spinner_step(spinner_step.get());
                 let visible = ui.sources_open()
@@ -304,7 +326,12 @@ fn player_to_slider_volume(volume: f64) -> f64 {
 }
 
 /// Brings the interface and the player back in sync.
-fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
+fn tick(
+    ui: &PlayerUi,
+    app: &App,
+    loading: &mut Loading,
+    update_slot: &Rc<RefCell<Option<updater::Update>>>,
+) {
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(media)) => {
@@ -350,6 +377,11 @@ fn tick(ui: &PlayerUi, app: &App, loading: &mut Loading) {
                     crate::diag::note(&format!("yt-dlp was updated ({path})"));
                 }
             }
+            Message::UpdateAvailable(update) => {
+                ui.show_update(&update.version, &update.notes);
+                *update_slot.borrow_mut() = Some(update);
+            }
+            Message::UpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => loading.problem(text),
         }
     }

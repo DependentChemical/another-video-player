@@ -12,6 +12,7 @@ members = [
     "crates/ui-kit",
     "crates/video-surface",
     "crates/ytdlp-tool",
+    "crates/updater",
     "xtask",
 ]
 # `cargo run` / `cargo build` at the workspace root operate on the primary crate.
@@ -37,6 +38,7 @@ stream-resolver = { path = "crates/stream-resolver" }
 ui-kit = { path = "crates/ui-kit" }
 video-surface = { path = "crates/video-surface" }
 ytdlp-tool = { path = "crates/ytdlp-tool" }
+updater = { path = "crates/updater" }
 
 # --- external crates ---------------------------------------------------------
 slint = { version = "1.18", default-features = false, features = [

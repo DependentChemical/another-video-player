@@ -18,6 +18,7 @@ settings = { workspace = true }
 ui-kit = { workspace = true }
 video-surface = { workspace = true }
 ytdlp-tool = { workspace = true }
+updater = { workspace = true }
 slint = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

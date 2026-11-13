@@ -30,6 +30,10 @@ pub enum Message {
     Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
     ToolUpdated(String),
+    /// A newer application release is available.
+    UpdateAvailable(updater::Update),
+    /// An accepted application update could not be prepared for installation.
+    UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
 }
@@ -295,7 +299,13 @@ impl App {
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
-        self.prepare_current(&pending.url, &pending.title, thumbnail.as_deref(), thumbnail_url.as_deref(), uploader.as_deref());
+        self.prepare_current(
+            &pending.url,
+            &pending.title,
+            thumbnail.as_deref(),
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+        );
         let loaded = self.consume_resolved(
             &pending.url,
             pending.source,
@@ -314,7 +324,13 @@ impl App {
         let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
-        let entry = match self.queue.push(&pending.url, &pending.title, thumbnail.as_deref(), thumbnail_url.as_deref(), uploader.as_deref()) {
+        let entry = match self.queue.push(
+            &pending.url,
+            &pending.title,
+            thumbnail.as_deref(),
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+        ) {
             Ok(entry) => entry,
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be written: {error}"));
@@ -339,12 +355,20 @@ impl App {
     }
 
     /// Puts a freshly resolved media in the active queue before it is loaded.
-    pub fn prepare_current(&self, url: &str, title: &str, thumbnail: Option<&str>, thumbnail_url: Option<&str>, uploader: Option<&str>) {
+    pub fn prepare_current(
+        &self,
+        url: &str,
+        title: &str,
+        thumbnail: Option<&str>,
+        thumbnail_url: Option<&str>,
+        uploader: Option<&str>,
+    ) {
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
         }
-        if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader) {
+        if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
+        {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
         }
     }
@@ -478,10 +502,7 @@ impl App {
 
         // Check history for saved playback position (only for non-live videos)
         let history_position = if !source.is_live {
-            self.queue.history_get(&id_hash)
-                .ok()
-                .flatten()
-                .map(|entry| entry.position_seconds)
+            self.queue.history_get(&id_hash).ok().flatten().map(|entry| entry.position_seconds)
         } else {
             None
         };
@@ -694,6 +715,39 @@ impl App {
         });
     }
 
+    /// Checks GitHub for a newer Flatline release in the background.
+    pub fn check_app_update(&self) {
+        let outbox = Arc::clone(&self.outbox);
+        self.runtime.handle().spawn_blocking(move || match updater::check(crate::VERSION) {
+            Ok(Some(update)) => {
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateAvailable(update))));
+            }
+            Ok(None) => crate::diag::note("Flatline is up to date"),
+            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
+        });
+    }
+
+    /// Downloads and prepares an accepted application update in the background.
+    pub fn install_app_update(
+        &self,
+        update: updater::Update,
+        directory: PathBuf,
+        executable: PathBuf,
+    ) {
+        let outbox = Arc::clone(&self.outbox);
+        self.runtime.handle().spawn_blocking(move || {
+            if let Err(error) = updater::install(&update, &directory, &executable) {
+                let message = error.to_string();
+                crate::diag::note(&format!("the Flatline update failed: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateFailed(message))));
+            }
+        });
+    }
+
     /// Marks the start of a replacement file so an older load event is ignored.
     pub fn on_file_started(&self) {
         let mut state = self.state.lock().expect("the state is not poisoned");
@@ -734,9 +788,9 @@ impl App {
         state.current_id_hash = Some(id_hash.clone());
 
         let now = Instant::now();
-        let should_save = state.last_history_save.is_none_or(|last| {
-            now.duration_since(last) >= Duration::from_secs(20)
-        });
+        let should_save = state
+            .last_history_save
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(20));
 
         if !should_save {
             return;
@@ -754,7 +808,14 @@ impl App {
 
         drop(state); // Release lock before DB operation
 
-        if let Err(error) = self.queue.history_upsert(&id_hash, &url, &title, thumbnail_url.as_deref(), uploader.as_deref(), position) {
+        if let Err(error) = self.queue.history_upsert(
+            &id_hash,
+            &url,
+            &title,
+            thumbnail_url.as_deref(),
+            uploader.as_deref(),
+            position,
+        ) {
             crate::diag::note(&format!("failed to save history position: {error}"));
         } else {
             // Update last save time

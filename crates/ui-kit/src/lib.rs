@@ -289,6 +289,26 @@ impl PlayerUi {
         self.window.set_pending_open(false);
     }
 
+    /// Shows the release notes and available version.
+    pub fn show_update(&self, version: &str, notes: &str) {
+        self.window.set_update_version(version.into());
+        self.window.set_update_notes(notes.into());
+        self.window.set_update_installing(false);
+        self.window.set_update_error("".into());
+        self.window.set_update_open(true);
+    }
+
+    /// Shows an update preparation error in the open update dialog.
+    pub fn show_update_error(&self, message: &str) {
+        self.window.set_update_installing(false);
+        self.window.set_update_error(message.into());
+    }
+
+    /// Shows that the package is being downloaded and installed.
+    pub fn set_update_installing(&self, installing: bool) {
+        self.window.set_update_installing(installing);
+    }
+
     // ------------------------------------------------------------ events --
 
     /// Called when the user asks for the URL to be loaded.
@@ -368,6 +388,16 @@ impl PlayerUi {
     /// Called when the user dismisses the pending dialog.
     pub fn on_pending_dismissed(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_dismissed(handler);
+    }
+
+    /// Called when the user accepts the update.
+    pub fn on_update_accepted(&self, handler: impl Fn() + 'static) {
+        self.window.on_update_accepted(handler);
+    }
+
+    /// Called when the user declines the update.
+    pub fn on_update_dismissed(&self, handler: impl Fn() + 'static) {
+        self.window.on_update_dismissed(handler);
     }
 }
 
