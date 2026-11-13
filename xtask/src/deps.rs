@@ -65,18 +65,10 @@ pub fn mpv_library_dir() -> Option<PathBuf> {
 
 /// The version used for release tags and archive names.
 ///
-/// The app embeds this same version at compile time; the version file itself
-/// is not shipped with the app.
+/// This is the workspace version from the root `Cargo.toml`, the single
+/// source of truth for the version of Flatline.
 pub fn version() -> Result<String, String> {
-    let file = workspace_root().join("version.txt");
-    let text = std::fs::read_to_string(&file).map_err(|error| {
-        format!("the version could not be read from {}: {error}", file.display())
-    })?;
-    let version = text.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("");
-    if version.is_empty() {
-        return Err(format!("{} is empty", file.display()));
-    }
-    Ok(version.to_string())
+    Ok(env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// Prepares every external dependency.

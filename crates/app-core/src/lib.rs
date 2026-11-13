@@ -25,8 +25,8 @@ pub use paths::AppPaths;
 pub use shell::Shell;
 pub use timeline::{LIVE_BUFFER, LIVE_WINDOW, LiveAxis, Timeline};
 
-/// The version of Flatline, taken from `version.txt` when it was built.
-pub const VERSION: &str = env!("FLATLINE_VERSION");
+/// The version of Flatline, taken from the workspace manifest in `Cargo.toml`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Starts the player.
 ///
@@ -106,25 +106,5 @@ impl From<app::Error> for Error {
 impl From<shell::Error> for Error {
     fn from(value: shell::Error) -> Self {
         Error::Shell(value)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// The version file is the reference for the version of the project.
-    ///
-    /// Cargo needs a version of its own, so this test keeps the two in step.
-    #[test]
-    fn the_version_file_matches_the_crate_version() {
-        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../version.txt")
-            .canonicalize()
-            .expect("version.txt exists");
-        let text = std::fs::read_to_string(&file).expect("version.txt can be read");
-        let version = text.trim();
-
-        assert!(!version.is_empty(), "version.txt is empty");
-        assert_eq!(version, env!("CARGO_PKG_VERSION"), "version.txt and Cargo.toml do not agree");
-        assert_eq!(version, crate::VERSION);
     }
 }

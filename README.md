@@ -63,13 +63,12 @@ mode and collects a runnable player in `dist/`:
 dist/
 ├── flatline.exe          the player
 ├── libmpv-2.dll          the mpv runtime it needs
-├── tools/
-│   └── yt-dlp.exe        the resolver the player keeps up to date
-└── version.txt           the version of this build
+└── tools/
+    └── yt-dlp.exe        the resolver the player keeps up to date
 ```
 
 The release archive is the same folder as a `.zip`, named after the platform
-and the version in `version.txt` (for example
+and the version in `Cargo.toml` (for example
 `flatline-0.1.0-windows-x64.zip`).
 
 For day-to-day work the debug build is faster:
@@ -84,18 +83,19 @@ prefer to spell it out.
 
 ## Releases
 
-The version lives in `version.txt`; the workspace version in `Cargo.toml` has
-to match it, and a test keeps the two in step. The **Build** workflow runs the
-tests and packages the Windows and Linux archives on every push to `main`.
+The version lives in `[workspace.package].version` in the root `Cargo.toml`
+and is the single source of truth for the application. The **Build** workflow
+runs the tests and packages the Windows and Linux archives on every push to
+`main`.
 
 When a build on `main` succeeds, the **Release** workflow publishes a GitHub
 release named `v<version>` with both archives attached. It reads the version
-from `version.txt` at the commit that was built, uses the commit message as the
+from `Cargo.toml` at the commit that was built, uses the commit message as the
 release notes and does nothing when the tag already exists. The release only
 runs when every test and both platform builds of the **Build** workflow
 passed. Each release also moves the floating `latest` tag to the release
 commit, so `latest` always points at the newest release. To cut a release,
-bump `version.txt` and `Cargo.toml` together and push.
+bump the workspace version in `Cargo.toml` and push.
 
 ## Run
 
