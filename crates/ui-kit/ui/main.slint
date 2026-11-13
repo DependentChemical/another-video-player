@@ -398,9 +398,8 @@ export component MainWindow inherits Window {
                 changed has-hover => {
                     root.controls-hovered(self.has-hover);
                 }
-            }
 
-            PlayPauseButton {
+                PlayPauseButton {
                 x: 12px;
                 y: (parent.height - 32px) / 2;
                 width: 44px;
@@ -502,6 +501,7 @@ export component MainWindow inherits Window {
                 value: root.volume;
                 maximum: 200;
                 moved(value) => {
+                    root.pointer-activity();
                     root.volume-requested(value);
                 }
             }
@@ -517,6 +517,7 @@ export component MainWindow inherits Window {
                     root.fullscreen-toggled();
                 }
             }
+            }  // closes TouchArea
         }
     }
 
