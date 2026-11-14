@@ -3,12 +3,15 @@ import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 import { TopBar } from "slint-ui/TopBar.slint";
 import { VideoPlayer } from "slint-ui/VideoPlayer.slint";
+import { VideoHeader } from "slint-ui/VideoHeader.slint";
 import { PlayerControls } from "slint-ui/PlayerControls.slint";
 import { SourcePicker } from "slint-ui/SourcePicker.slint";
 import { PendingDialog } from "slint-ui/PendingDialog.slint";
 import { Toast } from "slint-ui/Toast.slint";
 import { SourceColumn } from "slint-ui/SourceColumn.slint";
 import { StreamItem } from "slint-ui/types.slint";
+
+import "../fonts/Inter.ttf";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -22,12 +25,13 @@ export component MainWindow inherits Window {
     min-width: 560px;
     min-height: 340px;
     background: root.has-media ? transparent : Theme.bg;
-    default-font-family: "Segoe UI";
+    default-font-family: "Inter";
     default-font-size: 13px;
 
     // ------------------------------------------------------------- state --
     in-out property <string> url: "";
     in property <string> media-title: "";
+    in property <string> media-uploader: "";
     in property <string> status: "";
     // "info", "busy" or "error".
     in property <string> status-kind: "info";
@@ -150,16 +154,6 @@ export component MainWindow inherits Window {
         }
     }
 
-    // Top bar with URL field
-    TopBar {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        url <=> root.url;
-        load-requested => { root.load-requested(); }
-        pointer-activity => { root.pointer-activity(); }
-    }
-
     // Video area with status display
     VideoPlayer {
         x: 0;
@@ -175,10 +169,31 @@ export component MainWindow inherits Window {
         pointer-activity => { root.pointer-activity(); }
     }
 
+    // Video header (title and channel) overlay below top bar
+    VideoHeader {
+        x: 0;
+        width: parent.width;
+        title: root.media-title;
+        uploader: root.media-uploader;
+        has-media: root.has-media;
+        controls-visible: root.controls-visible;
+        pointer-activity => { root.pointer-activity(); }
+    }
+
+    // Top bar with URL field
+    TopBar {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        url <=> root.url;
+        load-requested => { root.load-requested(); }
+        pointer-activity => { root.pointer-activity(); }
+    }
+
     // Control bar
     PlayerControls {
         x: 0;
-        y: parent.height - Theme.controls-height;
+        y: root.controls-visible ? parent.height - Theme.controls-height : parent.height;
         width: parent.width;
         height: Theme.controls-height;
         container-height: parent.height - Theme.bar-height;

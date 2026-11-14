@@ -1,0 +1,54 @@
+// An overlay bar at the top of the video area showing title and uploader info.
+//
+// The bar slides into view along with the bottom player controls when the
+// pointer is active, keeping the video unobstructed during playback.
+import { Theme } from "../theme.slint";
+
+export component VideoHeader inherits Rectangle {
+    in property <string> title: "";
+    in property <string> uploader: "";
+    in property <bool> controls-visible: true;
+    in property <bool> has-media: false;
+    callback pointer-activity();
+
+    background: #000000a6;
+    opacity: (root.has-media && root.controls-visible && (root.title != "" || root.uploader != "")) ? 1 : 0;
+    y: root.controls-visible ? Theme.bar-height : Theme.bar-height - self.height;
+
+    animate y { duration: 180ms; easing: ease-out; }
+    animate opacity { duration: 140ms; }
+
+    TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move {
+                root.pointer-activity();
+            }
+        }
+        moved => { root.pointer-activity(); }
+
+        VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 3px;
+            alignment: start;
+
+            Text {
+                text: root.title;
+                color: Theme.fg;
+                font-size: 15px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            if root.uploader != "": Text {
+                text: root.uploader;
+                color: Theme.muted;
+                font-size: 12px;
+                font-weight: 400;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

@@ -155,6 +155,8 @@ impl Shell {
                 if let Some((_, loaded)) = app.play_pending() {
                     ui_for_pending.hide_toast();
                     ui_for_pending.set_media_title(&loaded.title);
+                    ui_for_pending
+                        .set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                     ui_for_pending.set_sources(&loaded.sources);
                     ui_for_pending.set_selected_sources(
                         loaded.video.as_deref(),
@@ -353,6 +355,7 @@ fn tick(
                 };
                 ui.hide_toast();
                 ui.set_media_title(&loaded.title);
+                ui.set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                 ui.set_sources(&loaded.sources);
                 ui.set_selected_sources(
                     loaded.video.as_deref(),

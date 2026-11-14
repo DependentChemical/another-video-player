@@ -1,23 +1,26 @@
-//! Downloads the Material Icons font and compiles the user interface.
+//! Downloads the Material Icons and Inter fonts and compiles the user interface.
 //!
 //! The icons are drawn with the font that Google publishes for Material
-//! Design, so the interface does not have to carry vector paths of its own.
-//! The font is fetched once, checked for the glyphs the interface needs and
-//! then imported by the interface, which embeds it into the binary.
+//! Design, and the UI typography uses Inter, a variable font.
+//! The fonts are fetched, checked and then imported by the interface,
+//! which embeds them into the binary.
 
 use std::path::{Path, PathBuf};
 
-/// Where the font is published.
-const FONT_URL: &str = "https://raw.githubusercontent.com/google/material-design-icons/master/font/MaterialIcons-Regular.ttf";
+/// Where the Material Icons font is published.
+const ICONS_FONT_URL: &str = "https://raw.githubusercontent.com/google/material-design-icons/master/font/MaterialIcons-Regular.ttf";
 
-/// The name the font carries, and the name the interface asks for.
-const FONT_FAMILY: &str = "Material Icons";
+/// The family name for the icons font.
+const ICONS_FONT_FAMILY: &str = "Material Icons";
+
+/// Where the Inter variable font is published.
+const INTER_FONT_URL: &str =
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf";
+
+/// The family name for the Inter font.
+const INTER_FONT_FAMILY: &str = "Inter";
 
 /// The glyphs the interface uses.
-///
-/// The codepoints are the ones Google publishes for the Material Icons font.
-/// They are checked against the downloaded file, so a font that does not
-/// match stops the build instead of showing empty boxes.
 const REQUIRED_GLYPHS: &[(&str, u32)] = &[
     ("play_arrow", 0xe037),
     ("pause", 0xe034),
@@ -39,9 +42,13 @@ const REQUIRED_GLYPHS: &[(&str, u32)] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FLATLINE_MATERIAL_ICONS");
+    println!("cargo:rerun-if-env-changed=FLATLINE_INTER_FONT");
 
-    let font = prepare_font();
-    println!("cargo:rerun-if-changed={}", font.display());
+    let icons_font = prepare_icons_font();
+    println!("cargo:rerun-if-changed={}", icons_font.display());
+
+    let inter_font = prepare_inter_font();
+    println!("cargo:rerun-if-changed={}", inter_font.display());
 
     let config = slint_build::CompilerConfiguration::new()
         .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles);
@@ -49,36 +56,53 @@ fn main() {
         .expect("the user interface failed to compile");
 }
 
-/// Makes sure the font is there and returns where it is.
-///
-/// The font is kept in the crate, so the interface can import it by a path
-/// that does not change between builds.
-fn prepare_font() -> PathBuf {
+/// Makes sure the Material Icons font is present and returns its path.
+fn prepare_icons_font() -> PathBuf {
     let font =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts").join("MaterialIcons-Regular.ttf");
 
     match std::env::var_os("FLATLINE_MATERIAL_ICONS") {
         Some(path) => {
             let path = PathBuf::from(path);
-            check(&path);
+            check_icons_font(&path);
             path
         }
         None => {
             if !font.is_file() {
-                download(&font);
+                download(ICONS_FONT_URL, &font, "Material Icons");
             }
-            check(&font);
+            check_icons_font(&font);
             font
         }
     }
 }
 
-/// Downloads the font.
-fn download(destination: &Path) {
-    let mut response = ureq::get(FONT_URL)
+/// Makes sure the Inter font is present and returns its path.
+fn prepare_inter_font() -> PathBuf {
+    let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts").join("Inter.ttf");
+
+    match std::env::var_os("FLATLINE_INTER_FONT") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            check_inter_font(&path);
+            path
+        }
+        None => {
+            if !font.is_file() {
+                download(INTER_FONT_URL, &font, "Inter");
+            }
+            check_inter_font(&font);
+            font
+        }
+    }
+}
+
+/// Downloads a font to the destination path.
+fn download(url: &str, destination: &Path, name: &str) {
+    let mut response = ureq::get(url)
         .header("User-Agent", concat!("Flatline/", env!("CARGO_PKG_VERSION")))
         .call()
-        .unwrap_or_else(|error| panic!("the Material Icons font could not be downloaded: {error}"));
+        .unwrap_or_else(|error| panic!("the {name} font could not be downloaded: {error}"));
 
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)
@@ -87,30 +111,21 @@ fn download(destination: &Path) {
 
     let mut body = response.body_mut().as_reader();
     let mut file = std::fs::File::create(destination)
-        .unwrap_or_else(|error| panic!("the Material Icons font could not be written: {error}"));
+        .unwrap_or_else(|error| panic!("the {name} font could not be written: {error}"));
     std::io::copy(&mut body, &mut file)
-        .unwrap_or_else(|error| panic!("the Material Icons font could not be written: {error}"));
+        .unwrap_or_else(|error| panic!("the {name} font could not be written: {error}"));
 }
 
-/// Checks that the font has the family name and the glyphs the interface needs.
-fn check(path: &Path) {
+/// Checks that the font has the Material Icons family name and required glyphs.
+fn check_icons_font(path: &Path) {
     let data = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the Material Icons font could not be read: {error}"));
     let face = ttf_parser::Face::parse(&data, 0)
         .unwrap_or_else(|error| panic!("the Material Icons font could not be understood: {error}"));
 
-    let names = face.names();
-    let family = names
-        .into_iter()
-        .filter(|name| {
-            name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY
-                || name.name_id == ttf_parser::name_id::FAMILY
-        })
-        .filter_map(|name| name.to_string())
-        .find(|name| !name.is_empty())
-        .unwrap_or_default();
-    if family != FONT_FAMILY {
-        panic!("the downloaded font is {family:?} instead of {FONT_FAMILY:?}");
+    let family = extract_family(&face);
+    if family != ICONS_FONT_FAMILY {
+        panic!("the downloaded font is {family:?} instead of {ICONS_FONT_FAMILY:?}");
     }
 
     for (name, codepoint) in REQUIRED_GLYPHS {
@@ -120,4 +135,30 @@ fn check(path: &Path) {
             panic!("the Material Icons font does not have the glyph {name}");
         }
     }
+}
+
+/// Checks that the font has the Inter family name.
+fn check_inter_font(path: &Path) {
+    let data = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("the Inter font could not be read: {error}"));
+    let face = ttf_parser::Face::parse(&data, 0)
+        .unwrap_or_else(|error| panic!("the Inter font could not be understood: {error}"));
+
+    let family = extract_family(&face);
+    if family != INTER_FONT_FAMILY {
+        panic!("the downloaded font is {family:?} instead of {INTER_FONT_FAMILY:?}");
+    }
+}
+
+/// Extracts the typographic or standard family name of a font face.
+fn extract_family(face: &ttf_parser::Face) -> String {
+    face.names()
+        .into_iter()
+        .filter(|name| {
+            name.name_id == ttf_parser::name_id::TYPOGRAPHIC_FAMILY
+                || name.name_id == ttf_parser::name_id::FAMILY
+        })
+        .filter_map(|name| name.to_string())
+        .find(|name| !name.is_empty())
+        .unwrap_or_default()
 }

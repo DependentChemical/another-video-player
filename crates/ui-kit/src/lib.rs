@@ -167,6 +167,11 @@ impl PlayerUi {
         self.window.set_media_title(title.into());
     }
 
+    /// The channel or uploader of the media that is playing.
+    pub fn set_media_uploader(&self, uploader: &str) {
+        self.window.set_media_uploader(uploader.into());
+    }
+
     /// Shows a message.
     pub fn set_status(&self, status: &str, kind: StatusKind) {
         self.window.set_status(status.into());
@@ -423,4 +428,18 @@ fn to_model(options: &[SourceOption]) -> slint::ModelRc<StreamItem> {
 fn non_empty(value: slint::SharedString) -> Option<String> {
     let value = value.to_string();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_media_metadata_setters() {
+        let ui = PlayerUi::new().expect("UI window should initialize");
+        ui.set_media_title("Test Video Title");
+        ui.set_media_uploader("Test Channel");
+        assert_eq!(ui.window().get_media_title(), "Test Video Title");
+        assert_eq!(ui.window().get_media_uploader(), "Test Channel");
+    }
 }
