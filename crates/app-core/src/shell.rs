@@ -16,9 +16,9 @@ use playback_engine::{EndReason, EngineEvent};
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
-use ui_kit::{PlayerUi, StatusKind};
+use ui_kit::{HistoryListEntry, PlayerUi, QueueListEntry, StatusKind};
 
-use crate::app::{App, Message};
+use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
@@ -38,6 +38,7 @@ impl Shell {
     /// Builds the window and connects it to the application.
     pub fn new(app: Arc<App>, program_dir: PathBuf) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
+        ui.set_app_version(crate::VERSION);
         let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
             .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
             .into_rgba8();
@@ -46,6 +47,7 @@ impl Shell {
         let redraw = ui.redraw_handle();
         let last_pointer_activity = Rc::new(Cell::new(Instant::now()));
         let controls_hovered = Rc::new(Cell::new(false));
+        let controls_interacting = Rc::new(Cell::new(false));
 
         // mpv draws the video into the part of the window below the top bar.
         // The weak handle is the only thing the render thread touches, so it
@@ -135,15 +137,7 @@ impl Shell {
             let ui_for_load = Rc::clone(&ui);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
-                if ui_for_load.has_media() {
-                    // Something plays already, so the new URL must not
-                    // interrupt it. A toast says the background is working
-                    // and the dialog appears once the media is resolved.
-                    ui_for_load.show_toast("Parsing video");
-                } else {
-                    loading.borrow_mut().resolve_started();
-                }
-                app.load(url);
+                start_load(&app, &ui_for_load, &loading, url.as_str());
             });
         }
         {
@@ -152,8 +146,10 @@ impl Shell {
             let loading = Rc::clone(&loading);
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
-                    ui_for_pending.hide_toast();
+                    ui_for_pending.set_url("");
                     ui_for_pending.set_media_title(&loaded.title);
+                    ui_for_pending
+                        .set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                     ui_for_pending.set_sources(&loaded.sources);
                     ui_for_pending.set_selected_sources(
                         loaded.video.as_deref(),
@@ -171,13 +167,66 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
             ui.on_pending_queue(move || {
                 let _ = app.queue_pending();
+                ui_for_pending.set_url("");
             });
         }
         {
             let app = Arc::clone(&app);
             ui.on_pending_dismissed(move || app.dismiss_pending());
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_requested(move || {
+                let entries: Vec<QueueListEntry> = app
+                    .queue_entries()
+                    .into_iter()
+                    .map(|entry| QueueListEntry {
+                        position: entry.position as i32,
+                        title: entry.title,
+                        uploader: entry.uploader.unwrap_or_default(),
+                        thumbnail: entry.thumbnail.map(PathBuf::from).filter(|path| path.exists()),
+                        current: entry.current,
+                    })
+                    .collect();
+                ui_for_queue.show_queue(&entries);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_history = Rc::clone(&ui);
+            ui.on_history_requested(move || {
+                let entries: Vec<HistoryListEntry> = app
+                    .history_entries()
+                    .into_iter()
+                    .map(|entry| HistoryListEntry {
+                        title: entry.title,
+                        uploader: entry.uploader.unwrap_or_else(|| entry.url.clone()),
+                        url: entry.url,
+                    })
+                    .collect();
+                ui_for_history.show_history(&entries);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            ui.on_queue_item_selected(move |position| {
+                if app.play_queue_entry(position as i64) {
+                    loading.borrow_mut().resolve_started();
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_history = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_history_item_selected(move |url| {
+                start_load(&app, &ui_for_history, &loading, url.as_str());
+            });
         }
         {
             let app = Arc::clone(&app);
@@ -234,6 +283,10 @@ impl Shell {
             let controls_hovered = Rc::clone(&controls_hovered);
             ui.on_controls_hovered(move |hovered| controls_hovered.set(hovered));
         }
+        {
+            let controls_interacting = Rc::clone(&controls_interacting);
+            ui.on_interacting_changed(move |interacting| controls_interacting.set(interacting));
+        }
 
         // A timer keeps the interface in sync with the player.
         let timer = Timer::default();
@@ -243,6 +296,7 @@ impl Shell {
             let loading = Rc::clone(&loading);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             let controls_hovered = Rc::clone(&controls_hovered);
+            let controls_interacting = Rc::clone(&controls_interacting);
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
@@ -252,6 +306,7 @@ impl Shell {
                 let visible = ui.sources_open()
                     || (ui.has_media()
                         && (controls_hovered.get()
+                            || controls_interacting.get()
                             || Instant::now().duration_since(last_pointer_activity.get())
                                 < Duration::from_secs(4)));
                 ui.set_controls_visible(visible);
@@ -269,6 +324,9 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        let Some(url) = requested_url(url) else {
+            return;
+        };
         self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
         self.loading.borrow_mut().resolve_started();
@@ -288,6 +346,31 @@ impl Shell {
     }
 }
 
+/// Returns the URL to load, or `None` when the user submitted only whitespace.
+///
+/// Starting a resolution for an empty field would leave the spinner on with
+/// nothing to wait for.
+fn requested_url(url: &str) -> Option<&str> {
+    let url = url.trim();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Starts loading a URL for the user, from the bar or from the history.
+fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
+    let Some(url) = requested_url(url) else {
+        return;
+    };
+    if ui.has_media() {
+        // Something plays already, so the new URL must not interrupt it. A
+        // toast says the background is working and the dialog appears once
+        // the media is resolved.
+        ui.show_toast("Parsing video");
+    } else {
+        loading.borrow_mut().resolve_started();
+    }
+    app.load(url.to_string());
+}
+
 /// Chooses the next volume and remembers a nonzero level for the mute button.
 fn toggle_mute(saved: &Cell<Option<f64>>, current: f64) -> Option<f64> {
     if current <= 0.0 {
@@ -304,25 +387,22 @@ fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
     volume
 }
 
-/// Converts the UI slider value to mpv's linear gain percent.
+/// Converts the UI slider value to mpv's cubic soft-volume percent.
 ///
-/// The slider uses a perceptual scale (quadratic) where 100% is unity gain
-/// and 0% is mute. The quadratic curve matches human loudness perception.
+/// mpv does not treat `volume` as a linear gain: since 0.18.1 it cubes the
+/// value, so `v` percent produces a gain of `(v / 100)^3`. The slider should
+/// behave like YouTube's, where the position is the linear gain, so this takes
+/// the cube root to undo mpv's curve. Without it the two tapers compound and
+/// the lower half of the slider becomes inaudible.
 fn slider_to_player_volume(slider: f64) -> f64 {
     let slider = slider.clamp(0.0, 100.0);
-    if slider <= 0.0 {
-        0.0
-    } else {
-        // Perceptual taper: quadratic curve for gradual attenuation.
-        let position = slider / 100.0;
-        100.0 * position * position
-    }
+    if slider <= 0.0 { 0.0 } else { 100.0 * (slider / 100.0).cbrt() }
 }
 
-/// Converts mpv's linear gain percent back to the UI slider position.
+/// Converts mpv's cubic soft-volume percent back to the UI slider position.
 fn player_to_slider_volume(volume: f64) -> f64 {
     let volume = volume.clamp(0.0, 100.0);
-    if volume <= 0.0 { 0.0 } else { 100.0 * (volume / 100.0).sqrt() }
+    100.0 * (volume / 100.0).powi(3)
 }
 
 /// Brings the interface and the player back in sync.
@@ -342,10 +422,16 @@ fn tick(
                     crate::diag::note(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
+                    // The spinner belongs to that discarded result; without
+                    // this it would keep claiming the app is resolving.
+                    loading.resolve_failed(
+                        "the resolved video is no longer in the active queue".to_string(),
+                    );
+                    ui.show_toast("The resolved video is no longer in the active queue");
                     continue;
                 };
-                ui.hide_toast();
                 ui.set_media_title(&loaded.title);
+                ui.set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                 ui.set_sources(&loaded.sources);
                 ui.set_selected_sources(
                     loaded.video.as_deref(),
@@ -360,29 +446,59 @@ fn tick(
                 }
             }
             Message::Resolved(Err(error)) => {
-                ui.hide_toast();
-                loading.resolve_failed(error);
+                loading.resolve_failed(error.clone());
+                // Schedule a retry for resolver errors
+                if let Some(url) = app.resolving_url() {
+                    app.handle_resolver_error(url, error);
+                } else {
+                    ui.show_toast(&error);
+                }
             }
             Message::Pending(Ok(pending)) => {
-                ui.hide_toast();
                 ui.show_pending(&pending.title, pending.thumbnail.as_deref());
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {
-                ui.hide_toast();
-                loading.problem(error);
+                ui.show_toast(&error);
             }
             Message::ToolUpdated(path) => {
                 if !loading.tool_updated(&path) {
                     crate::diag::note(&format!("yt-dlp was updated ({path})"));
                 }
             }
+            Message::SigningIn(service) => {
+                // The sign-in happens in a window of its own; the player only
+                // says why that window is there.
+                ui.show_toast(&format!("Sign in to {service} to continue"));
+            }
             Message::UpdateAvailable(update) => {
                 ui.show_update(&update.version, &update.notes);
                 *update_slot.borrow_mut() = Some(update);
             }
             Message::UpdateFailed(error) => ui.show_update_error(&error),
-            Message::Problem(text) => loading.problem(text),
+            Message::Problem(text) => {
+                if loading.is_busy() {
+                    loading.problem(text.clone());
+                }
+                ui.show_toast(&text);
+            }
+            Message::RetryScheduled { error, delay_seconds, kind } => {
+                loading.retry_scheduled();
+                let prefix = match kind {
+                    RetryKind::Resolver => "retrying yt-dlp",
+                    RetryKind::Playback => "retrying playback",
+                    RetryKind::SourceSelection => "retrying source selection",
+                };
+                ui.show_toast(&format!("{} after {}s: {}", prefix, delay_seconds, error));
+            }
+        }
+    }
+
+    // Check for pending retries and show progress while the next attempt runs.
+    if let Some(kind) = app.check_retries() {
+        match kind {
+            RetryKind::Resolver | RetryKind::SourceSelection => loading.resolve_started(),
+            RetryKind::Playback => loading.resolved(),
         }
     }
 
@@ -401,7 +517,7 @@ fn tick(
     match loading.status() {
         loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
         loading::Status::Info(text) => ui.set_status(text, StatusKind::Info),
-        loading::Status::Error(text) => ui.set_status(text, StatusKind::Error),
+        loading::Status::Error(_) => ui.set_status("", StatusKind::Info),
     }
 
     // The time axis of a live stream is the window behind the live edge, so
@@ -409,6 +525,7 @@ fn tick(
     let timeline = app.timeline();
     ui.set_position(timeline.position);
     ui.set_duration(timeline.duration);
+    ui.set_buffered_ranges(&app.buffered_ranges());
     ui.set_time_text(&crate::time::format_timeline(&timeline));
     let playing = !app.engine().is_idle() && !app.engine().is_paused();
     ui.set_at_live_edge(timeline.live && timeline.behind <= crate::timeline::LIVE_BUFFER);
@@ -433,10 +550,18 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
             EngineEvent::EndFile { reason, error } => {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
-                loading.file_ended(failure);
+                loading.file_ended(failure.clone());
                 // Reset history position when video finishes normally (not error/stop)
                 if reason == EndReason::Eof {
                     app.reset_history_position();
+                } else if reason == EndReason::Error {
+                    // Schedule a retry for playback errors
+                    if let Some(url) = app.current_url() {
+                        app.handle_playback_error(
+                            url,
+                            failure.unwrap_or_else(|| "playback failed".to_string()),
+                        );
+                    }
                 }
             }
             EngineEvent::Log { level, text } => {
@@ -469,9 +594,24 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::{
-        player_to_slider_volume, slider_to_player_volume, slider_volume_changed, toggle_mute,
+        player_to_slider_volume, requested_url, slider_to_player_volume, slider_volume_changed,
+        toggle_mute,
     };
     use std::cell::Cell;
+
+    #[test]
+    fn a_blank_url_is_not_loaded() {
+        assert_eq!(requested_url("   \n\t "), None);
+        assert_eq!(requested_url(""), None);
+    }
+
+    #[test]
+    fn a_url_is_trimmed_before_it_is_loaded() {
+        assert_eq!(
+            requested_url("  https://example.com/video  "),
+            Some("https://example.com/video")
+        );
+    }
 
     #[test]
     fn mute_restores_the_previous_volume_once() {
@@ -505,9 +645,19 @@ mod tests {
             let player = slider_to_player_volume(slider);
             assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
         }
-        // Below unity the volume should fall off gradually, not collapse instantly.
-        assert!((slider_to_player_volume(50.0) - 25.0).abs() < 1e-9);
-        assert!(slider_to_player_volume(50.0) < slider_to_player_volume(75.0));
-        assert!(slider_to_player_volume(25.0) > 0.0);
+    }
+
+    #[test]
+    fn volume_slider_matches_youtube_linear_gain() {
+        // mpv's soft volume is cubic, so taking the cube root leaves the slider
+        // position equal to the linear gain, exactly like YouTube's slider.
+        for slider in [1.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0] {
+            let player = slider_to_player_volume(slider);
+            let gain = (player / 100.0).powi(3);
+            assert!((gain - slider / 100.0).abs() < 1e-12);
+        }
+        // Low positions must stay audible rather than collapsing to silence.
+        assert!(slider_to_player_volume(5.0) > 30.0);
+        assert!(slider_to_player_volume(10.0) > slider_to_player_volume(5.0));
     }
 }

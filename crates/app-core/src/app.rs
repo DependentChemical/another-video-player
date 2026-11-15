@@ -5,13 +5,13 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use library::{Queue, ThumbnailCache};
-use media_model::{MediaSource, PlaybackPlan, Quality};
+use media_model::{MediaSource, PlaybackPlan, Quality, Service};
 use playback_engine::{Engine, LoadRequest};
 use settings::Settings;
 use stream_resolver::{CommandSpec, Resolver};
@@ -19,6 +19,7 @@ use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
 
 use crate::paths::AppPaths;
+use crate::session::Session;
 use crate::timeline::{LiveAxis, Timeline};
 
 /// Something the background work wants to tell the user interface.
@@ -30,12 +31,34 @@ pub enum Message {
     Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
     ToolUpdated(String),
+    /// A service asks the user to sign in.
+    SigningIn(Service),
     /// A newer application release is available.
     UpdateAvailable(updater::Update),
     /// An accepted application update could not be prepared for installation.
     UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+    /// A retry is scheduled.
+    RetryScheduled {
+        /// The error message.
+        error: String,
+        /// Seconds until retry.
+        delay_seconds: u64,
+        /// The kind of error being retried.
+        kind: RetryKind,
+    },
+}
+
+/// The kind of error that triggered a retry, for display purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryKind {
+    /// yt-dlp resolution failed.
+    Resolver,
+    /// mpv playback failed.
+    Playback,
+    /// Source selection failed.
+    SourceSelection,
 }
 
 /// A URL that was resolved and is ready to play.
@@ -94,6 +117,10 @@ pub struct Loaded {
 
 /// How long a persisted resolver result may be reused before it is refreshed.
 const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
+
+/// How often a failing resolver, player or selection is retried before the
+/// failure is reported to the user instead of silently continuing.
+const MAX_RETRY_ATTEMPTS: u32 = 6;
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -158,6 +185,82 @@ struct State {
     current_uploader: Option<String>,
     /// Last time we saved history position (to throttle saves to ~20s intervals).
     last_history_save: Option<Instant>,
+    /// The URL currently being resolved (for retry purposes).
+    resolving_url: Option<String>,
+    /// Retry state for the current URL.
+    retry: RetryState,
+}
+
+/// Retry state for a URL being resolved or played.
+#[derive(Debug, Default)]
+struct RetryState {
+    /// The URL being retried.
+    url: Option<String>,
+    /// Number of retry attempts made.
+    attempt: u32,
+    /// When the next retry should happen.
+    next_retry: Option<Instant>,
+    /// The type of error being retried.
+    error_kind: Option<RetryErrorKind>,
+}
+
+/// The kind of error that triggered a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryErrorKind {
+    /// yt-dlp resolution failed (e.g., bot detection).
+    Resolver,
+    /// mpv playback failed.
+    Playback,
+    /// Source selection failed (no playable streams).
+    SourceSelection,
+}
+
+impl RetryState {
+    /// Starts a retry for the given URL and error kind.
+    fn start(&mut self, url: String, kind: RetryErrorKind) {
+        if self.url.as_deref() != Some(url.as_str()) || self.error_kind != Some(kind) {
+            self.url = Some(url);
+            self.error_kind = Some(kind);
+            self.attempt = 0;
+        }
+        self.schedule_next();
+    }
+
+    /// Schedules the next retry with exponential backoff (2, 4, 8, 16... seconds).
+    fn schedule_next(&mut self) {
+        let delay = Duration::from_secs(2u64.pow(self.attempt.min(6) + 1).min(60));
+        self.next_retry = Some(Instant::now() + delay);
+    }
+
+    /// Checks if it's time to retry.
+    fn is_ready(&self) -> bool {
+        self.next_retry.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Whether the retry budget is used up.
+    fn exhausted(&self) -> bool {
+        self.attempt >= MAX_RETRY_ATTEMPTS
+    }
+
+    /// Increments the attempt counter and schedules the next retry.
+    fn next_attempt(&mut self) {
+        self.attempt += 1;
+        self.schedule_next();
+    }
+
+    /// Clears the retry state.
+    fn clear(&mut self) {
+        self.url = None;
+        self.error_kind = None;
+        self.attempt = 0;
+        self.next_retry = None;
+    }
+
+    /// Returns the delay until the next retry in seconds.
+    fn next_delay_seconds(&self) -> Option<u64> {
+        self.next_retry
+            .map(|t| t.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64)
+    }
 }
 
 /// The application, without a user interface.
@@ -165,7 +268,7 @@ pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
     settings: Settings,
-    youtube_cookies: std::path::PathBuf,
+    session: Session,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
     inbox: Mutex<Receiver<Box<Message>>>,
@@ -176,6 +279,8 @@ pub struct App {
     queue: Queue,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
+    /// The directory the player buffers downloaded media in.
+    stream_buffer: PathBuf,
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
 }
@@ -183,13 +288,23 @@ pub struct App {
 impl App {
     /// Creates the application around a `yt-dlp` installation.
     pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
-        let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
-        let youtube_cookies = paths.youtube_cookies();
-        let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
+        let stream_buffer = paths.stream_buffer();
+        // Crash or unclean shutdown may have left cache files behind.
+        // Clear them before creating the engine so mpv never sees stale data.
+        clear_stream_buffer(&stream_buffer);
+        let engine =
+            Engine::new(&stream_buffer).map_err(|error| Error::Engine(error.to_string()))?;
+        let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
+        let resolver = Resolver::new(command_spec(ytdlp, &paths.cookies()));
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
+        let cache = ThumbnailCache::new(paths.cache().join("thumbnails"));
+        // Drop thumbnails that no longer point at a live queue or history
+        // entry, plus any file that is not a healthy JPEG, so the cache does
+        // not grow with broken or orphaned images.
+        prune_thumbnail_cache(&cache, &queue);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -201,14 +316,15 @@ impl App {
             engine,
             resolver: Mutex::new(resolver),
             settings,
-            youtube_cookies,
+            session,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
             queue,
-            cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
+            cache,
+            stream_buffer,
             pending: Mutex::new(None),
         })
     }
@@ -232,6 +348,9 @@ impl App {
         if url.is_empty() {
             return;
         }
+        // A retry belongs to whatever was current before the user asked for
+        // something else; letting it fire would bring the old media back.
+        self.clear_retry();
         if self.has_media() {
             self.resolve_pending(url);
         } else {
@@ -245,22 +364,39 @@ impl App {
         self.state.lock().expect("the state is not poisoned").source.is_some()
     }
 
+    /// Returns the URL currently being resolved, if any.
+    pub fn resolving_url(&self) -> Option<String> {
+        self.state.lock().expect("the state is not poisoned").resolving_url.clone()
+    }
+
+    /// Returns the currently playing URL, if any.
+    pub fn current_url(&self) -> Option<String> {
+        self.state.lock().expect("the state is not poisoned").current_url.clone()
+    }
+
     /// Resolves the URL read from the active queue in the background.
     fn resolve_play(&self, url: String) {
+        // Track the URL being resolved for retry purposes
+        self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
+
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
-                let thumbnail = source
-                    .thumbnail
-                    .as_deref()
-                    .and_then(|url| cache.fetch(url).ok())
-                    .map(|path| path.to_string_lossy().into_owned());
-                ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
-            });
+            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
+            let result = resolve_with_session(&resolver, &session, &url, &sender)
+                .map_err(|error| error.to_string())
+                .map(|source| {
+                    let thumbnail = source
+                        .thumbnail
+                        .as_deref()
+                        .and_then(|url| cache.fetch(url).ok())
+                        .map(|path| path.to_string_lossy().into_owned());
+                    ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
+                });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
@@ -269,21 +405,26 @@ impl App {
     /// the user to decide.
     fn resolve_pending(&self, url: String) {
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
-                let thumbnail = source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
-                PendingMedia {
-                    url,
-                    title: source.title.clone(),
-                    source,
-                    thumbnail,
-                    resolved_at: unix_time(),
-                }
-            });
+            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
+            let result = resolve_with_session(&resolver, &session, &url, &sender)
+                .map_err(|error| error.to_string())
+                .map(|source| {
+                    let thumbnail =
+                        source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
+                    PendingMedia {
+                        url,
+                        title: source.title.clone(),
+                        source,
+                        thumbnail,
+                        resolved_at: unix_time(),
+                    }
+                });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
     }
@@ -363,6 +504,7 @@ impl App {
         thumbnail_url: Option<&str>,
         uploader: Option<&str>,
     ) {
+        self.clear_retry();
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
@@ -381,6 +523,7 @@ impl App {
     pub fn advance(&self) -> bool {
         match self.queue.advance() {
             Ok(Some(_)) => {
+                self.clear_retry();
                 self.consume_current();
                 true
             }
@@ -410,6 +553,43 @@ impl App {
         }
     }
 
+    /// Returns every entry of the active queue, in play order.
+    pub fn queue_entries(&self) -> Vec<library::QueueEntry> {
+        match self.queue.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Returns every history entry, most recently played first.
+    pub fn history_entries(&self) -> Vec<library::HistoryEntry> {
+        match self.queue.history_all() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the history could not be read: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Starts the entry at `position` and marks it as the current one.
+    pub fn play_queue_entry(&self, position: i64) -> bool {
+        match self.queue.set_current(position) {
+            Ok(()) => {
+                self.clear_retry();
+                self.consume_current();
+                true
+            }
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                false
+            }
+        }
+    }
+
     /// Asks the current queue entry to be consumed.
     ///
     /// The URL is read from the queue, so callers cannot supply a player URL.
@@ -432,9 +612,10 @@ impl App {
                     self.resolve_play(entry.url);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => self.report("the active queue has nothing to play".to_string()),
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"));
+                self.report(format!("the active queue could not be read: {error}"));
             }
         }
     }
@@ -470,13 +651,18 @@ impl App {
         {
             crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
         }
-        Some(self.accept_current_source(source, url))
+        Some(self.accept_current_source(source, url, &current))
     }
 
     /// Builds playback state for the source already authorized by the queue.
-    fn accept_current_source(&self, source: MediaSource, url: &str) -> Loaded {
+    fn accept_current_source(
+        &self,
+        source: MediaSource,
+        url: &str,
+        current: &library::QueueEntry,
+    ) -> Loaded {
         let sources = source_lists(&source);
-        let default = self
+        let default_plan = self
             .settings
             .select(&source, url)
             .and_then(|quality| {
@@ -484,7 +670,35 @@ impl App {
                     .map_err(|error| settings::Error::Invalid(error.to_string()))
             })
             .ok();
-        let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
+        let default_selection = default_plan.as_ref().map(selection_of).unwrap_or_default();
+        let has_saved_selection = current.selected_video.is_some()
+            || current.selected_audio.is_some()
+            || current.selected_muxed.is_some();
+        let saved_selection = if has_saved_selection {
+            let video = current
+                .selected_video
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, false));
+            let audio = current
+                .selected_audio
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, true));
+            let muxed = current
+                .selected_muxed
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, false));
+            let all_saved_streams_exist = (current.selected_video.is_none() || video.is_some())
+                && (current.selected_audio.is_none() || audio.is_some())
+                && (current.selected_muxed.is_none() || muxed.is_some());
+            (all_saved_streams_exist && !(muxed.is_some() && (video.is_some() || audio.is_some())))
+                .then_some((video, audio, muxed))
+        } else {
+            None
+        };
+        let (video, audio, muxed) = saved_selection.unwrap_or(default_selection);
+        let plan = plan_from_selection(&source, &video, &audio, &muxed).or(default_plan);
+        let (video, audio, muxed) = plan.as_ref().map(selection_of).unwrap_or_default();
+
         let loaded = Loaded {
             title: source.title.clone(),
             duration: source.duration,
@@ -519,23 +733,121 @@ impl App {
             state.current_id_hash = Some(id_hash.clone());
             state.current_url = Some(url.to_string());
             state.current_title = Some(loaded.title.clone());
-            state.current_thumbnail_url = loaded.thumbnail_url.clone(); // We'll need to add this to Loaded
-            state.current_uploader = loaded.uploader.clone(); // We'll need to add this to Loaded
+            state.current_thumbnail_url = loaded.thumbnail_url.clone();
+            state.current_uploader = loaded.uploader.clone();
             state.last_history_save = None;
+            // A successful resolution ends any prior retry cycle.
+            state.resolving_url = None;
+            if plan.is_some() && state.retry.error_kind != Some(RetryErrorKind::Playback) {
+                state.retry.clear();
+            }
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
-        match default {
+        match plan {
             Some(plan) => {
                 if let Err(error) = self.start(&plan) {
-                    self.report(error);
+                    self.handle_playback_error(url.to_string(), error);
                 } else if let Err(error) = self.engine.play() {
-                    self.report(error.to_string());
+                    self.handle_playback_error(url.to_string(), error.to_string());
                 }
             }
-            None => self.report("this source has no playable stream".to_string()),
+            None => self.handle_source_selection_error(url.to_string()),
         }
         loaded
+    }
+
+    /// Handles a playback error by scheduling a retry.
+    pub fn handle_playback_error(&self, url: String, error: String) {
+        self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
+    }
+
+    /// Handles a source selection error by scheduling a retry with fresh resolution.
+    fn handle_source_selection_error(&self, url: String) {
+        self.schedule_retry(
+            url,
+            RetryErrorKind::SourceSelection,
+            RetryKind::SourceSelection,
+            "this source has no playable stream".to_string(),
+        );
+    }
+
+    /// Handles a resolver error by scheduling a retry.
+    pub fn handle_resolver_error(&self, url: String, error: String) {
+        self.state.lock().expect("the state is not poisoned").resolving_url = None;
+        self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+    }
+
+    /// Schedules another attempt, or reports the failure once the budget is
+    /// used up so a permanently broken source does not retry forever.
+    fn schedule_retry(
+        &self,
+        url: String,
+        kind: RetryErrorKind,
+        report_kind: RetryKind,
+        message: String,
+    ) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.start(url, kind);
+        let attempt = state.retry.attempt;
+        if state.retry.exhausted() {
+            state.retry.clear();
+            drop(state);
+            self.report(format!("{message} (gave up after {attempt} retries)"));
+            return;
+        }
+        let delay = state.retry.next_delay_seconds().unwrap_or(2);
+        drop(state);
+        self.report_retry(message, delay, report_kind);
+    }
+
+    /// Sends a retry notification to the UI.
+    fn report_retry(&self, error: String, delay_seconds: u64, kind: RetryKind) {
+        let _ = self.outbox.lock().map(|sender| {
+            sender.send(Box::new(Message::RetryScheduled { error, delay_seconds, kind }))
+        });
+    }
+
+    /// Checks if any retry is due and executes it.
+    pub fn check_retries(&self) -> Option<RetryKind> {
+        let (url, kind) = {
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            if let (Some(url), Some(kind)) = (state.retry.url.clone(), state.retry.error_kind)
+                && state.retry.is_ready()
+            {
+                state.retry.next_attempt();
+                (Some(url), Some(kind))
+            } else {
+                (None, None)
+            }
+        };
+
+        if let (Some(url), Some(kind)) = (url, kind) {
+            Some(match kind {
+                RetryErrorKind::Resolver => {
+                    self.resolve_play(url);
+                    RetryKind::Resolver
+                }
+                RetryErrorKind::Playback => {
+                    // Re-try with the same source selection
+                    self.consume_current();
+                    RetryKind::Playback
+                }
+                RetryErrorKind::SourceSelection => {
+                    // Re-resolve to get fresh sources
+                    self.resolve_play(url);
+                    RetryKind::SourceSelection
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Clears any pending retry state.
+    fn clear_retry(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.clear();
     }
 
     /// Plays a source selection.
@@ -589,13 +901,31 @@ impl App {
             self.report(error);
             return;
         }
+        self.clear_retry();
         self.state.lock().expect("the state is not poisoned").pending_restore.begin(pending);
         self.live.lock().expect("the live axis is not poisoned").reset();
 
         let mut state = self.state.lock().expect("the state is not poisoned");
-        state.selected_video = video;
-        state.selected_audio = audio;
-        state.selected_muxed = muxed;
+        state.selected_video = video.clone();
+        state.selected_audio = audio.clone();
+        state.selected_muxed = muxed.clone();
+
+        // Save the selection to the queue
+        if let Ok(Some(current)) = self.queue.current() {
+            let source = state.source.as_ref().expect("source should exist");
+            let video_formatted =
+                video.as_ref().and_then(|id| format_saved_selection(id, source, false));
+            let audio_formatted =
+                audio.as_ref().and_then(|id| format_saved_selection(id, source, true));
+            let muxed_formatted =
+                muxed.as_ref().and_then(|id| format_saved_selection(id, source, false));
+            let _ = self.queue.set_selected_sources(
+                current.position,
+                video_formatted.as_deref(),
+                audio_formatted.as_deref(),
+                muxed_formatted.as_deref(),
+            );
+        }
     }
 
     /// Switches between playing and paused.
@@ -676,6 +1006,30 @@ impl App {
         }
     }
 
+    /// The downloaded spans of the current media, as fractions of the axis.
+    ///
+    /// The interface draws them as the secondary bar of the scrubber, so the
+    /// user can see where a paused media has already buffered to and which
+    /// parts a seek would have to download again.
+    pub fn buffered_ranges(&self) -> Vec<(f64, f64)> {
+        let ranges: Vec<(f64, f64)> = self
+            .engine
+            .buffered_ranges()
+            .into_iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+
+        if self.is_live() {
+            let origin = self.live.lock().expect("the live axis is not poisoned").window_start();
+            crate::timeline::buffered_fractions(crate::timeline::LIVE_WINDOW, origin, &ranges)
+        } else {
+            crate::timeline::buffered_fractions(self.engine.duration(), 0.0, &ranges)
+        }
+    }
+
     /// Changes the volume.
     pub fn set_volume(&self, volume: f64) {
         if let Err(error) = self.engine.set_volume(volume) {
@@ -686,7 +1040,7 @@ impl App {
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = Resolver::new(command_spec(ytdlp, &self.youtube_cookies));
+        *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
 
     /// Looks for a newer `yt-dlp` in the background.
@@ -756,6 +1110,7 @@ impl App {
 
     /// Restores playback position after a source change once the file is ready.
     pub fn on_file_loaded(&self) {
+        self.clear_retry();
         let pending =
             self.state.lock().expect("the state is not poisoned").pending_restore.file_loaded();
         match pending {
@@ -851,6 +1206,9 @@ impl App {
 
     /// Loads a finished playback plan into the player.
     fn start(&self, plan: &PlaybackPlan) -> Result<(), String> {
+        // Every load belongs to a different media, and a cached packet from
+        // the old source would be plain garbage to the new demuxer.
+        clear_stream_buffer(&self.stream_buffer);
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
@@ -861,6 +1219,60 @@ impl App {
     /// Sends a problem to the user interface.
     fn report(&self, text: String) {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
+    }
+}
+
+/// Removes the media a previous source buffered.
+///
+/// The player may still have a cache file open while it replaces the old
+/// media, and such a file cannot be removed on every platform. Those leftovers
+/// are picked up by the next load and by the cleanup at start-up.
+fn clear_stream_buffer(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            crate::diag::note(&format!("a stream buffer file could not be removed: {error}"));
+        }
+    }
+}
+
+/// Cleans the thumbnail cache at start-up.
+///
+/// Every thumbnail that the active queue or the history still points at is
+/// kept; a leftover from an older run, a file that is not a JPEG and a
+/// broken image are all removed. The URLs are collected from the two lists
+/// the user can still see, so the cleanup only deletes what cannot be shown
+/// again anyway.
+fn prune_thumbnail_cache(cache: &ThumbnailCache, queue: &Queue) {
+    let mut keep: Vec<String> = Vec::new();
+    match queue.entries() {
+        Ok(entries) => {
+            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
+        }
+        Err(error) => {
+            crate::diag::note(&format!("the active queue could not be read: {error}"));
+            return;
+        }
+    }
+    match queue.history_all() {
+        Ok(entries) => {
+            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
+        }
+        Err(error) => {
+            crate::diag::note(&format!("the history could not be read: {error}"));
+            return;
+        }
+    }
+    if let Err(error) = cache.prune(&keep) {
+        crate::diag::note(&format!("the thumbnail cache could not be pruned: {error}"));
     }
 }
 
@@ -912,6 +1324,54 @@ fn selection_of(plan: &PlaybackPlan) -> (Option<String>, Option<String>, Option<
             plan.audio.as_ref().map(|audio| audio.format_id.clone()),
             None,
         )
+    }
+}
+
+/// Builds the playback plan represented by a saved picker selection.
+fn plan_from_selection(
+    source: &MediaSource,
+    video: &Option<String>,
+    audio: &Option<String>,
+    muxed: &Option<String>,
+) -> Option<PlaybackPlan> {
+    let quality = if let Some(id) = muxed {
+        Quality::Streams { video: Some(id.clone()), audio: None }
+    } else {
+        Quality::Streams { video: video.clone(), audio: audio.clone() }
+    };
+    stream_resolver::plan(source, &quality).ok()
+}
+
+/// Parses a saved selection string (format "ID|value") and verifies the stream
+/// still exists in the source. Returns the format_id if valid.
+fn parse_saved_selection(saved: &str, source: &MediaSource, is_audio: bool) -> Option<String> {
+    let parts: Vec<&str> = saved.split('|').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let format_id = parts[0];
+    let _value = parts[1]; // We could verify this matches, but just check ID exists
+
+    if is_audio {
+        source.audio_streams.iter().find(|s| s.format_id == format_id).map(|s| s.format_id.clone())
+    } else {
+        source.video_streams.iter().find(|s| s.format_id == format_id).map(|s| s.format_id.clone())
+    }
+}
+
+/// Formats a selection as "ID|value" for storage. Value is height for video/muxed,
+/// bitrate for audio.
+fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool) -> Option<String> {
+    if is_audio {
+        source.audio_streams.iter().find(|s| s.format_id == format_id).map(|s| {
+            let bitrate = s.bitrate.unwrap_or(0);
+            format!("{}|{}", format_id, bitrate)
+        })
+    } else {
+        source.video_streams.iter().find(|s| s.format_id == format_id).map(|s| {
+            let height = s.height.unwrap_or(0);
+            format!("{}|{}", format_id, height)
+        })
     }
 }
 
@@ -988,12 +1448,49 @@ fn format_bitrate(kilobits: u64) -> String {
 }
 
 /// Describes how `yt-dlp` has to be invoked.
-fn command_spec(ytdlp: &YtDlp, youtube_cookies: &std::path::Path) -> CommandSpec {
+///
+/// Every service gets its own cookie file, and a file is only passed when it
+/// is really there: `yt-dlp` refuses to work with an empty cookie file.
+fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
     let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    spec.with_youtube_cookies(youtube_cookies)
+    spec.with_cookies(Service::YouTube, web_session::cookie_file(cookies, Service::YouTube))
+        .with_cookies(Service::Twitch, web_session::cookie_file(cookies, Service::Twitch))
+}
+
+/// Resolves a URL and asks the user to sign in when the service demands it.
+///
+/// A sign-in challenge pauses this resolve: the helper runs before the retry
+/// loop is told about the failure, so the user can finish or close the
+/// window first. A successful sign-in is followed by one fresh resolve; if the
+/// user closes the window or the helper cannot run, the original challenge is
+/// returned so the normal retry flow can continue and a later challenge can
+/// ask again.
+fn resolve_with_session(
+    resolver: &Resolver,
+    session: &Session,
+    url: &str,
+    notice: &Sender<Box<Message>>,
+) -> Result<MediaSource, String> {
+    let error = match resolver.resolve(url) {
+        Ok(source) => return Ok(source),
+        Err(error) => error.to_string(),
+    };
+    let Some(service) = web_session::challenge_service(url, &error) else {
+        return Err(error);
+    };
+    // The helper opens a window of its own; the player says why it is there.
+    let _ = notice.send(Box::new(Message::SigningIn(service)));
+    if let Err(problem) = session.sign_in(service, url) {
+        // The helper's failure is the reason the challenge could not be
+        // answered, so it is reported alongside the resolver error instead of
+        // being swallowed: an invisible sign-in would otherwise look like the
+        // player simply ignoring the challenge.
+        return Err(format!("{error} ({problem})"));
+    }
+    resolver.resolve(url).map_err(|error| error.to_string())
 }
 
 /// Everything that can go wrong while running the application.
@@ -1149,10 +1646,95 @@ mod tests {
     }
 
     #[test]
+    fn retry_attempts_keep_backoff_for_the_same_failure() {
+        let mut retry = RetryState::default();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+        retry.next_attempt();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.next_retry.is_some());
+
+        retry.start("https://example.com/other".into(), RetryErrorKind::Resolver);
+        assert_eq!(retry.attempt, 0);
+    }
+
+    #[test]
+    fn retry_backoff_starts_at_two_seconds_and_stops_growing_at_one_minute() {
+        let mut retry = RetryState::default();
+        retry.schedule_next();
+        assert_eq!(retry.next_delay_seconds(), Some(2));
+
+        retry.attempt = 20;
+        retry.schedule_next();
+        assert_eq!(retry.next_delay_seconds(), Some(60));
+    }
+
+    #[test]
+    fn a_retry_stops_after_the_attempt_budget_is_used_up() {
+        let mut retry = RetryState::default();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+
+        for _ in 0..MAX_RETRY_ATTEMPTS {
+            assert!(!retry.exhausted());
+            retry.next_attempt();
+        }
+
+        assert!(retry.exhausted());
+    }
+
+    #[test]
+    fn saved_split_selection_builds_the_selected_playback_plan() {
+        let source = source();
+        let video = Some("137".to_string());
+        let audio = Some("140".to_string());
+        let plan = plan_from_selection(&source, &video, &audio, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (video, audio, None));
+    }
+
+    #[test]
+    fn saved_video_only_selection_does_not_attach_default_audio() {
+        let source = source();
+        let video = Some("137".to_string());
+        let plan = plan_from_selection(&source, &video, &None, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (video, None, None));
+    }
+
+    #[test]
+    fn saved_audio_only_selection_builds_an_audio_plan() {
+        let source = source();
+        let audio = Some("140".to_string());
+        let plan = plan_from_selection(&source, &None, &audio, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (None, audio, None));
+    }
+
+    #[test]
     fn labels_carry_the_size_the_user_asked_for() {
         let lists = source_lists(&source());
         assert_eq!(lists.video[0].label, "1080p");
         assert!(lists.video[0].detail.contains("1920×1080"));
         assert!(lists.audio[0].label.contains("128"));
+    }
+
+    #[test]
+    fn clearing_the_stream_buffer_removes_every_downloaded_file() {
+        let directory = std::env::temp_dir().join("flatline-stream-buffer-test");
+        let nested = directory.join("nested");
+        std::fs::create_dir_all(&nested).expect("the test directory can be created");
+        std::fs::write(directory.join("cache.bin"), b"media").expect("a cache file can be written");
+        std::fs::write(nested.join("part.bin"), b"more").expect("a nested file can be written");
+
+        clear_stream_buffer(&directory);
+
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("the buffer directory stays in place")
+                .next()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

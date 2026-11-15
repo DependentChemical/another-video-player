@@ -1,10 +1,12 @@
 import { Theme } from "../theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
+import { BufferedRange } from "types.slint";
 
 export component PlayerControls inherits Rectangle {
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
+    in property <[BufferedRange]> buffered-ranges: [];
     in property <float> volume: 100;
     in property <string> time-text: "0:00 / 0:00";
     in property <bool> live: false;
@@ -22,6 +24,7 @@ export component PlayerControls inherits Rectangle {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback interacting-changed(bool);
     callback sources-toggled();
 
     width: root.width;
@@ -32,132 +35,148 @@ export component PlayerControls inherits Rectangle {
     animate y { duration: 180ms; easing: ease-out; }
     animate opacity { duration: 140ms; }
 
+    private property <bool> interacting: false;
+
     TouchArea {
         width: root.width;
         height: root.height;
         changed has-hover => {
             root.controls-hovered(self.has-hover);
         }
-
-        PlayPauseButton {
-            x: 12px;
-            y: (root.height - 32px) / 2;
-            width: 44px;
-            height: 32px;
-            playing: root.playing;
-            pointer-activity => { root.pointer-activity(); }
-            clicked => {
-                root.play-toggled();
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.interacting = true;
+                root.interacting-changed(true);
+            }
+            if event.kind == PointerEventKind.up {
+                root.interacting = false;
+                root.interacting-changed(false);
             }
         }
 
-        LiveButton {
-            x: 60px;
-            y: (root.height - 32px) / 2;
-            width: 82px;
-            height: 32px;
-            visible: root.live;
-            at-edge: root.at-live-edge;
-            label: root.time-text;
-            pointer-activity => { root.pointer-activity(); }
-            clicked => {
-                root.live-requested();
-            }
-        }
+        HorizontalLayout {
+            padding: 12px;
+            spacing: 12px;
+            cross-axis-alignment: center;
 
-        Text {
-            x: 68px;
-            width: 64px;
-            visible: !root.live;
-            text: root.time-text;
-            color: Theme.fg;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-
-        seek := SeekBar {
-            x: root.live ? 152px : 140px;
-            y: (root.height - 18px) / 2;
-            width: root.width - (root.live ? 152px : 140px) - 220px;
-            height: 18px;
-            value: root.position;
-            maximum: root.duration;
-            pointer-activity => { root.pointer-activity(); }
-            moved(value) => {
-                root.seek-requested(value);
-            }
-        }
-
-        GearButton {
-            x: root.width - 212px;
-            y: (root.height - 32px) / 2;
-            width: 32px;
-            height: 32px;
-            active: root.sources-open;
-            enabled: root.has-media;
-            pointer-activity => { root.pointer-activity(); }
-            clicked => {
-                root.sources-toggled();
-            }
-        }
-
-        Rectangle {
-            x: root.width - 40px - 90px - 20px - 26px;
-            y: (root.height - 24px) / 2;
-            width: 24px;
-            height: 24px;
-            border-radius: 4px;
-            background: volume-touch.pressed ? Theme.elevated : transparent;
-
-            if root.volume <= 0: VolumeOffIcon {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 24px;
-                height: 24px;
-            }
-            if root.volume > 0: VolumeIcon {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 24px;
-                height: 24px;
-            }
-
-            volume-touch := TouchArea {
-                x: 0px;
-                y: 0px;
-                width: root.width;
-                height: root.height;
-                pointer-event(event) => {
-                    if event.kind == PointerEventKind.move { root.pointer-activity(); }
-                }
+            PlayPauseButton {
+                width: 44px;
+                height: 32px;
+                playing: root.playing;
+                pointer-activity => { root.pointer-activity(); }
                 clicked => {
-                    root.volume-toggled();
+                    root.play-toggled();
                 }
             }
-        }
 
-        volume := SeekBar {
-            x: root.width - 40px - 90px - 20px;
-            y: (root.height - 18px) / 2;
-            width: 90px;
-            height: 18px;
-            value: root.volume;
-            maximum: 100;
-            moved(value) => {
-                root.pointer-activity();
-                root.volume-requested(value);
+            if root.live: LiveButton {
+                width: 82px;
+                height: 32px;
+                at-edge: root.at-live-edge;
+                label: root.time-text;
+                pointer-activity => { root.pointer-activity(); }
+                clicked => {
+                    root.live-requested();
+                }
             }
-        }
+            if !root.live: Text {
+                text: root.time-text;
+                color: Theme.fg;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
 
-        FullscreenButton {
-            x: root.width - 40px - 12px;
-            y: (root.height - 32px) / 2;
-            width: 40px;
-            height: 32px;
-            fullscreen: root.fullscreen;
-            pointer-activity => { root.pointer-activity(); }
-            clicked => {
-                root.fullscreen-toggled();
+            seek := SeekBar {
+                horizontal-stretch: 1;
+                height: 18px;
+                value: root.position;
+                maximum: root.duration;
+                buffered-ranges: root.buffered-ranges;
+                pointer-activity => { root.pointer-activity(); }
+                moved(value) => {
+                    root.seek-requested(value);
+                }
+                drag-started => {
+                    root.interacting = true;
+                    root.interacting-changed(true);
+                }
+                drag-ended => {
+                    root.interacting = false;
+                    root.interacting-changed(false);
+                }
+            }
+
+            GearButton {
+                width: 32px;
+                height: 32px;
+                active: root.sources-open;
+                enabled: root.has-media;
+                pointer-activity => { root.pointer-activity(); }
+                clicked => {
+                    root.sources-toggled();
+                }
+            }
+
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
+                background: volume-touch.pressed ? Theme.elevated : (volume-touch.has-hover ? Theme.elevated : transparent);
+
+                if root.volume <= 0: VolumeOffIcon {
+                    width: 24px;
+                    height: 24px;
+                }
+                if root.volume > 0: VolumeIcon {
+                    width: 24px;
+                    height: 24px;
+                }
+
+                volume-touch := TouchArea {
+                    pointer-event(event) => {
+                        if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                        if event.kind == PointerEventKind.down {
+                            root.interacting = true;
+                            root.interacting-changed(true);
+                        }
+                        if event.kind == PointerEventKind.up {
+                            root.interacting = false;
+                            root.interacting-changed(false);
+                        }
+                    }
+                    clicked => {
+                        root.volume-toggled();
+                    }
+                }
+            }
+
+            volume := SeekBar {
+                width: 90px;
+                height: 18px;
+                value: root.volume;
+                maximum: 100;
+                moved(value) => {
+                    root.pointer-activity();
+                    root.volume-requested(value);
+                }
+                drag-started => {
+                    root.interacting = true;
+                    root.interacting-changed(true);
+                }
+                drag-ended => {
+                    root.interacting = false;
+                    root.interacting-changed(false);
+                }
+            }
+
+            FullscreenButton {
+                width: 40px;
+                height: 32px;
+                fullscreen: root.fullscreen;
+                pointer-activity => { root.pointer-activity(); }
+                clicked => {
+                    root.fullscreen-toggled();
+                }
             }
         }
     }

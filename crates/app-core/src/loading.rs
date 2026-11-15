@@ -119,6 +119,19 @@ impl Loading {
         self.current_file = false;
     }
 
+    /// Stops the spinner while an error is waiting for its retry delay.
+    ///
+    /// A retry message can arrive after the user started another load; a
+    /// resolution that is still running keeps its spinner in that case.
+    pub fn retry_scheduled(&mut self) {
+        if self.phase == Phase::Resolving {
+            return;
+        }
+        self.phase = Phase::Idle;
+        self.status = Status::Info(String::new());
+        self.current_file = false;
+    }
+
     /// Notes that a newer `yt-dlp` is now in use.
     ///
     /// The message is ignored while the dots are running, so it can never
@@ -275,6 +288,36 @@ mod tests {
 
         assert_eq!(loading.status(), &Status::Error("nope".to_string()));
         assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_scheduled_retry_clears_the_stale_loading_message() {
+        let mut loading = Loading::new();
+        loading.resolve_started();
+        loading.resolve_failed("nope".to_string());
+        loading.retry_scheduled();
+
+        assert_eq!(loading.status(), &Status::Info(String::new()));
+        assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_scheduled_retry_stops_the_spinner_of_the_failed_attempt() {
+        let mut loading = Loading::new();
+        loading.resolved();
+        loading.retry_scheduled();
+
+        assert_eq!(loading.status(), &Status::Info(String::new()));
+        assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_scheduled_retry_never_interrupts_a_new_resolution() {
+        let mut loading = Loading::new();
+        loading.retry_scheduled();
+        loading.resolve_started();
+
+        assert_eq!(loading.status(), &Status::Busy(RESOLVING));
     }
 
     #[test]

@@ -14,16 +14,10 @@ export component SourcePicker inherits Rectangle {
     callback sources-applied(string, string, string);
     callback pointer-activity();
 
-    private property <string> draft-video: "";
-    private property <string> draft-audio: "";
-    private property <string> draft-muxed: "";
+    private property <bool> can-apply: root.selected-video-id != ""
+        || root.selected-audio-id != ""
+        || root.selected-muxed-id != "";
 
-    private property <bool> can-apply: root.draft-video != ""
-        || root.draft-audio != ""
-        || root.draft-muxed != "";
-
-    x: 0px;
-    y: 0px;
     background: #00000066;
 
     TouchArea {
@@ -78,34 +72,34 @@ export component SourcePicker inherits Rectangle {
                 SourceColumn {
                     heading: "Video only";
                     items: root.video-sources;
-                    selected: root.draft-video;
+                    selected: root.selected-video-id;
                     picked(id) => {
-                        root.draft-muxed = "";
-                        root.draft-video = root.draft-video == id ? "" : id;
+                        root.selected-muxed-id = "";
+                        root.selected-video-id = root.selected-video-id == id ? "" : id;
                     }
                 }
 
                 SourceColumn {
                     heading: "Audio only";
                     items: root.audio-sources;
-                    selected: root.draft-audio;
+                    selected: root.selected-audio-id;
                     picked(id) => {
-                        root.draft-muxed = "";
-                        root.draft-audio = root.draft-audio == id ? "" : id;
+                        root.selected-muxed-id = "";
+                        root.selected-audio-id = root.selected-audio-id == id ? "" : id;
                     }
                 }
 
                 SourceColumn {
                     heading: "Video + audio";
                     items: root.muxed-sources;
-                    selected: root.draft-muxed;
+                    selected: root.selected-muxed-id;
                     picked(id) => {
-                        if (root.draft-muxed == id) {
-                            root.draft-muxed = "";
+                        if (root.selected-muxed-id == id) {
+                            root.selected-muxed-id = "";
                         } else {
-                            root.draft-muxed = id;
-                            root.draft-video = "";
-                            root.draft-audio = "";
+                            root.selected-muxed-id = id;
+                            root.selected-video-id = "";
+                            root.selected-audio-id = "";
                         }
                     }
                 }
@@ -138,13 +132,10 @@ export component SourcePicker inherits Rectangle {
                     primary: true;
                     enabled: root.can-apply;
                     clicked => {
-                        root.selected-video-id = root.draft-video;
-                        root.selected-audio-id = root.draft-audio;
-                        root.selected-muxed-id = root.draft-muxed;
                         root.sources-applied(
-                            root.draft-video,
-                            root.draft-audio,
-                            root.draft-muxed
+                            root.selected-video-id,
+                            root.selected-audio-id,
+                            root.selected-muxed-id
                         );
                         root.sources-open = false;
                     }

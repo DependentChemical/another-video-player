@@ -1,14 +1,20 @@
-import { Button, ProgressIndicator, ScrollView } from "std-widgets.slint";
+import { ProgressIndicator, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 import { TopBar } from "slint-ui/TopBar.slint";
 import { VideoPlayer } from "slint-ui/VideoPlayer.slint";
+import { VideoHeader } from "slint-ui/VideoHeader.slint";
 import { PlayerControls } from "slint-ui/PlayerControls.slint";
 import { SourcePicker } from "slint-ui/SourcePicker.slint";
 import { PendingDialog } from "slint-ui/PendingDialog.slint";
-import { Toast } from "slint-ui/Toast.slint";
+import { ToastList, ToastItem } from "slint-ui/Toast.slint";
 import { SourceColumn } from "slint-ui/SourceColumn.slint";
-import { StreamItem } from "slint-ui/types.slint";
+import { Sidebar } from "slint-ui/Sidebar.slint";
+import { QueueDialog } from "slint-ui/QueueDialog.slint";
+import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
+import { StreamItem, QueueItem, HistoryItem, BufferedRange } from "slint-ui/types.slint";
+
+import "../fonts/Inter.ttf";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -16,18 +22,20 @@ import { StreamItem } from "slint-ui/types.slint";
 // the window before Slint renders this scene, and every part of the scene
 // that stays transparent lets that frame through.
 export component MainWindow inherits Window {
-    title: root.has-media ? root.media-title + " \u{2014} Flatline" : "Flatline";
+    title: root.has-media ? root.media-title + " \u{2014} Flatline " + root.app-version : "Flatline " + root.app-version;
     preferred-width: 1100px;
     preferred-height: 680px;
     min-width: 560px;
     min-height: 340px;
     background: root.has-media ? transparent : Theme.bg;
-    default-font-family: "Segoe UI";
+    default-font-family: "Inter";
     default-font-size: 13px;
 
     // ------------------------------------------------------------- state --
     in-out property <string> url: "";
     in property <string> media-title: "";
+    in property <string> media-uploader: "";
+    in property <string> app-version: "";
     in property <string> status: "";
     // "info", "busy" or "error".
     in property <string> status-kind: "info";
@@ -45,6 +53,8 @@ export component MainWindow inherits Window {
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
+    // The parts of the axis that are already downloaded, as fractions.
+    in property <[BufferedRange]> buffered-ranges: [];
     in property <float> volume: 100;
     // The playback position, formatted for the user.
     in property <string> time-text: "0:00 / 0:00";
@@ -56,8 +66,7 @@ export component MainWindow inherits Window {
     in property <bool> fullscreen: false;
     // The small note in the corner, shown while a URL is parsed in the
     // background.
-    in-out property <bool> toast-visible: false;
-    in property <string> toast-text: "";
+    in-out property <[ToastItem]> toasts: [];
     // The dialog that asks what to do with a media that was resolved while
     // another one already plays.
     in-out property <bool> pending-open: false;
@@ -68,6 +77,13 @@ export component MainWindow inherits Window {
     in property <string> update-notes: "";
     in-out property <bool> update-installing: false;
     in property <string> update-error: "";
+    // The drawer that opens under the top bar when the mascot is clicked.
+    in-out property <bool> sidebar-open: false;
+    // The queue and history lists shown from the sidebar.
+    in-out property <bool> queue-open: false;
+    in property <[QueueItem]> queue-items: [];
+    in-out property <bool> history-open: false;
+    in property <[HistoryItem]> history-items: [];
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -80,11 +96,16 @@ export component MainWindow inherits Window {
     callback live-requested();
     callback pointer-activity();
     callback controls-hovered(bool);
+    callback interacting-changed(bool);
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
+    callback queue-requested();
+    callback history-requested();
+    callback queue-item-selected(int);
+    callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -149,16 +170,6 @@ export component MainWindow inherits Window {
         }
     }
 
-    // Top bar with URL field
-    TopBar {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        url <=> root.url;
-        load-requested => { root.load-requested(); }
-        pointer-activity => { root.pointer-activity(); }
-    }
-
     // Video area with status display
     VideoPlayer {
         x: 0;
@@ -174,16 +185,39 @@ export component MainWindow inherits Window {
         pointer-activity => { root.pointer-activity(); }
     }
 
+    // Video header (title and channel) overlay below top bar
+    VideoHeader {
+        x: 0;
+        width: parent.width;
+        title: root.media-title;
+        uploader: root.media-uploader;
+        has-media: root.has-media;
+        controls-visible: root.controls-visible;
+        pointer-activity => { root.pointer-activity(); }
+    }
+
+    // Top bar with URL field
+    TopBar {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        url <=> root.url;
+        load-requested => { root.load-requested(); }
+        pointer-activity => { root.pointer-activity(); }
+        brand-clicked => { root.sidebar-open = !root.sidebar-open; }
+    }
+
     // Control bar
     PlayerControls {
         x: 0;
-        y: parent.height - Theme.controls-height;
+        y: root.controls-visible ? parent.height - Theme.controls-height : parent.height;
         width: parent.width;
         height: Theme.controls-height;
         container-height: parent.height - Theme.bar-height;
         playing: root.playing;
         position: root.position;
         duration: root.duration;
+        buffered-ranges: root.buffered-ranges;
         volume: root.volume;
         time-text: root.time-text;
         live: root.live;
@@ -200,14 +234,33 @@ export component MainWindow inherits Window {
         live-requested => { root.live-requested(); }
         pointer-activity => { root.pointer-activity(); }
         controls-hovered(hovered) => { root.controls-hovered(hovered); }
+        interacting-changed(interacting) => { root.interacting-changed(interacting); }
         sources-toggled => { root.toggle-sources(); }
     }
 
-    // Toast notification
-    Toast {
-        toast-text: root.toast-text;
-        toast-visible: root.toast-visible;
-        controls-height: Theme.controls-height;
+    // Sidebar drawer, above the video and its overlays.
+    Sidebar {
+        width: parent.width;
+        height: parent.height;
+        open: root.sidebar-open;
+        queue-clicked => {
+            root.sidebar-open = false;
+            root.queue-requested();
+        }
+        history-clicked => {
+            root.sidebar-open = false;
+            root.history-requested();
+        }
+        dismissed => { root.sidebar-open = false; }
+    }
+
+    // Toast notifications (auto-dismiss after 10s, stacked, max 5)
+    ToastList {
+        width: min(380px, parent.width - 40px);
+        x: parent.width - self.width - 20px;
+        y: parent.height - self.height - Theme.controls-height - 12px;
+        toasts: root.toasts;
+        toast-max-width: 380px;
     }
 
     // Source picker
@@ -242,6 +295,26 @@ export component MainWindow inherits Window {
         pending-dismissed => { root.pending-dismissed(); }
     }
 
+    // Active queue dialog
+    if root.queue-open: QueueDialog {
+        width: parent.width;
+        height: parent.height;
+        items: root.queue-items;
+        open <=> root.queue-open;
+        item-selected(position) => { root.queue-item-selected(position); }
+        dismissed => { root.queue-open = false; }
+    }
+
+    // History dialog
+    if root.history-open: HistoryDialog {
+        width: parent.width;
+        height: parent.height;
+        items: root.history-items;
+        open <=> root.history-open;
+        item-selected(url) => { root.history-item-selected(url); }
+        dismissed => { root.history-open = false; }
+    }
+
     if root.update-open: Rectangle {
         width: parent.width; height: parent.height;
         background: #00000099;
@@ -258,10 +331,28 @@ export component MainWindow inherits Window {
                 if root.update-error != "": Text { text: root.update-error; color: Theme.danger; wrap: word-wrap; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
-                    if !root.update-installing && root.update-error == "": Button { text: "No"; clicked => { root.update-open = false; root.update-dismissed(); } }
-                    if !root.update-installing && root.update-error == "": Button { text: "Yes, download and install"; clicked => { root.update-installing = true; root.update-accepted(); } }
+                    if !root.update-installing && root.update-error == "": Rectangle {
+                        width: 80px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        background: btn1.pressed ? Theme.elevated : (btn1.has-hover ? Theme.elevated : Theme.panel);
+                        Text { text: "No"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn1 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                    }
+                    if !root.update-installing && root.update-error == "": Rectangle {
+                        width: 200px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.accent;
+                        background: btn2.pressed ? #5a9bf5 : (btn2.has-hover ? #5a9bf5 : Theme.accent);
+                        Text { text: "Yes, download and install"; color: Theme.on-accent; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn2 := TouchArea { clicked => { root.update-installing = true; root.update-accepted(); } }
+                    }
                     if root.update-installing: ProgressIndicator { indeterminate: true; }
-                    if root.update-error != "": Button { text: "Close"; clicked => { root.update-open = false; root.update-dismissed(); } }
+                    if root.update-error != "": Rectangle {
+                        width: 80px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        background: btn3.pressed ? Theme.elevated : (btn3.has-hover ? Theme.elevated : Theme.panel);
+                        Text { text: "Close"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn3 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                    }
                 }
             }
         }

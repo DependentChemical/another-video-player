@@ -14,6 +14,7 @@
 pub mod render;
 
 use std::fmt;
+use std::path::Path;
 
 pub use render::{GlProcAddress, VideoRenderer};
 
@@ -22,6 +23,31 @@ pub use render::{GlProcAddress, VideoRenderer};
 /// mpv's default ceiling is 130; Flatline raises it to 100 so the slider
 /// reaches unity gain at 100%.
 pub const MAX_VOLUME: f64 = 100.0;
+
+/// How far ahead mpv is allowed to buffer, in seconds.
+///
+/// The limit is effectively removed so that a paused media keeps downloading
+/// to its end instead of stopping at the usual readahead window.
+const CACHE_SECONDS: &str = "1000000000";
+
+/// How much packet metadata the demuxer may keep.
+///
+/// With `cache-on-disk` this counts metadata, not the cached payload, so a
+/// large value is what lets the whole media stay buffered and the already
+/// downloaded ranges stay seekable.
+const DEMUXER_MAX_BYTES: &str = "1024MiB";
+
+/// A span of the media that mpv has already downloaded.
+///
+/// The ranges are in stream timestamps, in seconds, and are not necessarily
+/// ordered or disjoint: the demuxer reports them as it fills them in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BufferedRange {
+    /// The first timestamp that is buffered.
+    pub start: f64,
+    /// The last timestamp that is buffered.
+    pub end: f64,
+}
 
 /// Keeps a volume inside the range the player accepts.
 fn clamp_volume(volume: f64) -> f64 {
@@ -94,12 +120,15 @@ impl LoadRequest {
 pub enum Error {
     /// mpv rejected a command or a property.
     Mpv(rsmpv::Error),
+    /// The on-disk stream cache directory could not be created.
+    Cache(std::io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Mpv(error) => write!(f, "mpv error: {error}"),
+            Error::Cache(error) => write!(f, "the stream buffer could not be prepared: {error}"),
         }
     }
 }
@@ -108,6 +137,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Mpv(error) => Some(error),
+            Error::Cache(error) => Some(error),
         }
     }
 }
@@ -132,7 +162,15 @@ impl Engine {
     ///
     /// The player renders into an OpenGL context that the embedder provides,
     /// so `vo` is fixed to `libmpv` and no window is ever created.
-    pub fn new() -> Result<Engine, Error> {
+    ///
+    /// Downloaded media is kept in an append-only cache file below
+    /// `cache_dir`, so a paused or scrubbed media is buffered to disk instead
+    /// of being thrown away. The directory is created when it is missing.
+    pub fn new(cache_dir: impl AsRef<Path>) -> Result<Engine, Error> {
+        let cache_dir = cache_dir.as_ref();
+        std::fs::create_dir_all(cache_dir).map_err(Error::Cache)?;
+        let cache_dir = cache_dir.to_string_lossy();
+
         let mpv = rsmpv::Mpv::builder()?
             .set_property("vo", "libmpv")?
             .set_property("config", "no")?
@@ -146,6 +184,15 @@ impl Engine {
             .set_property("input-vo-keyboard", "no")?
             .set_property("title", "Flatline")?
             .set_property("volume-max", MAX_VOLUME)?
+            // Keep reading the stream ahead even while playback is paused, and
+            // write the packets to Flatline's own folder so the downloaded
+            // parts survive a seek instead of being discarded.
+            .set_property("cache", "yes")?
+            .set_property("cache-on-disk", "yes")?
+            .set_property("demuxer-cache-dir", cache_dir.as_ref())?
+            .set_property("cache-secs", CACHE_SECONDS)?
+            .set_property("demuxer-max-bytes", DEMUXER_MAX_BYTES)?
+            .set_property("demuxer-max-back-bytes", DEMUXER_MAX_BYTES)?
             .build()?;
 
         // mpv does not deliver file lifecycle events until they are requested.
@@ -244,14 +291,27 @@ impl Engine {
     /// Live streams keep downloading while paused, so this is a better
     /// estimate of the live edge than the paused playback position.
     pub fn seekable_end(&self) -> Option<f64> {
-        let state = self.core.get_property("demuxer-cache-state").ok()?;
-        seekable_end_from_cache(&state)
+        self.buffered_ranges().into_iter().map(|range| range.end).max_by(f64::total_cmp)
     }
 
-    /// Sets the volume, in percent.
+    /// The spans of the media that are already downloaded into the cache.
+    ///
+    /// A media that is paused keeps filling this in until its end; a media
+    /// that was scrubbed may report several disjoint ranges. The caller can
+    /// show them without ever distinguishing a full download from a seek.
+    pub fn buffered_ranges(&self) -> Vec<BufferedRange> {
+        let Ok(state) = self.core.get_property("demuxer-cache-state") else {
+            return Vec::new();
+        };
+        buffered_ranges_from_cache(&state)
+    }
+
+    /// Sets the volume, in mpv's cubic percent.
     ///
     /// The value is clamped to `0..=`[`MAX_VOLUME`], so a stray click on the
-    /// slider can never ask mpv for something it refuses.
+    /// slider can never ask mpv for something it refuses. Note that mpv maps
+    /// this percent to a linear gain with `(volume / 100)^3`; callers that want
+    /// a linear-gain slider have to undo that curve before calling.
     pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
         self.core.set_property("volume", clamp_volume(volume))?;
         Ok(())
@@ -353,15 +413,15 @@ impl Engine {
     }
 }
 
-/// The furthest timestamp in mpv's current seekable cache ranges.
-fn seekable_end_from_cache(state: &rsmpv::Node) -> Option<f64> {
+/// The spans mpv reports in its current demuxer cache state.
+fn buffered_ranges_from_cache(state: &rsmpv::Node) -> Vec<BufferedRange> {
     let rsmpv::Node::Map(state) = state else {
-        return None;
+        return Vec::new();
     };
-    let ranges =
-        state.iter().find_map(|(key, value)| (key == "seekable-ranges").then_some(value))?;
-    let rsmpv::Node::Array(ranges) = ranges else {
-        return None;
+    let Some(rsmpv::Node::Array(ranges)) =
+        state.iter().find_map(|(key, value)| (key == "seekable-ranges").then_some(value))
+    else {
+        return Vec::new();
     };
 
     ranges
@@ -370,51 +430,103 @@ fn seekable_end_from_cache(state: &rsmpv::Node) -> Option<f64> {
             let rsmpv::Node::Map(fields) = range else {
                 return None;
             };
-            fields.iter().find_map(|(key, value)| {
-                if key != "end" {
-                    return None;
+            let mut start = None;
+            let mut end = None;
+            for (key, value) in fields {
+                let rsmpv::Node::Double(seconds) = value else {
+                    continue;
+                };
+                if !seconds.is_finite() {
+                    continue;
                 }
-                match value {
-                    rsmpv::Node::Double(end) if end.is_finite() => Some(*end),
-                    _ => None,
+                match key.as_str() {
+                    "start" => start = Some(*seconds),
+                    "end" => end = Some(*seconds),
+                    _ => {}
                 }
-            })
+            }
+            match (start, end) {
+                (Some(start), Some(end)) if end > start => Some(BufferedRange { start, end }),
+                _ => None,
+            }
         })
-        .max_by(f64::total_cmp)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A cache directory of its own, so the tests never share cache files.
+    fn cache_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join("flatline-playback-engine-tests").join("stream_buffer")
+    }
+
+    fn cache_state(ranges: &[(f64, f64)]) -> rsmpv::Node {
+        rsmpv::Node::Map(vec![(
+            "seekable-ranges".to_string(),
+            rsmpv::Node::Array(
+                ranges
+                    .iter()
+                    .map(|&(start, end)| {
+                        rsmpv::Node::Map(vec![
+                            ("start".to_string(), rsmpv::Node::Double(start)),
+                            ("end".to_string(), rsmpv::Node::Double(end)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )])
+    }
+
     #[test]
     fn the_latest_seekable_range_is_the_live_edge() {
+        let cache = cache_state(&[(10.0, 20.0), (30.0, 40.0)]);
+        assert_eq!(
+            buffered_ranges_from_cache(&cache)
+                .into_iter()
+                .map(|range| range.end)
+                .max_by(f64::total_cmp),
+            Some(40.0)
+        );
+    }
+
+    #[test]
+    fn the_cache_reports_every_buffered_span() {
+        let cache = cache_state(&[(0.0, 30.0), (60.0, 90.0)]);
+        assert_eq!(
+            buffered_ranges_from_cache(&cache),
+            vec![BufferedRange { start: 0.0, end: 30.0 }, BufferedRange { start: 60.0, end: 90.0 },]
+        );
+    }
+
+    #[test]
+    fn empty_and_malformed_ranges_are_ignored() {
         let cache = rsmpv::Node::Map(vec![(
             "seekable-ranges".to_string(),
             rsmpv::Node::Array(vec![
                 rsmpv::Node::Map(vec![
-                    ("start".to_string(), rsmpv::Node::Double(10.0)),
+                    ("start".to_string(), rsmpv::Node::Double(20.0)),
                     ("end".to_string(), rsmpv::Node::Double(20.0)),
                 ]),
                 rsmpv::Node::Map(vec![
-                    ("start".to_string(), rsmpv::Node::Double(30.0)),
-                    ("end".to_string(), rsmpv::Node::Double(40.0)),
+                    ("start".to_string(), rsmpv::Node::Double(1.0)),
+                    ("end".to_string(), rsmpv::Node::String("broken".into())),
                 ]),
             ]),
         )]);
-
-        assert_eq!(seekable_end_from_cache(&cache), Some(40.0));
+        assert!(buffered_ranges_from_cache(&cache).is_empty());
     }
 
     #[test]
     fn unavailable_seekable_ranges_have_no_live_edge() {
-        assert_eq!(seekable_end_from_cache(&rsmpv::Node::None), None);
+        assert!(buffered_ranges_from_cache(&rsmpv::Node::None).is_empty());
     }
 
     #[test]
     fn a_new_engine_is_idle_and_has_no_duration() {
         // Creating an engine needs libmpv; skip the test when it is absent.
-        let Ok(engine) = Engine::new() else {
+        let Ok(engine) = Engine::new(cache_dir()) else {
             return;
         };
         assert!(engine.is_idle());
@@ -423,7 +535,7 @@ mod tests {
 
     #[test]
     fn a_new_engine_is_neither_active_nor_buffering() {
-        let Ok(engine) = Engine::new() else {
+        let Ok(engine) = Engine::new(cache_dir()) else {
             return;
         };
         assert!(!engine.is_active());
@@ -432,10 +544,11 @@ mod tests {
 
     #[test]
     fn a_new_engine_has_no_seekable_live_edge() {
-        let Ok(engine) = Engine::new() else {
+        let Ok(engine) = Engine::new(cache_dir()) else {
             return;
         };
         assert_eq!(engine.seekable_end(), None);
+        assert!(engine.buffered_ranges().is_empty());
     }
 
     #[test]

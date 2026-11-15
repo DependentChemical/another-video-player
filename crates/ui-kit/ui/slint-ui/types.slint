@@ -4,3 +4,30 @@ export struct StreamItem {
     label: string,
     detail: string,
 }
+
+/// A span of the media that is already downloaded.
+///
+/// Both ends are fractions of the axis the scrubber shows, so the same value
+/// works for a recorded media and for the window of a live stream.
+export struct BufferedRange {
+    start: float,
+    end: float,
+}
+
+/// One row of the queue dialog.
+export struct QueueItem {
+    /// The position of the entry in the active queue.
+    position: int,
+    title: string,
+    uploader: string,
+    thumbnail: image,
+    /// Whether this is the entry that plays now.
+    current: bool,
+}
+
+/// One row of the history dialog.
+export struct HistoryItem {
+    title: string,
+    uploader: string,
+    url: string,
+}

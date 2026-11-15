@@ -55,14 +55,20 @@ The ladder:
 | Layer | Crates | May depend on |
 | --- | --- | --- |
 | 0 — vocabulary | `media-model` | nothing |
-| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `ytdlp-tool` | `database`/`media-model` at most |
-| 2 — adapter | `video-surface` | `playback-engine` only |
+| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `web-session`, `ytdlp-tool` | `database`/`media-model` at most |
+| 2 — adapter | `video-surface`, `web-session-view` | one capability each |
 | 3 — composition root | `app-core` | everything |
 
 `video-surface` is the single exception the ladder allows: the mpv render
 context belongs to the player, but it can only be created while a UI toolkit
 holds an OpenGL context. The coupling is deliberate, narrow and documented
 in that crate.
+
+`web-session-view` is the same kind of exception: the webview that signs the
+user in belongs to the sign-in capability, but it can only be created inside
+an event loop of its own. It therefore lives in its own program
+(`flatline-session`), and the player only starts it — it never links the
+browser into the player.
 
 When you add a crate, put it on the ladder and extend the table in
 `xtask/src/isolation.rs` in the same change. The checker reads the real
@@ -114,6 +120,10 @@ for itself when it is missing, and looks for a newer one on every start.
 - `crates/ytdlp-tool` — finds, installs and updates the `yt-dlp` executable.
 - `crates/storyboard` — cuts preview images out of a media with `ffmpeg`.
 - `crates/ui-kit` — the Slint components, the theme and the widgets.
+- `crates/web-session` — knows when a service demands a signed-in session and
+  keeps the Netscape cookie file `yt-dlp` reads.
+- `crates/web-session-view` — the `flatline-session` helper: a Tauri webview
+  that signs the user in and exports the cookies.
 - `xtask` — the build task: dependency provisioning, the isolation check
   and packaging.
 - `.flatline/` — downloaded dependencies. Not part of the repository.
@@ -129,6 +139,22 @@ for itself when it is missing, and looks for a newer one on every start.
 - No `unwrap()` outside tests, except where the invariant is documented
   right above the line.
 - Comments explain *why*, never *what*. The code already says what.
+- **UI Layout**: Never hardcode element coordinates (`x:`, `y:`), absolute
+  pixel offsets, or explicit positions in Slint components. All UI layout
+  must use Slint's implicit layout system: `HorizontalLayout`,
+  `VerticalLayout`, `CrossAxisLayout` and their `padding` / `spacing`
+  properties to control gaps between elements. When placing an element
+  inside a container, wrap it in the appropriate layout and use the
+  layout's `padding` / `spacing` to control spacing, rather than assigning
+  `x:` / `y:` literal values. Centering may use `(parent.width - self.width)
+  / 2` or similar computed expressions that reference the container's
+  dimensions, but absolute pixel offsets are prohibited. All gap / inter-element
+  spacing must be declared via `padding` on the layout container or the
+  `spacing` property of `HorizontalLayout` / `VerticalLayout`. The `x:` and
+  `y:` properties on a component should only reference the parent container
+  (e.g. `parent.width`, `parent.height`) or use computed relative expressions
+  — never bare numbers like `10px` or `0px` unless they are zero and
+  used inside a layout that manages positioning.
 
 ## Testing instructions
 
@@ -153,6 +179,9 @@ for itself when it is missing, and looks for a newer one on every start.
 ## Security
 
 - Never commit secrets. `.env` is in `.gitignore`, and so is `.flatline/`.
+- The cookie files under `cache/cookies` and the browser profile under
+  `user-data/` hold the credentials of the signed-in services. Both are in
+  `.gitignore`.
 - The player runs `yt-dlp` with a URL the user typed. It never builds a
   shell command out of it: the URL is passed as a separate argument.
 - Downloaded files land in a directory Flatline owns and are replaced

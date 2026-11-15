@@ -22,6 +22,8 @@ pub enum Error {
     Io(std::io::Error),
     /// A thumbnail could not be downloaded.
     Http(String),
+    /// A thumbnail could not be processed.
+    Image(image_process::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -30,6 +32,7 @@ impl std::fmt::Display for Error {
             Error::Database(error) => write!(f, "the database failed: {error}"),
             Error::Io(error) => write!(f, "a file could not be handled: {error}"),
             Error::Http(message) => write!(f, "a thumbnail could not be downloaded: {message}"),
+            Error::Image(error) => write!(f, "a thumbnail could not be processed: {error}"),
         }
     }
 }
@@ -45,5 +48,11 @@ impl From<database::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Error::Io(value)
+    }
+}
+
+impl From<image_process::Error> for Error {
+    fn from(value: image_process::Error) -> Self {
+        Error::Image(value)
     }
 }

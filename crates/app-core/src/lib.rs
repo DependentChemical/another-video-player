@@ -14,6 +14,7 @@ pub mod app;
 pub mod diag;
 pub mod loading;
 pub mod paths;
+pub mod session;
 pub mod shell;
 pub mod time;
 pub mod timeline;

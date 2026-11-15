@@ -10,11 +10,70 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
-use std::path::Path;
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Timer, TimerMode};
 
 slint::include_modules!();
+
+/// How long a toast stays on screen before it is removed on its own.
+const TOAST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many toasts are kept at once; newer ones push out the oldest.
+const TOAST_LIMIT: usize = 5;
+
+/// How often expired toasts are swept away.
+const TOAST_SWEEP: Duration = Duration::from_millis(500);
+
+/// One toast that is currently on screen and the moment it was shown.
+struct ActiveToast {
+    item: ToastItem,
+    shown_at: Instant,
+}
+
+/// The toasts the window is showing.
+///
+/// The store owns their lifetime: callers only add to it, and the sweep
+/// removes a toast once it is older than [`TOAST_TIMEOUT`] or has been
+/// pushed past [`TOAST_LIMIT`].
+#[derive(Default)]
+struct ToastStore {
+    toasts: Vec<ActiveToast>,
+    next_id: i32,
+}
+
+impl ToastStore {
+    /// Adds a toast, evicting the oldest when the limit is exceeded.
+    fn show(&mut self, text: &str, now: Instant) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.toasts.push(ActiveToast { item: ToastItem { text: text.into(), id }, shown_at: now });
+        if self.toasts.len() > TOAST_LIMIT {
+            let excess = self.toasts.len() - TOAST_LIMIT;
+            self.toasts.drain(..excess);
+        }
+    }
+
+    /// Removes expired toasts and reports whether the set changed.
+    fn prune(&mut self, now: Instant) -> bool {
+        let before = self.toasts.len();
+        self.toasts.retain(|toast| now.duration_since(toast.shown_at) < TOAST_TIMEOUT);
+        self.toasts.len() != before
+    }
+
+    /// Whether no toast is left.
+    fn is_empty(&self) -> bool {
+        self.toasts.is_empty()
+    }
+
+    /// The items the Slint model expects.
+    fn items(&self) -> Vec<ToastItem> {
+        self.toasts.iter().map(|toast| toast.item.clone()).collect()
+    }
+}
 
 /// How prominent a status message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,10 +130,44 @@ pub struct SourceLists {
     pub muxed: Vec<SourceOption>,
 }
 
+/// One entry of the active queue shown in the queue dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueListEntry {
+    /// The position of the entry in the active queue.
+    pub position: i32,
+    /// Human readable title of the media.
+    pub title: String,
+    /// The channel or uploader of the media.
+    pub uploader: String,
+    /// A cached thumbnail on disk, when one is available.
+    pub thumbnail: Option<PathBuf>,
+    /// Whether this is the entry that plays now.
+    pub current: bool,
+}
+
+/// One entry of the playback history shown in the history dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryListEntry {
+    /// Human readable title of the media.
+    pub title: String,
+    /// The channel or uploader of the media, or its URL as a fallback.
+    pub uploader: String,
+    /// The URL the media can be resolved from again.
+    pub url: String,
+}
+
 /// The player window.
 pub struct PlayerUi {
     window: MainWindow,
-    fullscreen: std::cell::Cell<bool>,
+    fullscreen: Cell<bool>,
+    toasts: Rc<RefCell<ToastStore>>,
+    toast_timer: Rc<Timer>,
+}
+
+impl Drop for PlayerUi {
+    fn drop(&mut self) {
+        self.toast_timer.stop();
+    }
 }
 
 /// A handle that asks the toolkit to draw another frame.
@@ -107,7 +200,12 @@ impl Default for PlayerUi {
 impl PlayerUi {
     /// Creates the window.
     pub fn new() -> Result<PlayerUi, slint::PlatformError> {
-        Ok(PlayerUi { window: MainWindow::new()?, fullscreen: std::cell::Cell::new(false) })
+        Ok(PlayerUi {
+            window: MainWindow::new()?,
+            fullscreen: Cell::new(false),
+            toasts: Rc::new(RefCell::new(ToastStore::default())),
+            toast_timer: Rc::new(Timer::default()),
+        })
     }
 
     /// The underlying component.
@@ -167,6 +265,16 @@ impl PlayerUi {
         self.window.set_media_title(title.into());
     }
 
+    /// The application version to show in the window title.
+    pub fn set_app_version(&self, version: &str) {
+        self.window.set_app_version(version.into());
+    }
+
+    /// The channel or uploader of the media that is playing.
+    pub fn set_media_uploader(&self, uploader: &str) {
+        self.window.set_media_uploader(uploader.into());
+    }
+
     /// Shows a message.
     pub fn set_status(&self, status: &str, kind: StatusKind) {
         self.window.set_status(status.into());
@@ -192,9 +300,12 @@ impl PlayerUi {
         audio: Option<&str>,
         muxed: Option<&str>,
     ) {
-        self.window.set_selected_video_id(video.unwrap_or_default().into());
-        self.window.set_selected_audio_id(audio.unwrap_or_default().into());
-        self.window.set_selected_muxed_id(muxed.unwrap_or_default().into());
+        let video = video.unwrap_or_default();
+        let audio = audio.unwrap_or_default();
+        let muxed = muxed.unwrap_or_default();
+        self.window.set_selected_video_id(video.into());
+        self.window.set_selected_audio_id(audio.into());
+        self.window.set_selected_muxed_id(muxed.into());
     }
 
     /// Whether a media is loaded.
@@ -222,7 +333,21 @@ impl PlayerUi {
         self.window.set_duration(seconds as f32);
     }
 
-    /// The volume, in the range mpv uses.
+    /// The spans of the media that are already downloaded.
+    ///
+    /// Each span is a fraction between zero and one of the shown axis, so the
+    /// scrubber can draw them without knowing which time axis it is on.
+    pub fn set_buffered_ranges(&self, ranges: &[(f64, f64)]) {
+        let ranges: Vec<BufferedRange> = ranges
+            .iter()
+            .filter_map(|&(start, end)| {
+                (end > start).then_some(BufferedRange { start: start as f32, end: end as f32 })
+            })
+            .collect();
+        self.window.set_buffered_ranges(slint::ModelRc::new(slint::VecModel::from(ranges)));
+    }
+
+    /// The volume slider position, from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.window.set_volume(volume as f32);
     }
@@ -262,14 +387,45 @@ impl PlayerUi {
     }
 
     /// Shows a short note in the corner of the window.
+    ///
+    /// This is fire-and-forget: the caller never has to remove it. The toast
+    /// disappears on its own after ten seconds, and when more than five are
+    /// shown at once the oldest are dropped to make room.
     pub fn show_toast(&self, text: &str) {
-        self.window.set_toast_text(text.into());
-        self.window.set_toast_visible(true);
+        let items = {
+            let mut toasts = self.toasts.borrow_mut();
+            toasts.show(text, Instant::now());
+            toasts.items()
+        };
+        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.sweep_toasts();
     }
 
-    /// Hides the note in the corner of the window.
-    pub fn hide_toast(&self) {
-        self.window.set_toast_visible(false);
+    /// Makes sure the sweep timer runs while any toast is on screen.
+    fn sweep_toasts(&self) {
+        if self.toast_timer.running() {
+            return;
+        }
+        let toasts = Rc::clone(&self.toasts);
+        let weak_window = self.window.as_weak();
+        let weak_timer = Rc::downgrade(&self.toast_timer);
+        self.toast_timer.start(TimerMode::Repeated, TOAST_SWEEP, move || {
+            let items = {
+                let mut toasts = toasts.borrow_mut();
+                if !toasts.prune(Instant::now()) {
+                    return;
+                }
+                if toasts.is_empty()
+                    && let Some(timer) = weak_timer.upgrade()
+                {
+                    timer.stop();
+                }
+                toasts.items()
+            };
+            if let Some(window) = weak_window.upgrade() {
+                window.set_toasts(slint::ModelRc::new(slint::VecModel::from(items)));
+            }
+        });
     }
 
     /// Opens the dialog that asks what to do with a resolved media.
@@ -287,6 +443,43 @@ impl PlayerUi {
     /// Closes the pending dialog.
     pub fn hide_pending(&self) {
         self.window.set_pending_open(false);
+    }
+
+    /// Shows the active queue in a list over the video.
+    ///
+    /// Only thumbnails that exist on disk are decoded; a missing file simply
+    /// leaves the placeholder in the row.
+    pub fn show_queue(&self, entries: &[QueueListEntry]) {
+        let items: Vec<QueueItem> = entries
+            .iter()
+            .map(|entry| QueueItem {
+                position: entry.position,
+                title: entry.title.as_str().into(),
+                uploader: entry.uploader.as_str().into(),
+                thumbnail: entry
+                    .thumbnail
+                    .as_deref()
+                    .and_then(|path| slint::Image::load_from_path(path).ok())
+                    .unwrap_or_default(),
+                current: entry.current,
+            })
+            .collect();
+        self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.window.set_queue_open(true);
+    }
+
+    /// Shows the playback history in a list over the video.
+    pub fn show_history(&self, entries: &[HistoryListEntry]) {
+        let items: Vec<HistoryItem> = entries
+            .iter()
+            .map(|entry| HistoryItem {
+                title: entry.title.as_str().into(),
+                uploader: entry.uploader.as_str().into(),
+                url: entry.url.as_str().into(),
+            })
+            .collect();
+        self.window.set_history_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.window.set_history_open(true);
     }
 
     /// Shows the release notes and available version.
@@ -375,6 +568,11 @@ impl PlayerUi {
         self.window.on_controls_hovered(handler);
     }
 
+    /// Called when an interaction with the control bar starts or ends.
+    pub fn on_interacting_changed(&self, handler: impl Fn(bool) + 'static) {
+        self.window.on_interacting_changed(handler);
+    }
+
     /// Called when the user asks to play the pending media right away.
     pub fn on_pending_play(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_play_requested(handler);
@@ -399,6 +597,30 @@ impl PlayerUi {
     pub fn on_update_dismissed(&self, handler: impl Fn() + 'static) {
         self.window.on_update_dismissed(handler);
     }
+
+    /// Called when the user asks for the active queue.
+    pub fn on_queue_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_queue_requested(handler);
+    }
+
+    /// Called when the user asks for the playback history.
+    pub fn on_history_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_history_requested(handler);
+    }
+
+    /// Called when the user picks an entry of the active queue.
+    ///
+    /// The argument is the position of the entry in the queue.
+    pub fn on_queue_item_selected(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_item_selected(handler);
+    }
+
+    /// Called when the user picks a history entry.
+    ///
+    /// The argument is the URL of the entry, ready to be resolved again.
+    pub fn on_history_item_selected(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_history_item_selected(move |url| handler(url.to_string()));
+    }
 }
 
 /// Converts host options into the model Slint understands.
@@ -418,4 +640,74 @@ fn to_model(options: &[SourceOption]) -> slint::ModelRc<StreamItem> {
 fn non_empty(value: slint::SharedString) -> Option<String> {
     let value = value.to_string();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use slint::Model;
+
+    use super::*;
+
+    #[test]
+    fn test_media_metadata_setters() {
+        let ui = PlayerUi::new().expect("UI window should initialize");
+        ui.set_media_title("Test Video Title");
+        ui.set_media_uploader("Test Channel");
+        assert_eq!(ui.window().get_media_title(), "Test Video Title");
+        assert_eq!(ui.window().get_media_uploader(), "Test Channel");
+
+        ui.show_queue(&[QueueListEntry {
+            position: 0,
+            title: "First".to_string(),
+            uploader: "Uploader".to_string(),
+            thumbnail: None,
+            current: true,
+        }]);
+        assert!(ui.window().get_queue_open());
+        assert_eq!(ui.window().get_queue_items().row_count(), 1);
+
+        ui.show_history(&[HistoryListEntry {
+            title: "First".to_string(),
+            uploader: "Uploader".to_string(),
+            url: "https://example.com/video".to_string(),
+        }]);
+        assert!(ui.window().get_history_open());
+        assert_eq!(ui.window().get_history_items().row_count(), 1);
+
+        // The host clears the URL entry once it has been processed.
+        ui.set_url("https://example.com/video");
+        assert_eq!(ui.window().get_url(), "https://example.com/video");
+        ui.set_url("");
+        assert_eq!(ui.window().get_url(), "");
+
+        ui.show_toast("hello");
+        let toasts = ui.window().get_toasts();
+        assert_eq!(toasts.row_count(), 1);
+        assert_eq!(toasts.row_data(0).expect("one toast").text, "hello");
+    }
+
+    #[test]
+    fn a_toast_disappears_after_its_timeout() {
+        let mut store = ToastStore::default();
+        let shown_at = Instant::now();
+        store.show("hello", shown_at);
+
+        assert!(!store.prune(shown_at + TOAST_TIMEOUT - Duration::from_millis(1)));
+        assert_eq!(store.toasts.len(), 1);
+        assert!(store.prune(shown_at + TOAST_TIMEOUT));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn older_toasts_are_dropped_beyond_the_limit() {
+        let mut store = ToastStore::default();
+        let now = Instant::now();
+        for index in 0..(TOAST_LIMIT + 2) {
+            store.show(&format!("toast {index}"), now);
+        }
+
+        assert_eq!(store.toasts.len(), TOAST_LIMIT);
+        assert_eq!(store.toasts[0].item.text, "toast 2");
+        assert_eq!(store.toasts[TOAST_LIMIT - 1].item.text, format!("toast {}", TOAST_LIMIT + 1));
+    }
 }

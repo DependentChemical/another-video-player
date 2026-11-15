@@ -14,7 +14,8 @@ use std::process::Command;
 /// workspace.
 const RULES: &[(&str, &[&str])] = &[
     ("database", &[]),
-    ("library", &["database", "media-model"]),
+    ("image-process", &["media-model"]),
+    ("library", &["database", "media-model", "image-process"]),
     ("media-model", &[]),
     ("settings", &["media-model"]),
     ("playback-engine", &[]),
@@ -24,6 +25,8 @@ const RULES: &[(&str, &[&str])] = &[
     ("updater", &[]),
     ("stream-resolver", &["media-model"]),
     ("video-surface", &["playback-engine"]),
+    ("web-session", &["media-model"]),
+    ("web-session-view", &["web-session", "media-model"]),
     (
         "app-core",
         &[
@@ -35,6 +38,7 @@ const RULES: &[(&str, &[&str])] = &[
             "storyboard",
             "ui-kit",
             "video-surface",
+            "web-session",
             "ytdlp-tool",
             "updater",
         ],

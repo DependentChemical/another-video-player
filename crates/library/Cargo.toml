@@ -10,6 +10,11 @@ authors.workspace = true
 # Layer 1: models on top of the database. Knows nothing about playback or UI.
 [dependencies]
 database = { workspace = true }
+image-process = { workspace = true }
 media-model = { workspace = true }
 rusqlite = { workspace = true }
 ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+image = "0.25"

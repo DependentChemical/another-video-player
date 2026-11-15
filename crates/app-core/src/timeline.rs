@@ -37,6 +37,41 @@ impl Timeline {
     }
 }
 
+/// Maps downloaded spans onto the axis the interface shows, as fractions.
+///
+/// `span` is the length of the axis in seconds and `origin` the stream time
+/// that sits at its left hand end. A recorded media starts at zero; a live
+/// stream starts at the left hand end of its window. Spans outside the axis
+/// are clipped, overlapping spans are joined and empty spans are dropped, so
+/// the caller can draw the result directly.
+pub fn buffered_fractions(span: f64, origin: f64, ranges: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if span <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut clipped: Vec<(f64, f64)> = ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            let start = ((start - origin) / span).clamp(0.0, 1.0);
+            let end = ((end - origin) / span).clamp(0.0, 1.0);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    clipped.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(clipped.len());
+    for (start, end) in clipped {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
 /// The axis of a live stream.
 ///
 /// The struct remembers where the live edge is and where the shown window
@@ -60,6 +95,11 @@ impl LiveAxis {
     /// The furthest the stream has come, in seconds.
     pub fn edge(&self) -> f64 {
         self.edge
+    }
+
+    /// The stream time the left hand end of the shown axis stands for.
+    pub fn window_start(&self) -> f64 {
+        self.start
     }
 
     /// Notes the position the player is at.
@@ -269,5 +309,36 @@ mod tests {
         axis.anchor();
         assert_eq!(axis.to_stream(-10.0), 700.0);
         assert_eq!(axis.to_stream(LIVE_WINDOW + 100.0), 1000.0);
+    }
+
+    #[test]
+    fn buffered_spans_are_fractions_of_a_recorded_media() {
+        assert_eq!(buffered_fractions(200.0, 0.0, &[(50.0, 100.0)]), vec![(0.25, 0.5)]);
+    }
+
+    #[test]
+    fn buffered_spans_are_clipped_to_the_axis() {
+        assert_eq!(
+            buffered_fractions(100.0, 0.0, &[(-10.0, 20.0), (90.0, 130.0)]),
+            vec![(0.0, 0.2), (0.9, 1.0)]
+        );
+    }
+
+    #[test]
+    fn overlapping_buffered_spans_are_joined() {
+        assert_eq!(buffered_fractions(100.0, 0.0, &[(40.0, 60.0), (10.0, 50.0)]), vec![(0.1, 0.6)]);
+    }
+
+    #[test]
+    fn buffered_spans_of_a_live_stream_use_its_window() {
+        assert_eq!(
+            buffered_fractions(LIVE_WINDOW, 700.0, &[(700.0, 850.0), (950.0, 1000.0)]),
+            vec![(0.0, 0.5), (250.0 / LIVE_WINDOW, 1.0)]
+        );
+    }
+
+    #[test]
+    fn buffered_spans_without_an_axis_are_dropped() {
+        assert!(buffered_fractions(0.0, 0.0, &[(0.0, 10.0)]).is_empty());
     }
 }

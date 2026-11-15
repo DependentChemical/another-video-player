@@ -1,4 +1,5 @@
 import { Theme } from "theme.slint";
+import { BufferedRange } from "slint-ui/types.slint";
 
 // The font that carries the icons.
 //
@@ -86,6 +87,45 @@ export component ReplayIcon inherits Icon {
     glyph: "\u{e059}";
 }
 
+// The cross that marks the close button.
+export component CloseIcon inherits Icon {
+    glyph: "\u{e5cd}";
+    size: 16px;
+    ink: Theme.muted;
+}
+
+// The button that closes a dialog.
+//
+// It sits in the upper right corner of a modal and carries the same size as
+// the other small square buttons, so a dialog and the bars share one rhythm.
+export component CloseButton inherits Rectangle {
+    callback clicked();
+    callback pointer-activity();
+
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
+
+    CloseIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: touch.has-hover ? Theme.fg : Theme.muted;
+    }
+
+    touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 // A flat button with a text label.
 export component FlatButton inherits Rectangle {
     in property <string> label: "";
@@ -96,8 +136,8 @@ export component FlatButton inherits Rectangle {
 
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.primary ? Theme.accent : Theme.border;
-    background: root.primary ? Theme.accent : (touch.pressed ? Theme.elevated : Theme.panel);
+    border-color: root.primary ? Theme.accent : (touch.has-hover && root.enabled ? Theme.accent : Theme.border);
+    background: root.primary ? (touch.has-hover ? #5a9bf5 : Theme.accent) : (touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel));
     opacity: root.enabled ? 1 : 0.45;
 
     Text {
@@ -130,8 +170,8 @@ export component PlayPauseButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     icon := Rectangle {
         x: (parent.width - self.width) / 2;
@@ -175,8 +215,8 @@ export component FullscreenButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     if !root.fullscreen: FullscreenIcon {
         x: (parent.width - self.width) / 2;
@@ -214,8 +254,8 @@ export component LiveButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.at-edge ? Theme.danger : Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: root.at-edge ? Theme.danger : (touch.has-hover ? Theme.accent : Theme.border);
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     LiveDot {
         x: 8px;
@@ -255,14 +295,14 @@ export component GearButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.active ? Theme.accent : Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: root.active ? Theme.accent : (touch.has-hover && root.enabled ? Theme.accent : Theme.border);
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
     opacity: root.enabled ? 1 : 0.45;
 
     GearIcon {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        ink: root.active ? Theme.accent : Theme.muted;
+        ink: root.active ? Theme.accent : (touch.has-hover ? Theme.accent : Theme.muted);
     }
 
     touch := TouchArea {
@@ -280,15 +320,19 @@ export component GearButton inherits Rectangle {
 // A horizontal slider.
 //
 // The slider reports the position the user picked through the `moved`
-// callback; the caller decides what to do with it. The part that has been
-// played is filled from the left and grows to the right, the same way a
-// progress bar does.
+ // callback; the caller decides what to do with it. The part that has been
+ // played is filled from the left and grows to the right, the same way a
+ // progress bar does.
 export component SeekBar inherits Rectangle {
     in property <float> value: 0;
     in property <float> maximum: 1;
+    // The spans that are already downloaded, as fractions of the track.
+    in property <[BufferedRange]> buffered-ranges: [];
     in property <bool> interactive: true;
     callback moved(float);
     callback pointer-activity();
+    callback drag-started();
+    callback drag-ended();
 
     height: 18px;
 
@@ -299,31 +343,45 @@ export component SeekBar inherits Rectangle {
         ? clamp(root.value / root.maximum, 0.0, 1.0)
         : 0.0;
 
+    // The width of the part of the slider that carries the track.
+    private property <length> track-width: max(0px, root.width - 12px);
+
     track := Rectangle {
         x: 6px;
         y: (parent.height - self.height) / 2;
-        width: max(0px, parent.width - 12px);
+        width: root.track-width;
         height: 4px;
         border-radius: 2px;
         background: Theme.border;
     }
 
+    // The downloaded part sits under the played part, so the played part keeps
+    // the accent colour while the run-ahead is visible in a lighter tint.
+    for span in root.buffered-ranges: Rectangle {
+        x: 6px + root.track-width * span.start;
+        y: (parent.height - self.height) / 2;
+        width: root.track-width * (span.end - span.start);
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.buffered;
+    }
+
     fill := Rectangle {
         x: 6px;
         y: (parent.height - self.height) / 2;
-        width: max(0px, parent.width - 12px) * root.ratio;
+        width: root.track-width * root.ratio;
         height: 4px;
         border-radius: 2px;
         background: Theme.accent;
     }
 
     knob := Rectangle {
-        x: 6px + max(0px, parent.width - 12px) * root.ratio - self.width / 2;
+        x: 6px + root.track-width * root.ratio - self.width / 2;
         y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;
         border-radius: 6px;
-        background: Theme.accent;
+        background: area.has-hover ? #5a9bf5 : Theme.accent;
         visible: root.interactive && root.maximum > 0;
     }
 
@@ -337,9 +395,11 @@ export component SeekBar inherits Rectangle {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
             if (event.kind == PointerEventKind.down) {
                 root.moved(root.value-at(area.mouse-x));
+                root.drag-started();
             }
             if (event.kind == PointerEventKind.up) {
                 root.moved(root.value-at(area.mouse-x));
+                root.drag-ended();
             }
         }
         moved => {

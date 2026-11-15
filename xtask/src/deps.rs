@@ -18,7 +18,10 @@ use serde::Deserialize;
 const MPV_RELEASES: &str =
     "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest";
 
-#[cfg(windows)]
+/// Where the Inter variable font is published.
+const INTER_FONT_URL: &str =
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf";
+
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 
 /// A GitHub release.
@@ -82,6 +85,26 @@ pub fn setup() -> Result<(), String> {
         // it through `pkg-config`.
     }
 
+    setup_fonts()?;
+
+    Ok(())
+}
+
+/// Downloads the UI font into `crates/ui-kit/fonts/Inter.ttf`.
+pub fn setup_fonts() -> Result<(), String> {
+    let destination =
+        workspace_root().join("crates").join("ui-kit").join("fonts").join("Inter.ttf");
+    if destination.is_file() {
+        return Ok(());
+    }
+
+    println!("xtask: downloading Inter font…");
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    download(INTER_FONT_URL, &destination)?;
+    println!("xtask: Inter font is ready");
     Ok(())
 }
 
@@ -197,7 +220,6 @@ fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Downloads a file.
-#[cfg(windows)]
 fn download(url: &str, destination: &Path) -> Result<(), String> {
     let mut response = ureq::get(url)
         .header("User-Agent", USER_AGENT)
