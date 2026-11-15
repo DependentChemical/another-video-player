@@ -211,9 +211,11 @@ enum RetryErrorKind {
 impl RetryState {
     /// Starts a retry for the given URL and error kind.
     fn start(&mut self, url: String, kind: RetryErrorKind) {
-        self.url = Some(url);
-        self.error_kind = Some(kind);
-        self.attempt = 0;
+        if self.url.as_deref() != Some(url.as_str()) || self.error_kind != Some(kind) {
+            self.url = Some(url);
+            self.error_kind = Some(kind);
+            self.attempt = 0;
+        }
         self.schedule_next();
     }
 
@@ -235,7 +237,6 @@ impl RetryState {
     }
 
     /// Clears the retry state.
-    #[allow(dead_code)]
     fn clear(&mut self) {
         self.url = None;
         self.error_kind = None;
@@ -465,6 +466,7 @@ impl App {
         thumbnail_url: Option<&str>,
         uploader: Option<&str>,
     ) {
+        self.clear_retry();
         let thumbnail_path = thumbnail.map(PathBuf::from);
         if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
             crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
@@ -483,6 +485,7 @@ impl App {
     pub fn advance(&self) -> bool {
         match self.queue.advance() {
             Ok(Some(_)) => {
+                self.clear_retry();
                 self.consume_current();
                 true
             }
@@ -583,7 +586,7 @@ impl App {
         current: &library::QueueEntry,
     ) -> Loaded {
         let sources = source_lists(&source);
-        let default = self
+        let default_plan = self
             .settings
             .select(&source, url)
             .and_then(|quality| {
@@ -591,23 +594,34 @@ impl App {
                     .map_err(|error| settings::Error::Invalid(error.to_string()))
             })
             .ok();
-        let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
-
-        // Use saved selection from queue if available, otherwise use defaults
-        let saved_video = current
-            .selected_video
-            .as_deref()
-            .and_then(|s| parse_saved_selection(s, &source, false));
-        let saved_audio =
-            current.selected_audio.as_deref().and_then(|s| parse_saved_selection(s, &source, true));
-        let saved_muxed = current
-            .selected_muxed
-            .as_deref()
-            .and_then(|s| parse_saved_selection(s, &source, false));
-
-        let video = saved_video.or(video);
-        let audio = saved_audio.or(audio);
-        let muxed = saved_muxed.or(muxed);
+        let default_selection = default_plan.as_ref().map(selection_of).unwrap_or_default();
+        let has_saved_selection = current.selected_video.is_some()
+            || current.selected_audio.is_some()
+            || current.selected_muxed.is_some();
+        let saved_selection = if has_saved_selection {
+            let video = current
+                .selected_video
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, false));
+            let audio = current
+                .selected_audio
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, true));
+            let muxed = current
+                .selected_muxed
+                .as_deref()
+                .and_then(|s| parse_saved_selection(s, &source, false));
+            let all_saved_streams_exist = (current.selected_video.is_none() || video.is_some())
+                && (current.selected_audio.is_none() || audio.is_some())
+                && (current.selected_muxed.is_none() || muxed.is_some());
+            (all_saved_streams_exist && !(muxed.is_some() && (video.is_some() || audio.is_some())))
+                .then_some((video, audio, muxed))
+        } else {
+            None
+        };
+        let (video, audio, muxed) = saved_selection.unwrap_or(default_selection);
+        let plan = plan_from_selection(&source, &video, &audio, &muxed).or(default_plan);
+        let (video, audio, muxed) = plan.as_ref().map(selection_of).unwrap_or_default();
 
         let loaded = Loaded {
             title: source.title.clone(),
@@ -646,12 +660,15 @@ impl App {
             state.current_thumbnail_url = loaded.thumbnail_url.clone();
             state.current_uploader = loaded.uploader.clone();
             state.last_history_save = None;
-            // Clear the resolving URL since we successfully started playing
+            // A successful resolution ends any prior retry cycle.
             state.resolving_url = None;
+            if plan.is_some() && state.retry.error_kind != Some(RetryErrorKind::Playback) {
+                state.retry.clear();
+            }
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
-        match default {
+        match plan {
             Some(plan) => {
                 if let Err(error) = self.start(&plan) {
                     self.handle_playback_error(url.to_string(), error);
@@ -734,7 +751,6 @@ impl App {
     }
 
     /// Clears any pending retry state.
-    #[allow(dead_code)]
     fn clear_retry(&self) {
         let mut state = self.state.lock().expect("the state is not poisoned");
         state.retry.clear();
@@ -791,6 +807,7 @@ impl App {
             self.report(error);
             return;
         }
+        self.clear_retry();
         self.state.lock().expect("the state is not poisoned").pending_restore.begin(pending);
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -975,6 +992,7 @@ impl App {
 
     /// Restores playback position after a source change once the file is ready.
     pub fn on_file_loaded(&self) {
+        self.clear_retry();
         let pending =
             self.state.lock().expect("the state is not poisoned").pending_restore.file_loaded();
         match pending {
@@ -1132,6 +1150,21 @@ fn selection_of(plan: &PlaybackPlan) -> (Option<String>, Option<String>, Option<
             None,
         )
     }
+}
+
+/// Builds the playback plan represented by a saved picker selection.
+fn plan_from_selection(
+    source: &MediaSource,
+    video: &Option<String>,
+    audio: &Option<String>,
+    muxed: &Option<String>,
+) -> Option<PlaybackPlan> {
+    let quality = if let Some(id) = muxed {
+        Quality::Streams { video: Some(id.clone()), audio: None }
+    } else {
+        Quality::Streams { video: video.clone(), audio: audio.clone() }
+    };
+    stream_resolver::plan(source, &quality).ok()
 }
 
 /// Parses a saved selection string (format "ID|value") and verifies the stream
@@ -1398,6 +1431,48 @@ mod tests {
         restore.file_started();
         assert!(matches!(restore.file_loaded(), Some(PendingSeek::Position(p)) if p == 42.0));
         assert!(restore.file_loaded().is_none());
+    }
+
+    #[test]
+    fn retry_attempts_keep_backoff_for_the_same_failure() {
+        let mut retry = RetryState::default();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+        retry.next_attempt();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.next_retry.is_some());
+
+        retry.start("https://example.com/other".into(), RetryErrorKind::Resolver);
+        assert_eq!(retry.attempt, 0);
+    }
+
+    #[test]
+    fn saved_split_selection_builds_the_selected_playback_plan() {
+        let source = source();
+        let video = Some("137".to_string());
+        let audio = Some("140".to_string());
+        let plan = plan_from_selection(&source, &video, &audio, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (video, audio, None));
+    }
+
+    #[test]
+    fn saved_video_only_selection_does_not_attach_default_audio() {
+        let source = source();
+        let video = Some("137".to_string());
+        let plan = plan_from_selection(&source, &video, &None, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (video, None, None));
+    }
+
+    #[test]
+    fn saved_audio_only_selection_builds_an_audio_plan() {
+        let source = source();
+        let audio = Some("140".to_string());
+        let plan = plan_from_selection(&source, &None, &audio, &None).expect("selection is valid");
+
+        assert_eq!(selection_of(&plan), (None, audio, None));
     }
 
     #[test]

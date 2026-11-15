@@ -37,10 +37,11 @@ export component TopBar inherits Rectangle {
             border-color: url-input.has-focus ? Theme.accent : Theme.border;
             background: Theme.elevated;
 
-            VerticalLayout {
-                padding: 10px;
-
-                url-placeholder := Text {
+            url-placeholder := Text {
+                x: 10px;
+                y: 0;
+                width: parent.width - 20px;
+                height: parent.height;
                 text: "Paste a video URL and press Enter";
                 color: Theme.muted;
                 font-size: 13px;
@@ -49,7 +50,10 @@ export component TopBar inherits Rectangle {
             }
 
             url-input := TextInput {
-                horizontal-stretch: 1;
+                x: 10px;
+                y: 0;
+                width: parent.width - 20px;
+                height: parent.height;
                 text <=> root.url;
                 color: Theme.fg;
                 font-size: 13px;
@@ -58,7 +62,6 @@ export component TopBar inherits Rectangle {
                     root.load-requested();
                 }
             }
-        }
         }
 
         load-button := FlatButton {
