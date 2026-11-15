@@ -72,20 +72,44 @@ impl Session {
         if !self.is_available() {
             return Err(Error::Missing(self.helper.clone()));
         }
-        let output = Command::new(&self.helper)
-            .arg("--service")
-            .arg(service.name())
-            .arg("--target")
-            .arg(target)
-            .arg("--cookies")
-            .arg(self.cookie_file(service))
-            .arg("--user-data")
-            .arg(&self.user_data)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(Error::Start)?;
+        let output = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let mut cmd = Command::new(&self.helper);
+                cmd.creation_flags(0x08000000);
+                cmd.arg("--service")
+                    .arg(service.name())
+                    .arg("--target")
+                    .arg(target)
+                    .arg("--cookies")
+                    .arg(self.cookie_file(service))
+                    .arg("--user-data")
+                    .arg(&self.user_data)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(Error::Start)?
+            }
+            #[cfg(not(windows))]
+            {
+                Command::new(&self.helper)
+                    .arg("--service")
+                    .arg(service.name())
+                    .arg("--target")
+                    .arg(target)
+                    .arg("--cookies")
+                    .arg(self.cookie_file(service))
+                    .arg("--user-data")
+                    .arg(&self.user_data)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(Error::Start)?
+            }
+        };
         if output.status.success() {
             Ok(())
         } else {

@@ -1446,8 +1446,12 @@ fn resolve_with_session(
     };
     // The helper opens a window of its own; the player says why it is there.
     let _ = notice.send(Box::new(Message::SigningIn(service)));
-    if session.sign_in(service, url).is_err() {
-        return Err(error);
+    if let Err(problem) = session.sign_in(service, url) {
+        // The helper's failure is the reason the challenge could not be
+        // answered, so it is reported alongside the resolver error instead of
+        // being swallowed: an invisible sign-in would otherwise look like the
+        // player simply ignoring the challenge.
+        return Err(format!("{error} ({problem})"));
     }
     resolver.resolve(url).map_err(|error| error.to_string())
 }

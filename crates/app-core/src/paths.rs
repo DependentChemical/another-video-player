@@ -76,9 +76,30 @@ impl AppPaths {
     /// The helper that opens the sign-in window.
     ///
     /// It lives next to the player, so a copied folder keeps working and a
-    /// build without it simply cannot sign in.
+    /// build without it simply cannot sign in. Two fallbacks keep a plain
+    /// `cargo run -p app-core` usable: an explicit `FLATLINE_SESSION_PROGRAM`
+    /// override, and the sibling Cargo profile directories. A `cargo run` build
+    /// of the player sits in `target/<profile>/`, and a helper compiled into a
+    /// different profile is found through the `target/` parent.
     pub fn session_helper(&self) -> PathBuf {
-        self.program.join(session_helper_name())
+        if let Some(program) =
+            std::env::var_os("FLATLINE_SESSION_PROGRAM").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(program);
+        }
+        let beside = self.program.join(session_helper_name());
+        if beside.is_file() {
+            return beside;
+        }
+        if let Some(target) = self.program.parent() {
+            for profile in ["debug", "release"] {
+                let candidate = target.join(profile).join(session_helper_name());
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        beside
     }
 
     /// The bundled settings document beside the executable.

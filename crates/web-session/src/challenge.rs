@@ -23,8 +23,13 @@ const CHALLENGE_PHRASES: &[&str] = &[
 
 /// Whether a resolver error means the cookies need to be refreshed.
 pub fn is_auth_challenge(message: &str) -> bool {
-    let lowercase = message.to_ascii_lowercase();
-    CHALLENGE_PHRASES.iter().any(|phrase| lowercase.contains(phrase))
+    // yt-dlp on Windows may emit the apostrophe in a non-UTF-8 codepage,
+    // which `from_utf8_lossy` turns into U+FFFD. Normalising both the
+    // message and the phrases keeps the match working regardless.
+    let normalize =
+        |text: &str| text.replace(['\u{FFFD}', '\u{2019}', '\u{2018}'], "'").to_ascii_lowercase();
+    let lowercase = normalize(message);
+    CHALLENGE_PHRASES.iter().any(|phrase| lowercase.contains(&normalize(phrase)))
 }
 
 /// Whether a resolver error is worth a sign-in attempt for this service.
@@ -59,6 +64,13 @@ mod tests {
     #[test]
     fn matching_ignores_case() {
         assert!(is_auth_challenge("SIGN IN TO CONFIRM YOU'RE NOT A BOT"));
+    }
+
+    #[test]
+    fn replacement_characters_from_a_non_utf8_codepage_still_match() {
+        // A Windows ANSI apostrophe read as UTF-8 becomes U+FFFD.
+        assert!(is_auth_challenge("Sign in to confirm you\u{FFFD}re not a bot"));
+        assert!(is_auth_challenge("Sign in to confirm you\u{2019}re not a bot"));
     }
 
     #[test]

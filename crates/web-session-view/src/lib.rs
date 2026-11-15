@@ -21,7 +21,7 @@ use url::Url;
 use web_session::{Cookie, Options, cookie, home_url, login_url};
 
 /// How long the hidden profile check waits before the sign-in window appears.
-const HIDDEN_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+const HIDDEN_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the user has to finish signing in.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long the target page is given to load.

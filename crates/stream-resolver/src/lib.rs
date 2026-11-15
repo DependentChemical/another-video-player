@@ -154,6 +154,11 @@ impl Resolver {
     /// process handling.
     pub fn resolve(&self, url: &str) -> Result<MediaSource, Error> {
         let mut command = self.spec.command();
+        // yt-dlp on Windows writes stderr in the system ANSI codepage, so
+        // non-ASCII characters like the apostrophe in "you're" arrive as
+        // invalid UTF-8 and get replaced with U+FFFD. Force UTF-8 output so
+        // challenge phrases survive the round-trip intact.
+        command.env("PYTHONIOENCODING", "utf-8");
         command
             .arg("--dump-single-json")
             .arg("--no-warnings")
