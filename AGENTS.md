@@ -139,6 +139,22 @@ for itself when it is missing, and looks for a newer one on every start.
 - No `unwrap()` outside tests, except where the invariant is documented
   right above the line.
 - Comments explain *why*, never *what*. The code already says what.
+- **UI Layout**: Never hardcode element coordinates (`x:`, `y:`), absolute
+  pixel offsets, or explicit positions in Slint components. All UI layout
+  must use Slint's implicit layout system: `HorizontalLayout`,
+  `VerticalLayout`, `CrossAxisLayout` and their `padding` / `spacing`
+  properties to control gaps between elements. When placing an element
+  inside a container, wrap it in the appropriate layout and use the
+  layout's `padding` / `spacing` to control spacing, rather than assigning
+  `x:` / `y:` literal values. Centering may use `(parent.width - self.width)
+  / 2` or similar computed expressions that reference the container's
+  dimensions, but absolute pixel offsets are prohibited. All gap / inter-element
+  spacing must be declared via `padding` on the layout container or the
+  `spacing` property of `HorizontalLayout` / `VerticalLayout`. The `x:` and
+  `y:` properties on a component should only reference the parent container
+  (e.g. `parent.width`, `parent.height`) or use computed relative expressions
+  — never bare numbers like `10px` or `0px` unless they are zero and
+  used inside a layout that manages positioning.
 
 ## Testing instructions
 
