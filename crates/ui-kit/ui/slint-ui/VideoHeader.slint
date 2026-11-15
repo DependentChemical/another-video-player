@@ -13,47 +13,46 @@ export component VideoHeader inherits Rectangle {
 
     opacity: (root.has-media && root.controls-visible && (root.title != "" || root.uploader != "")) ? 1 : 0;
     y: root.controls-visible ? Theme.bar-height : Theme.bar-height - self.height;
-    background: transparent;
+    // The bar hugs its text instead of covering the video behind it. The
+    // layout's preferred height follows word-wrapped titles and uploader
+    // names, so there is no fixed height to get out of sync.
+    height: info.preferred-height;
+    background: #000000a6;
 
-     animate y { duration: 180ms; easing: ease-out; }
-     animate opacity { duration: 140ms; }
+    animate y { duration: 180ms; easing: ease-out; }
+    animate opacity { duration: 140ms; }
 
-     Rectangle {
-         width: parent.width;
-         background: #000000a6;
+    TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move {
+                root.pointer-activity();
+            }
+        }
+        moved => { root.pointer-activity(); }
 
-         TouchArea {
-             pointer-event(event) => {
-                 if event.kind == PointerEventKind.move {
-                     root.pointer-activity();
-                 }
-             }
-             moved => { root.pointer-activity(); }
+        info := VerticalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 3px;
+            alignment: start;
 
-             VerticalLayout {
-                 padding-left: 16px;
-                 padding-right: 16px;
-                 padding-top: 10px;
-                 padding-bottom: 10px;
-                 spacing: 3px;
-                 alignment: start;
+            Text {
+                text: root.title;
+                color: Theme.fg;
+                font-size: 15px;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
 
-                 Text {
-                     text: root.title;
-                     color: Theme.fg;
-                     font-size: 15px;
-                     font-weight: 700;
-                     wrap: word-wrap;
-                 }
-
-                 if root.uploader != "": Text {
-                     text: root.uploader;
-                     color: Theme.muted;
-                     font-size: 12px;
-                     font-weight: 400;
-                     wrap: word-wrap;
-                 }
-             }
-         }
-     }
- }
+            if root.uploader != "": Text {
+                text: root.uploader;
+                color: Theme.muted;
+                font-size: 12px;
+                font-weight: 400;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

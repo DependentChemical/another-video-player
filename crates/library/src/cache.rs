@@ -8,10 +8,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::Error;
-use image_process::normalize_to_jpeg;
+use image_process::{is_renderable_jpeg, normalize_to_jpeg};
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 
@@ -19,8 +19,9 @@ const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 /// waiting on a stalled server.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The extensions a downloaded thumbnail may have (used for the temp file).
-const DOWNLOAD_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
+/// Scratch files older than this were left behind by an interrupted
+/// download; no healthy fetch keeps one around that long.
+const STALE_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The directory downloaded thumbnails are kept in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,20 +47,29 @@ impl ThumbnailCache {
     /// file first and is moved into place afterwards, so an interrupted
     /// download never leaves a broken image behind.
     ///
-    /// The cached thumbnail is always normalized to JPEG so the UI can render it.
+    /// The cached thumbnail is always normalized to JPEG so the UI can render
+    /// it. A cached file whose header cannot be read is downloaded again.
     pub fn fetch(&self, url: &str) -> Result<PathBuf, Error> {
         let jpeg_path = self.path_for(url);
         if jpeg_path.is_file() {
-            return Ok(jpeg_path);
+            if is_renderable_jpeg(&jpeg_path) {
+                return Ok(jpeg_path);
+            }
+            match fs::remove_file(&jpeg_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
+            }
         }
 
         fs::create_dir_all(&self.directory)?;
+        self.remove_stale_partials();
 
-        // Download to a temp file with the original extension (so the image crate
-        // can detect the format), then normalize to JPEG.
-        let download_ext = download_extension_of(url);
-        let temp_name = format!("{:016x}.{}.part", fnv1a(url.as_bytes()), download_ext);
+        // The download is format-agnostic: the scratch name has no meaning,
+        // because the normalizer guesses the real format from the bytes.
+        let temp_name = format!("{:016x}.part", fnv1a(url.as_bytes()));
         let temporary = self.directory.join(temp_name);
+        let _scratch = ScratchFile(&temporary);
 
         {
             let mut response = ureq::get(url)
@@ -111,26 +121,44 @@ impl ThumbnailCache {
         }
         Ok(())
     }
+
+    /// Removes scratch files left behind by an interrupted download.
+    fn remove_stale_partials(&self) {
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("part") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_PARTIAL_AGE);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// Removes a partially downloaded thumbnail when a fetch ends, whether it
+/// succeeded or failed. A successful conversion has already removed it.
+struct ScratchFile<'a>(&'a Path);
+
+impl Drop for ScratchFile<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
 }
 
 /// The file name a thumbnail URL is cached under (always .jpg).
 pub fn file_name_for(url: &str) -> String {
     format!("{:016x}.jpg", fnv1a(url.as_bytes()))
-}
-
-/// The extension to use for the temporary download file.
-fn download_extension_of(url: &str) -> &str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let candidate = path.rsplit('.').next().unwrap_or_default();
-    if candidate.len() <= 5
-        && !candidate.is_empty()
-        && candidate.chars().all(|c| c.is_ascii_alphanumeric())
-        && DOWNLOAD_EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(candidate))
-    {
-        candidate
-    } else {
-        "jpg"
-    }
 }
 
 /// A 64 bit FNV-1a hash, used only for cache file names.
@@ -173,5 +201,36 @@ mod tests {
         let cache = ThumbnailCache::new("/tmp/flatline-cache");
         let path = cache.path_for("https://example.com/a.jpg");
         assert_eq!(path.parent(), Some(Path::new("/tmp/flatline-cache")));
+    }
+
+    #[test]
+    fn stale_scratch_files_are_removed_but_fresh_ones_are_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let stale = temp.path().join("stale.webp.part");
+        let fresh = temp.path().join("fresh.jpg.part");
+        fs::write(&stale, b"junk").unwrap();
+        fs::write(&fresh, b"junk").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+
+        cache.remove_stale_partials();
+
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn a_scratch_file_is_removed_when_the_fetch_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("thumbnail.part");
+        fs::write(&path, b"partial").unwrap();
+
+        {
+            let _scratch = ScratchFile(&path);
+            assert!(path.exists());
+        }
+
+        assert!(!path.exists());
     }
 }

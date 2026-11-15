@@ -8,6 +8,7 @@
 //! it as JPEG.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -17,41 +18,57 @@ pub enum Error {
     /// The source image could not be read.
     #[error("could not read image: {0}")]
     Read(#[from] image::ImageError),
+    /// The converted image could not be encoded.
+    #[error("could not encode image: {0}")]
+    Encode(image::ImageError),
     /// The destination file could not be written.
     #[error("could not write image: {0}")]
     Write(#[from] std::io::Error),
     /// The source file does not exist.
     #[error("source file does not exist: {0}")]
     NotFound(PathBuf),
+    /// The converted image is not a readable JPEG.
+    #[error("the converted image is not a readable JPEG: {0}")]
+    NotRenderable(PathBuf),
 }
 
 /// Converts an image file to JPEG, writing the result to `destination`.
 ///
-/// If the source is already a JPEG (by extension), it is copied as-is.
-/// Otherwise the image is decoded and re-encoded as JPEG with 85% quality.
+/// The source extension is never trusted: the format is guessed from the
+/// bytes, so a download named `thumbnail.webp.part` is still handled. The
+/// image is always decoded and re-encoded, which also rejects truncated or
+/// corrupt downloads instead of caching them.
 ///
-/// The source file is removed after successful conversion.
+/// The destination is written through a scratch file and moved into place
+/// atomically, so a reader never sees a half-written image. The source file
+/// is removed after a successful conversion.
 pub fn normalize_to_jpeg(source: &Path, destination: &Path) -> Result<(), Error> {
-    if !source.exists() {
+    if !source.is_file() {
         return Err(Error::NotFound(source.to_path_buf()));
     }
 
-    let is_jpeg = source
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
-        .unwrap_or(false);
+    let image = decode(source)?;
+    write_jpeg(&image, destination)?;
 
-    if is_jpeg {
-        std::fs::copy(source, destination)?;
-        std::fs::remove_file(source)?;
-        return Ok(());
-    }
-
-    let img = image::open(source)?;
-    img.save_with_format(destination, image::ImageFormat::Jpeg)?;
     std::fs::remove_file(source)?;
     Ok(())
+}
+
+/// Returns whether `path` is a JPEG whose header can be decoded.
+///
+/// The cache uses this to discard a file that was left behind by an older
+/// build before it hands the thumbnail to the UI.
+pub fn is_renderable_jpeg(path: &Path) -> bool {
+    let Ok(reader) = image::ImageReader::open(path) else {
+        return false;
+    };
+    let Ok(reader) = reader.with_guessed_format() else {
+        return false;
+    };
+    if reader.format() != Some(image::ImageFormat::Jpeg) {
+        return false;
+    }
+    matches!(reader.into_dimensions(), Ok((width, height)) if width > 0 && height > 0)
 }
 
 /// Returns the path where the normalized JPEG should be stored.
@@ -61,72 +78,146 @@ pub fn jpeg_path_for(source: &Path) -> PathBuf {
     source.with_extension("jpg")
 }
 
+/// Decodes an image by looking at its bytes, not its file name.
+fn decode(source: &Path) -> Result<image::DynamicImage, Error> {
+    let reader = image::ImageReader::open(source)
+        .map_err(|error| Error::Read(image::ImageError::IoError(error)))?
+        .with_guessed_format()
+        .map_err(|error| Error::Read(image::ImageError::IoError(error)))?;
+    Ok(reader.decode()?)
+}
+
+/// Encodes `image` as JPEG next to `destination` and moves it into place.
+fn write_jpeg(image: &image::DynamicImage, destination: &Path) -> Result<(), Error> {
+    let temporary = scratch_path_for(destination);
+    image.save_with_format(&temporary, image::ImageFormat::Jpeg).map_err(Error::Encode)?;
+
+    if !is_renderable_jpeg(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(Error::NotRenderable(destination.to_path_buf()));
+    }
+
+    if destination.exists() {
+        std::fs::remove_file(destination)?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, destination) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(Error::Write(error));
+    }
+    Ok(())
+}
+
+/// A per-process scratch name beside `destination`, so concurrent
+/// conversions cannot write the same intermediate file.
+fn scratch_path_for(destination: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = destination.file_name().and_then(|name| name.to_str()).unwrap_or("thumbnail");
+    destination.with_file_name(format!(".{name}.{}.{sequence}.tmp", std::process::id()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn red_png() -> Vec<u8> {
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("the test image encodes");
+        bytes
+    }
+
+    fn red_webp() -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_fn(2, 2, |_, _| {
+            image::Rgb([255u8, 0, 0])
+        }));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::WebP)
+            .expect("the test image encodes");
+        bytes
+    }
 
     #[test]
     fn converts_png_to_jpeg() {
         let temp = tempfile::tempdir().unwrap();
         let png_path = temp.path().join("test.png");
         let jpg_path = temp.path().join("test.jpg");
-
-        // Create a minimal PNG (1x1 red pixel) using the image crate
-        let img = image::ImageBuffer::from_fn(1, 1, |_, _| image::Rgb([255u8, 0, 0]));
-        img.save(&png_path).unwrap();
+        fs::write(&png_path, red_png()).unwrap();
 
         normalize_to_jpeg(&png_path, &jpg_path).unwrap();
 
         assert!(jpg_path.exists());
         assert!(!png_path.exists());
+        assert!(is_renderable_jpeg(&jpg_path));
 
-        // Verify it's a valid JPEG
-        let img = image::open(&jpg_path).unwrap();
-        assert_eq!(img.width(), 1);
-        assert_eq!(img.height(), 1);
+        let image = image::open(&jpg_path).unwrap();
+        assert_eq!(image.width(), 2);
+        assert_eq!(image.height(), 2);
     }
 
     #[test]
-    fn copies_jpeg_as_is() {
+    fn converts_images_with_unknown_extensions() {
         let temp = tempfile::tempdir().unwrap();
-        let jpg_path = temp.path().join("test.jpg");
-        let dest_path = temp.path().join("test_copy.jpg");
+        let source = temp.path().join("thumbnail.webp.part");
+        let destination = temp.path().join("thumbnail.jpg");
+        fs::write(&source, red_png()).unwrap();
 
-        // Create a minimal JPEG (just enough to be recognized)
-        let jpeg_data = vec![
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01,
-            0x00, 0x48, 0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
-            0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
-            0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
-            0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
-            0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-            0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x01,
-            0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01, 0xFF, 0xC4, 0x00, 0x1F,
-            0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
-            0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03,
-            0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11,
-            0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32,
-            0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33,
-            0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
-            0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47,
-            0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65,
-            0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83,
-            0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
-            0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
-            0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
-            0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2, 0xE3, 0xE4,
-            0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
-            0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00,
-            0x3F, 0x00, 0xFF, 0xD9,
-        ];
-        fs::write(&jpg_path, &jpeg_data).unwrap();
+        normalize_to_jpeg(&source, &destination).unwrap();
 
-        normalize_to_jpeg(&jpg_path, &dest_path).unwrap();
+        assert!(destination.exists());
+        assert!(!source.exists());
+        assert!(is_renderable_jpeg(&destination));
+    }
 
-        assert!(dest_path.exists());
-        assert!(!jpg_path.exists());
+    #[test]
+    fn converts_webp_downloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("thumbnail.webp.part");
+        let destination = temp.path().join("thumbnail.jpg");
+        fs::write(&source, red_webp()).unwrap();
+
+        normalize_to_jpeg(&source, &destination).unwrap();
+
+        assert!(is_renderable_jpeg(&destination));
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn rejects_corrupt_downloads_without_writing_a_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("thumbnail.jpg.part");
+        let destination = temp.path().join("thumbnail.jpg");
+        fs::write(&source, b"not an image").unwrap();
+
+        assert!(normalize_to_jpeg(&source, &destination).is_err());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn replaces_a_stale_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("thumbnail.png");
+        let destination = temp.path().join("thumbnail.jpg");
+        fs::write(&source, red_png()).unwrap();
+        fs::write(&destination, b"stale").unwrap();
+
+        normalize_to_jpeg(&source, &destination).unwrap();
+
+        assert!(is_renderable_jpeg(&destination));
+    }
+
+    #[test]
+    fn a_png_is_not_a_renderable_jpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let png_path = temp.path().join("test.jpg");
+        fs::write(&png_path, red_png()).unwrap();
+
+        assert!(!is_renderable_jpeg(&png_path));
     }
 
     #[test]

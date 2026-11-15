@@ -1,8 +1,10 @@
 [package]
 name = "image-process"
-version = "0.3.4"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "Converts downloaded thumbnails to JPEG so the UI can render them."
 
 [dependencies]
