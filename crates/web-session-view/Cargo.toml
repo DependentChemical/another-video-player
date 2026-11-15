@@ -1,0 +1,27 @@
+[package]
+name = "web-session-view"
+description = "Runs the Flatline sign-in in a webview and exports the cookies yt-dlp needs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 2 adapter: binds a browser to the sign-in capability, the same way
+# `video-surface` binds the mpv renderer to the playback engine.
+[dependencies]
+media-model = { workspace = true }
+web-session = { workspace = true }
+tauri = { workspace = true }
+url = { workspace = true }
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[[bin]]
+name = "flatline-session"
+path = "src/main.rs"
+
+[lib]
+name = "web_session_view"
+path = "src/lib.rs"

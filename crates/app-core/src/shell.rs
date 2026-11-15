@@ -466,6 +466,11 @@ fn tick(
                     crate::diag::note(&format!("yt-dlp was updated ({path})"));
                 }
             }
+            Message::SigningIn(service) => {
+                // The sign-in happens in a window of its own; the player only
+                // says why that window is there.
+                ui.show_toast(&format!("Sign in to {service} to continue"));
+            }
             Message::UpdateAvailable(update) => {
                 ui.show_update(&update.version, &update.notes);
                 *update_slot.borrow_mut() = Some(update);

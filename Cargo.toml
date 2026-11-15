@@ -12,6 +12,8 @@ members = [
     "crates/stream-resolver",
     "crates/ui-kit",
     "crates/video-surface",
+    "crates/web-session",
+    "crates/web-session-view",
     "crates/ytdlp-tool",
     "crates/updater",
     "xtask",
@@ -20,7 +22,7 @@ members = [
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.4.8"
+version = "0.4.10"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -39,6 +41,8 @@ storyboard = { path = "crates/storyboard" }
 stream-resolver = { path = "crates/stream-resolver" }
 ui-kit = { path = "crates/ui-kit" }
 video-surface = { path = "crates/video-surface" }
+web-session = { path = "crates/web-session" }
+web-session-view = { path = "crates/web-session-view" }
 ytdlp-tool = { path = "crates/ytdlp-tool" }
 updater = { path = "crates/updater" }
 
@@ -62,6 +66,8 @@ ureq = { version = "3", features = ["json"] }
 zip = "8"
 md5 = "0.7"
 url = "2"
+tauri = { version = "2.12", features = ["wry"] }
+tauri-build = { version = "2", features = [] }
 
 [profile.release]
 opt-level = 3

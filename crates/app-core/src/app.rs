@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use library::{Queue, ThumbnailCache};
-use media_model::{MediaSource, PlaybackPlan, Quality};
+use media_model::{MediaSource, PlaybackPlan, Quality, Service};
 use playback_engine::{Engine, LoadRequest};
 use settings::Settings;
 use stream_resolver::{CommandSpec, Resolver};
@@ -19,6 +19,7 @@ use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
 
 use crate::paths::AppPaths;
+use crate::session::Session;
 use crate::timeline::{LiveAxis, Timeline};
 
 /// Something the background work wants to tell the user interface.
@@ -30,6 +31,8 @@ pub enum Message {
     Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
     ToolUpdated(String),
+    /// A service asks the user to sign in.
+    SigningIn(Service),
     /// A newer application release is available.
     UpdateAvailable(updater::Update),
     /// An accepted application update could not be prepared for installation.
@@ -265,7 +268,7 @@ pub struct App {
     engine: Engine,
     resolver: Mutex<Resolver>,
     settings: Settings,
-    youtube_cookies: std::path::PathBuf,
+    session: Session,
     runtime: tokio::runtime::Runtime,
     outbox: Arc<Mutex<Sender<Box<Message>>>>,
     inbox: Mutex<Receiver<Box<Message>>>,
@@ -291,8 +294,8 @@ impl App {
         clear_stream_buffer(&stream_buffer);
         let engine =
             Engine::new(&stream_buffer).map_err(|error| Error::Engine(error.to_string()))?;
-        let youtube_cookies = paths.youtube_cookies();
-        let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
+        let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
+        let resolver = Resolver::new(command_spec(ytdlp, &paths.cookies()));
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let queue =
@@ -308,7 +311,7 @@ impl App {
             engine,
             resolver: Mutex::new(resolver),
             settings,
-            youtube_cookies,
+            session,
             runtime,
             outbox: Arc::new(Mutex::new(sender)),
             inbox: Mutex::new(receiver),
@@ -372,19 +375,23 @@ impl App {
         self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
 
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
-                let thumbnail = source
-                    .thumbnail
-                    .as_deref()
-                    .and_then(|url| cache.fetch(url).ok())
-                    .map(|path| path.to_string_lossy().into_owned());
-                ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
-            });
+            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
+            let result = resolve_with_session(&resolver, &session, &url, &sender)
+                .map_err(|error| error.to_string())
+                .map(|source| {
+                    let thumbnail = source
+                        .thumbnail
+                        .as_deref()
+                        .and_then(|url| cache.fetch(url).ok())
+                        .map(|path| path.to_string_lossy().into_owned());
+                    ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
+                });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
@@ -393,21 +400,26 @@ impl App {
     /// the user to decide.
     fn resolve_pending(&self, url: String) {
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let result = resolver.resolve(&url).map_err(|error| error.to_string()).map(|source| {
-                let thumbnail = source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
-                PendingMedia {
-                    url,
-                    title: source.title.clone(),
-                    source,
-                    thumbnail,
-                    resolved_at: unix_time(),
-                }
-            });
+            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
+            let result = resolve_with_session(&resolver, &session, &url, &sender)
+                .map_err(|error| error.to_string())
+                .map(|source| {
+                    let thumbnail =
+                        source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
+                    PendingMedia {
+                        url,
+                        title: source.title.clone(),
+                        source,
+                        thumbnail,
+                        resolved_at: unix_time(),
+                    }
+                });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
     }
@@ -1023,7 +1035,7 @@ impl App {
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = Resolver::new(command_spec(ytdlp, &self.youtube_cookies));
+        *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
 
     /// Looks for a newer `yt-dlp` in the background.
@@ -1399,12 +1411,42 @@ fn format_bitrate(kilobits: u64) -> String {
 }
 
 /// Describes how `yt-dlp` has to be invoked.
-fn command_spec(ytdlp: &YtDlp, youtube_cookies: &std::path::Path) -> CommandSpec {
+///
+/// Every service gets its own cookie file, and a file is only passed when it
+/// is really there: `yt-dlp` refuses to work with an empty cookie file.
+fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
     let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    spec.with_youtube_cookies(youtube_cookies)
+    spec.with_cookies(Service::YouTube, web_session::cookie_file(cookies, Service::YouTube))
+        .with_cookies(Service::Twitch, web_session::cookie_file(cookies, Service::Twitch))
+}
+
+/// Resolves a URL and asks the user to sign in when the service demands it.
+///
+/// Only a sign-in challenge starts a browser; every other failure is handed
+/// to the caller as it is. The sign-in runs in a helper program, so the
+/// player keeps running while the user signs in.
+fn resolve_with_session(
+    resolver: &Resolver,
+    session: &Session,
+    url: &str,
+    notice: &Sender<Box<Message>>,
+) -> Result<MediaSource, String> {
+    let error = match resolver.resolve(url) {
+        Ok(source) => return Ok(source),
+        Err(error) => error.to_string(),
+    };
+    let Some(service) = web_session::challenge_service(url, &error) else {
+        return Err(error);
+    };
+    // The helper opens a window of its own; the player says why it is there.
+    let _ = notice.send(Box::new(Message::SigningIn(service)));
+    if let Err(problem) = session.sign_in(service, url) {
+        return Err(format!("{error} ({problem})"));
+    }
+    resolver.resolve(url).map_err(|error| error.to_string())
 }
 
 /// Everything that can go wrong while running the application.

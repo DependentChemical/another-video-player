@@ -1,0 +1,18 @@
+[package]
+name = "web-session"
+description = "Decides when Flatline needs a signed-in session and keeps the cookie file yt-dlp reads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1: standalone capability. Knows nothing about any other Flatline crate
+# and nothing about the browser that signs the user in.
+[dependencies]
+media-model = { workspace = true }
+url = { workspace = true }
+
+[lib]
+name = "web_session"
+path = "src/lib.rs"

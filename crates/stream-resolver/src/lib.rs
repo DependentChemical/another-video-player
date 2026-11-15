@@ -18,7 +18,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use media_model::MediaSource;
+use media_model::{MediaSource, Service};
 
 /// A resolver process must not leave the UI waiting indefinitely.
 const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(45);
@@ -64,27 +64,24 @@ pub enum Error {
 pub struct CommandSpec {
     program: PathBuf,
     interpreter: Option<PathBuf>,
-    youtube_cookies: Option<PathBuf>,
+    cookies: Vec<(Service, PathBuf)>,
 }
 
 impl CommandSpec {
     /// A spec that runs `program` directly.
     pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), interpreter: None, youtube_cookies: None }
+        Self { program: program.into(), interpreter: None, cookies: Vec::new() }
     }
 
     /// A spec that runs `program` through an interpreter.
     pub fn with_interpreter(program: impl Into<PathBuf>, interpreter: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            interpreter: Some(interpreter.into()),
-            youtube_cookies: None,
-        }
+        Self { program: program.into(), interpreter: Some(interpreter.into()), cookies: Vec::new() }
     }
 
-    /// Supplies a Netscape cookie file for YouTube URLs only.
-    pub fn with_youtube_cookies(mut self, path: impl Into<PathBuf>) -> Self {
-        self.youtube_cookies = Some(path.into());
+    /// Supplies a Netscape cookie file for URLs of one service.
+    pub fn with_cookies(mut self, service: Service, path: impl Into<PathBuf>) -> Self {
+        self.cookies.retain(|(existing, _)| *existing != service);
+        self.cookies.push((service, path.into()));
         self
     }
 
@@ -133,21 +130,9 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Whether a URL targets a YouTube hostname, including its short-link host.
-fn is_youtube_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or_default();
-    let host = host.strip_suffix(":443").or_else(|| host.strip_suffix(":80")).unwrap_or(host);
-
-    host.eq_ignore_ascii_case("youtube.com")
-        || host.to_ascii_lowercase().ends_with(".youtube.com")
-        || host.eq_ignore_ascii_case("youtu.be")
+/// Whether a URL targets a service whose cookie file the resolver can use.
+fn cookie_service(url: &str) -> Option<Service> {
+    Service::from_url(url)
 }
 
 /// Resolves URLs with `yt-dlp`.
@@ -176,7 +161,7 @@ impl Resolver {
             .arg("--ignore-config")
             .arg("--socket-timeout")
             .arg("20");
-        if let Some(cookies) = self.youtube_cookies_for_url(url) {
+        if let Some(cookies) = self.cookies_for_url(url) {
             command.arg("--cookies").arg(cookies);
         }
         command.arg(url);
@@ -192,13 +177,15 @@ impl Resolver {
         parse_catalog(&String::from_utf8_lossy(&output.stdout))
     }
 
-    /// The cookie file to pass for this URL, if a YouTube file is available.
-    fn youtube_cookies_for_url(&self, url: &str) -> Option<&std::path::Path> {
-        if is_youtube_url(url) {
-            self.spec.youtube_cookies.as_deref().filter(|path| path.is_file())
-        } else {
-            None
-        }
+    /// The cookie file to pass for this URL, when one exists.
+    fn cookies_for_url(&self, url: &str) -> Option<&std::path::Path> {
+        let service = cookie_service(url)?;
+        self.spec
+            .cookies
+            .iter()
+            .find(|(candidate, _)| *candidate == service)
+            .map(|(_, path)| path.as_path())
+            .filter(|path| path.is_file())
     }
 }
 
@@ -260,7 +247,8 @@ fn join_output(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandSpec, Error, Resolver, is_youtube_url, run_command};
+    use super::{CommandSpec, Error, Resolver, run_command};
+    use media_model::Service;
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -302,42 +290,35 @@ mod tests {
     }
 
     #[test]
-    fn youtube_cookie_matching_is_limited_to_youtube_hosts() {
-        for url in [
-            "https://youtube.com/watch?v=1",
-            "https://www.youtube.com/watch?v=1",
-            "https://music.youtube.com/watch?v=1",
-            "https://youtu.be/1",
-        ] {
-            assert!(is_youtube_url(url), "{url}");
-        }
-        for url in [
-            "https://youtube.com.example.org/watch?v=1",
-            "https://notyoutube.com/watch?v=1",
-            "https://example.org/watch?v=1",
-            "file:///video.mp4",
-        ] {
-            assert!(!is_youtube_url(url), "{url}");
-        }
-    }
-
-    #[test]
-    fn cookies_are_added_only_when_the_youtube_file_exists() {
+    fn cookie_matching_is_limited_to_the_service() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("flatline-cookies-{unique}.txt"));
-        let resolver = Resolver::new(CommandSpec::new("yt-dlp").with_youtube_cookies(path.clone()));
+        let directory = std::env::temp_dir().join(format!("flatline-cookies-{unique}"));
+        std::fs::create_dir_all(&directory).expect("the test directory can be created");
+        let youtube = directory.join("cookies-youtube.txt");
+        let twitch = directory.join("cookies-twitch.txt");
+        let resolver = Resolver::new(
+            CommandSpec::new("yt-dlp")
+                .with_cookies(Service::YouTube, youtube.clone())
+                .with_cookies(Service::Twitch, twitch.clone()),
+        );
 
-        assert_eq!(resolver.youtube_cookies_for_url("https://www.youtube.com/watch?v=1"), None);
-        std::fs::write(&path, "# Netscape HTTP Cookie File\n")
+        assert_eq!(resolver.cookies_for_url("https://www.youtube.com/watch?v=1"), None);
+        std::fs::write(&youtube, "# Netscape HTTP Cookie File\n")
+            .expect("test cookie file can be created");
+        std::fs::write(&twitch, "# Netscape HTTP Cookie File\n")
             .expect("test cookie file can be created");
         assert_eq!(
-            resolver.youtube_cookies_for_url("https://www.youtube.com/watch?v=1"),
-            Some(path.as_path())
+            resolver.cookies_for_url("https://www.youtube.com/watch?v=1"),
+            Some(youtube.as_path())
         );
-        assert_eq!(resolver.youtube_cookies_for_url("https://example.org/video"), None);
-        std::fs::remove_file(path).expect("test cookie file can be removed");
+        assert_eq!(
+            resolver.cookies_for_url("https://www.twitch.tv/channel"),
+            Some(twitch.as_path())
+        );
+        assert_eq!(resolver.cookies_for_url("https://example.org/video"), None);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

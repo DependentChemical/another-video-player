@@ -17,6 +17,7 @@ stream-resolver = { workspace = true }
 settings = { workspace = true }
 ui-kit = { workspace = true }
 video-surface = { workspace = true }
+web-session = { workspace = true }
 ytdlp-tool = { workspace = true }
 updater = { workspace = true }
 slint = { workspace = true }

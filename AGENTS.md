@@ -55,14 +55,20 @@ The ladder:
 | Layer | Crates | May depend on |
 | --- | --- | --- |
 | 0 — vocabulary | `media-model` | nothing |
-| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `ytdlp-tool` | `database`/`media-model` at most |
-| 2 — adapter | `video-surface` | `playback-engine` only |
+| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `web-session`, `ytdlp-tool` | `database`/`media-model` at most |
+| 2 — adapter | `video-surface`, `web-session-view` | one capability each |
 | 3 — composition root | `app-core` | everything |
 
 `video-surface` is the single exception the ladder allows: the mpv render
 context belongs to the player, but it can only be created while a UI toolkit
 holds an OpenGL context. The coupling is deliberate, narrow and documented
 in that crate.
+
+`web-session-view` is the same kind of exception: the webview that signs the
+user in belongs to the sign-in capability, but it can only be created inside
+an event loop of its own. It therefore lives in its own program
+(`flatline-session`), and the player only starts it — it never links the
+browser into the player.
 
 When you add a crate, put it on the ladder and extend the table in
 `xtask/src/isolation.rs` in the same change. The checker reads the real
@@ -114,6 +120,10 @@ for itself when it is missing, and looks for a newer one on every start.
 - `crates/ytdlp-tool` — finds, installs and updates the `yt-dlp` executable.
 - `crates/storyboard` — cuts preview images out of a media with `ffmpeg`.
 - `crates/ui-kit` — the Slint components, the theme and the widgets.
+- `crates/web-session` — knows when a service demands a signed-in session and
+  keeps the Netscape cookie file `yt-dlp` reads.
+- `crates/web-session-view` — the `flatline-session` helper: a Tauri webview
+  that signs the user in and exports the cookies.
 - `xtask` — the build task: dependency provisioning, the isolation check
   and packaging.
 - `.flatline/` — downloaded dependencies. Not part of the repository.
@@ -153,6 +163,9 @@ for itself when it is missing, and looks for a newer one on every start.
 ## Security
 
 - Never commit secrets. `.env` is in `.gitignore`, and so is `.flatline/`.
+- The cookie files under `cache/cookies` and the browser profile under
+  `user-data/` hold the credentials of the signed-in services. Both are in
+  `.gitignore`.
 - The player runs `yt-dlp` with a URL the user typed. It never builds a
   shell command out of it: the URL is passed as a separate argument.
 - Downloaded files land in a directory Flatline owns and are replaced
