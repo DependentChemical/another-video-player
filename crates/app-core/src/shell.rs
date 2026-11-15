@@ -16,7 +16,7 @@ use playback_engine::{EndReason, EngineEvent};
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
-use ui_kit::{PlayerUi, StatusKind};
+use ui_kit::{HistoryListEntry, PlayerUi, QueueListEntry, StatusKind};
 
 use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
@@ -136,18 +136,7 @@ impl Shell {
             let ui_for_load = Rc::clone(&ui);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
-                let Some(url) = requested_url(url.as_str()) else {
-                    return;
-                };
-                if ui_for_load.has_media() {
-                    // Something plays already, so the new URL must not
-                    // interrupt it. A toast says the background is working
-                    // and the dialog appears once the media is resolved.
-                    ui_for_load.show_toast("Parsing video");
-                } else {
-                    loading.borrow_mut().resolve_started();
-                }
-                app.load(url.to_string());
+                start_load(&app, &ui_for_load, &loading, url.as_str());
             });
         }
         {
@@ -184,6 +173,57 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             ui.on_pending_dismissed(move || app.dismiss_pending());
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_requested(move || {
+                let entries: Vec<QueueListEntry> = app
+                    .queue_entries()
+                    .into_iter()
+                    .map(|entry| QueueListEntry {
+                        position: entry.position as i32,
+                        title: entry.title,
+                        uploader: entry.uploader.unwrap_or_default(),
+                        thumbnail: entry.thumbnail.map(PathBuf::from).filter(|path| path.exists()),
+                        current: entry.current,
+                    })
+                    .collect();
+                ui_for_queue.show_queue(&entries);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_history = Rc::clone(&ui);
+            ui.on_history_requested(move || {
+                let entries: Vec<HistoryListEntry> = app
+                    .history_entries()
+                    .into_iter()
+                    .map(|entry| HistoryListEntry {
+                        title: entry.title,
+                        uploader: entry.uploader.unwrap_or_else(|| entry.url.clone()),
+                        url: entry.url,
+                    })
+                    .collect();
+                ui_for_history.show_history(&entries);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            ui.on_queue_item_selected(move |position| {
+                if app.play_queue_entry(position as i64) {
+                    loading.borrow_mut().resolve_started();
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_history = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_history_item_selected(move |url| {
+                start_load(&app, &ui_for_history, &loading, url.as_str());
+            });
         }
         {
             let app = Arc::clone(&app);
@@ -310,6 +350,22 @@ impl Shell {
 fn requested_url(url: &str) -> Option<&str> {
     let url = url.trim();
     (!url.is_empty()).then_some(url)
+}
+
+/// Starts loading a URL for the user, from the bar or from the history.
+fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
+    let Some(url) = requested_url(url) else {
+        return;
+    };
+    if ui.has_media() {
+        // Something plays already, so the new URL must not interrupt it. A
+        // toast says the background is working and the dialog appears once
+        // the media is resolved.
+        ui.show_toast("Parsing video");
+    } else {
+        loading.borrow_mut().resolve_started();
+    }
+    app.load(url.to_string());
 }
 
 /// Chooses the next volume and remembers a nonzero level for the mute button.

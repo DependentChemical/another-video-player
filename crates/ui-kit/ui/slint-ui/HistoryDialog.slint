@@ -1,0 +1,108 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { HistoryItem } from "types.slint";
+
+// The list of videos that were played before, shown from the sidebar.
+export component HistoryDialog inherits Rectangle {
+    in-out property <bool> open: false;
+    in property <[HistoryItem]> items: [];
+    callback item-selected(string);
+    callback dismissed();
+
+    background: #00000088;
+
+    TouchArea {
+        clicked => {
+            root.open = false;
+            root.dismissed();
+        }
+    }
+
+    panel := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: min(root.width - 40px, 520px);
+        height: min(root.height - 40px, 560px);
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000c0;
+
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            Text {
+                text: "History";
+                color: Theme.fg;
+                font-size: 18px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+
+            if root.items.length == 0: Text {
+                text: "There is nothing in the history yet.";
+                color: Theme.muted;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            if root.items.length > 0: ScrollView {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    spacing: 4px;
+
+                    for item in root.items: Rectangle {
+                        height: 60px;
+                        border-radius: 8px;
+                        background: transparent;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: start;
+                            cross-axis-alignment: center;
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                alignment: start;
+
+                                Text {
+                                    height: 20px;
+                                    text: item.title;
+                                    color: Theme.fg;
+                                    font-size: 13px;
+                                    wrap: word-wrap;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    height: 16px;
+                                    text: item.uploader;
+                                    color: Theme.muted;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        TouchArea {
+                            clicked => {
+                                root.open = false;
+                                root.item-selected(item.url);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

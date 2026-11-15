@@ -4,3 +4,21 @@ export struct StreamItem {
     label: string,
     detail: string,
 }
+
+/// One row of the queue dialog.
+export struct QueueItem {
+    /// The position of the entry in the active queue.
+    position: int,
+    title: string,
+    uploader: string,
+    thumbnail: image,
+    /// Whether this is the entry that plays now.
+    current: bool,
+}
+
+/// One row of the history dialog.
+export struct HistoryItem {
+    title: string,
+    uploader: string,
+    url: string,
+}

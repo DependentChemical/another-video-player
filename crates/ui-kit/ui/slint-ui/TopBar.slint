@@ -6,6 +6,7 @@ export component TopBar inherits Rectangle {
     in property <string> app-name: "Flatline";
     callback load-requested();
     callback pointer-activity();
+    callback brand-clicked();
 
     height: Theme.bar-height;
     background: Theme.panel;
@@ -15,18 +16,42 @@ export component TopBar inherits Rectangle {
         spacing: (parent.height - 32px) / 2;
         cross-axis-alignment: center;
 
-        Image {
-            width: 20px;
-            height: 20px;
-            source: @image_url("../../../../resources/flatline-32.png");
-            image-fit: contain;
-        }
+        Rectangle {
+            width: 108px;
+            height: 32px;
+            border-radius: 6px;
+            background: brand-touch.has-hover ? Theme.elevated : transparent;
 
-        Text {
-            text: root.app-name;
-            color: Theme.fg;
-            font-size: 15px;
-            vertical-alignment: center;
+            HorizontalLayout {
+                padding-left: 4px;
+                padding-right: 4px;
+                spacing: 8px;
+                alignment: start;
+                cross-axis-alignment: center;
+
+                Image {
+                    width: 20px;
+                    height: 20px;
+                    source: @image_url("../../../../resources/flatline-32.png");
+                    image-fit: contain;
+                }
+
+                Text {
+                    text: root.app-name;
+                    color: Theme.fg;
+                    font-size: 15px;
+                    vertical-alignment: center;
+                }
+            }
+
+            brand-touch := TouchArea {
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                }
+                clicked => {
+                    root.brand-clicked();
+                }
+            }
         }
 
         url-field := Rectangle {

@@ -9,7 +9,10 @@ import { SourcePicker } from "slint-ui/SourcePicker.slint";
 import { PendingDialog } from "slint-ui/PendingDialog.slint";
 import { ToastList, ToastItem } from "slint-ui/Toast.slint";
 import { SourceColumn } from "slint-ui/SourceColumn.slint";
-import { StreamItem } from "slint-ui/types.slint";
+import { Sidebar } from "slint-ui/Sidebar.slint";
+import { QueueDialog } from "slint-ui/QueueDialog.slint";
+import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
+import { StreamItem, QueueItem, HistoryItem } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
 
@@ -71,6 +74,13 @@ export component MainWindow inherits Window {
     in property <string> update-notes: "";
     in-out property <bool> update-installing: false;
     in property <string> update-error: "";
+    // The drawer that opens under the top bar when the mascot is clicked.
+    in-out property <bool> sidebar-open: false;
+    // The queue and history lists shown from the sidebar.
+    in-out property <bool> queue-open: false;
+    in property <[QueueItem]> queue-items: [];
+    in-out property <bool> history-open: false;
+    in property <[HistoryItem]> history-items: [];
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -89,6 +99,10 @@ export component MainWindow inherits Window {
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
+    callback queue-requested();
+    callback history-requested();
+    callback queue-item-selected(int);
+    callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -187,6 +201,7 @@ export component MainWindow inherits Window {
         url <=> root.url;
         load-requested => { root.load-requested(); }
         pointer-activity => { root.pointer-activity(); }
+        brand-clicked => { root.sidebar-open = !root.sidebar-open; }
     }
 
     // Control bar
@@ -217,6 +232,22 @@ export component MainWindow inherits Window {
         controls-hovered(hovered) => { root.controls-hovered(hovered); }
         interacting-changed(interacting) => { root.interacting-changed(interacting); }
         sources-toggled => { root.toggle-sources(); }
+    }
+
+    // Sidebar drawer, above the video and its overlays.
+    Sidebar {
+        width: parent.width;
+        height: parent.height;
+        open: root.sidebar-open;
+        queue-clicked => {
+            root.sidebar-open = false;
+            root.queue-requested();
+        }
+        history-clicked => {
+            root.sidebar-open = false;
+            root.history-requested();
+        }
+        dismissed => { root.sidebar-open = false; }
     }
 
     // Toast notifications (stacked, max 5)
@@ -258,6 +289,26 @@ export component MainWindow inherits Window {
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
         pending-dismissed => { root.pending-dismissed(); }
+    }
+
+    // Active queue dialog
+    if root.queue-open: QueueDialog {
+        width: parent.width;
+        height: parent.height;
+        items: root.queue-items;
+        open <=> root.queue-open;
+        item-selected(position) => { root.queue-item-selected(position); }
+        dismissed => { root.queue-open = false; }
+    }
+
+    // History dialog
+    if root.history-open: HistoryDialog {
+        width: parent.width;
+        height: parent.height;
+        items: root.history-items;
+        open <=> root.history-open;
+        item-selected(url) => { root.history-item-selected(url); }
+        dismissed => { root.history-open = false; }
     }
 
     if root.update-open: Rectangle {

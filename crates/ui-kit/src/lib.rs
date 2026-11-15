@@ -10,7 +10,7 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use slint::{ComponentHandle, Model};
 
@@ -69,6 +69,32 @@ pub struct SourceLists {
     pub audio: Vec<SourceOption>,
     /// Streams that carry both tracks in one file.
     pub muxed: Vec<SourceOption>,
+}
+
+/// One entry of the active queue shown in the queue dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueListEntry {
+    /// The position of the entry in the active queue.
+    pub position: i32,
+    /// Human readable title of the media.
+    pub title: String,
+    /// The channel or uploader of the media.
+    pub uploader: String,
+    /// A cached thumbnail on disk, when one is available.
+    pub thumbnail: Option<PathBuf>,
+    /// Whether this is the entry that plays now.
+    pub current: bool,
+}
+
+/// One entry of the playback history shown in the history dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryListEntry {
+    /// Human readable title of the media.
+    pub title: String,
+    /// The channel or uploader of the media, or its URL as a fallback.
+    pub uploader: String,
+    /// The URL the media can be resolved from again.
+    pub url: String,
 }
 
 /// The player window.
@@ -305,6 +331,43 @@ impl PlayerUi {
         self.window.set_pending_open(false);
     }
 
+    /// Shows the active queue in a list over the video.
+    ///
+    /// Only thumbnails that exist on disk are decoded; a missing file simply
+    /// leaves the placeholder in the row.
+    pub fn show_queue(&self, entries: &[QueueListEntry]) {
+        let items: Vec<QueueItem> = entries
+            .iter()
+            .map(|entry| QueueItem {
+                position: entry.position,
+                title: entry.title.as_str().into(),
+                uploader: entry.uploader.as_str().into(),
+                thumbnail: entry
+                    .thumbnail
+                    .as_deref()
+                    .and_then(|path| slint::Image::load_from_path(path).ok())
+                    .unwrap_or_default(),
+                current: entry.current,
+            })
+            .collect();
+        self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.window.set_queue_open(true);
+    }
+
+    /// Shows the playback history in a list over the video.
+    pub fn show_history(&self, entries: &[HistoryListEntry]) {
+        let items: Vec<HistoryItem> = entries
+            .iter()
+            .map(|entry| HistoryItem {
+                title: entry.title.as_str().into(),
+                uploader: entry.uploader.as_str().into(),
+                url: entry.url.as_str().into(),
+            })
+            .collect();
+        self.window.set_history_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.window.set_history_open(true);
+    }
+
     /// Shows the release notes and available version.
     pub fn show_update(&self, version: &str, notes: &str) {
         self.window.set_update_version(version.into());
@@ -420,6 +483,30 @@ impl PlayerUi {
     pub fn on_update_dismissed(&self, handler: impl Fn() + 'static) {
         self.window.on_update_dismissed(handler);
     }
+
+    /// Called when the user asks for the active queue.
+    pub fn on_queue_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_queue_requested(handler);
+    }
+
+    /// Called when the user asks for the playback history.
+    pub fn on_history_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_history_requested(handler);
+    }
+
+    /// Called when the user picks an entry of the active queue.
+    ///
+    /// The argument is the position of the entry in the queue.
+    pub fn on_queue_item_selected(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_item_selected(handler);
+    }
+
+    /// Called when the user picks a history entry.
+    ///
+    /// The argument is the URL of the entry, ready to be resolved again.
+    pub fn on_history_item_selected(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_history_item_selected(move |url| handler(url.to_string()));
+    }
 }
 
 /// Converts host options into the model Slint understands.
@@ -452,5 +539,23 @@ mod tests {
         ui.set_media_uploader("Test Channel");
         assert_eq!(ui.window().get_media_title(), "Test Video Title");
         assert_eq!(ui.window().get_media_uploader(), "Test Channel");
+
+        ui.show_queue(&[QueueListEntry {
+            position: 0,
+            title: "First".to_string(),
+            uploader: "Uploader".to_string(),
+            thumbnail: None,
+            current: true,
+        }]);
+        assert!(ui.window().get_queue_open());
+        assert_eq!(ui.window().get_queue_items().row_count(), 1);
+
+        ui.show_history(&[HistoryListEntry {
+            title: "First".to_string(),
+            uploader: "Uploader".to_string(),
+            url: "https://example.com/video".to_string(),
+        }]);
+        assert!(ui.window().get_history_open());
+        assert_eq!(ui.window().get_history_items().row_count(), 1);
     }
 }

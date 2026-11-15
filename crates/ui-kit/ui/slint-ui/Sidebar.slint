@@ -1,0 +1,114 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "../widgets.slint";
+
+// The drawer that opens under the top bar when the mascot is clicked.
+//
+// The component covers the whole window so a click anywhere outside the
+// panel dismisses it. The panel itself slides in from the left edge.
+export component Sidebar inherits Rectangle {
+    in property <bool> open: false;
+    callback queue-clicked();
+    callback history-clicked();
+    callback dismissed();
+
+    background: transparent;
+
+    outside := TouchArea {
+        enabled: root.open;
+        clicked => {
+            root.dismissed();
+        }
+    }
+
+    panel := Rectangle {
+        x: root.open ? 0px : -self.width;
+        y: Theme.bar-height;
+        width: 232px;
+        height: root.height - Theme.bar-height;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #00000080;
+
+        animate x {
+            duration: 180ms;
+            easing: ease-out;
+        }
+
+        // Swallows clicks on the empty part of the panel.
+        TouchArea { }
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 4px;
+            alignment: start;
+
+            Rectangle {
+                height: 44px;
+                border-radius: 8px;
+                background: queue-touch.has-hover ? Theme.elevated : transparent;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    alignment: start;
+                    cross-axis-alignment: center;
+
+                    Icon {
+                        glyph: "\u{e03d}";
+                        size: 20px;
+                        ink: queue-touch.has-hover ? Theme.fg : Theme.muted;
+                    }
+
+                    Text {
+                        text: "Queue";
+                        color: Theme.fg;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                queue-touch := TouchArea {
+                    clicked => {
+                        root.queue-clicked();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: 8px;
+                background: history-touch.has-hover ? Theme.elevated : transparent;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    alignment: start;
+                    cross-axis-alignment: center;
+
+                    Icon {
+                        glyph: "\u{e889}";
+                        size: 20px;
+                        ink: history-touch.has-hover ? Theme.fg : Theme.muted;
+                    }
+
+                    Text {
+                        text: "History";
+                        color: Theme.fg;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                history-touch := TouchArea {
+                    clicked => {
+                        root.history-clicked();
+                    }
+                }
+            }
+        }
+    }
+}

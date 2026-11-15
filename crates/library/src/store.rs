@@ -343,6 +343,32 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Moves the current mark to the entry at `position`.
+    ///
+    /// This is what a click in the queue list uses to continue from another
+    /// entry. A position that is not in the queue leaves the mark untouched.
+    pub fn set_current(&self, position: i64) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                let exists: Option<i64> = connection
+                    .query_row(
+                        "SELECT position FROM active_queue WHERE position = ?1",
+                        params![position],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if exists.is_some() {
+                    connection.execute("UPDATE active_queue SET current = 0", [])?;
+                    connection.execute(
+                        "UPDATE active_queue SET current = 1 WHERE position = ?1",
+                        params![position],
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
     /// Replaces the thumbnail of an entry.
     pub fn set_thumbnail(&self, position: i64, thumbnail: Option<&str>) -> Result<(), Error> {
         self.db
@@ -688,6 +714,32 @@ mod tests {
         let first = queue.advance().expect("advance works").expect("one entry");
         assert_eq!(first.url, "https://example.com/a");
         assert!(first.current);
+    }
+
+    #[test]
+    fn set_current_moves_the_mark_to_the_chosen_entry() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+
+        queue.set_current(1).expect("set current works");
+        assert_eq!(
+            queue.current().expect("current works").expect("one entry").url,
+            "https://example.com/b"
+        );
+        assert!(!queue.entries().expect("entries work")[0].current);
+    }
+
+    #[test]
+    fn set_current_ignores_a_position_that_is_not_in_the_queue() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+
+        queue.set_current(99).expect("set current works");
+        assert_eq!(
+            queue.current().expect("current works").expect("one entry").url,
+            "https://example.com/a"
+        );
     }
 
     #[test]

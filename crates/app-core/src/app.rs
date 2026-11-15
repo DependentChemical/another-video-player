@@ -528,6 +528,43 @@ impl App {
         }
     }
 
+    /// Returns every entry of the active queue, in play order.
+    pub fn queue_entries(&self) -> Vec<library::QueueEntry> {
+        match self.queue.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Returns every history entry, most recently played first.
+    pub fn history_entries(&self) -> Vec<library::HistoryEntry> {
+        match self.queue.history_all() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the history could not be read: {error}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Starts the entry at `position` and marks it as the current one.
+    pub fn play_queue_entry(&self, position: i64) -> bool {
+        match self.queue.set_current(position) {
+            Ok(()) => {
+                self.clear_retry();
+                self.consume_current();
+                true
+            }
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                false
+            }
+        }
+    }
+
     /// Asks the current queue entry to be consumed.
     ///
     /// The URL is read from the queue, so callers cannot supply a player URL.
