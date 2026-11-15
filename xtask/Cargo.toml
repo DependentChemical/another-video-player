@@ -9,9 +9,13 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }
-sevenz-rust2 = "0.25"
 ytdlp-tool = { workspace = true }
 zip = { workspace = true }
+
+# Only the Windows dependency provisioning uses these; on the other
+# platforms they would be flagged as unused dependencies.
+[target.'cfg(windows)'.dependencies]
+serde = { workspace = true }
+sevenz-rust2 = "0.25"

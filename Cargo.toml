@@ -30,7 +30,6 @@ authors = ["Flatline contributors"]
 
 [workspace.dependencies]
 # --- internal crates (see AGENTS.md "Crate isolation") -------------------------
-app-core = { path = "crates/app-core" }
 database = { path = "crates/database" }
 image-process = { path = "crates/image-process" }
 library = { path = "crates/library" }
@@ -42,7 +41,6 @@ stream-resolver = { path = "crates/stream-resolver" }
 ui-kit = { path = "crates/ui-kit" }
 video-surface = { path = "crates/video-surface" }
 web-session = { path = "crates/web-session" }
-web-session-view = { path = "crates/web-session-view" }
 ytdlp-tool = { path = "crates/ytdlp-tool" }
 updater = { path = "crates/updater" }
 
