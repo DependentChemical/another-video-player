@@ -4,7 +4,7 @@ export component Toast inherits Rectangle {
     in property <string> toast-text: "";
     in property <bool> toast-visible: false;
     in property <length> controls-height: 56px;
-    in property <length> toast-max-width: 480px;
+    in property <length> toast-max-width: 380px;
 
     if root.toast-visible: Rectangle {
         x: parent.width - self.width - 20px;
@@ -31,7 +31,7 @@ export component Toast inherits Rectangle {
             }
 
             Text {
-                width: Math.min(root.toast-max-width - 42px, 438px);
+                width: Math.min(root.toast-max-width - 42px, 338px);
                 text: root.toast-text;
                 color: Theme.fg;
                 font-size: 13px;
