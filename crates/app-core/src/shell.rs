@@ -392,7 +392,9 @@ fn tick(
                 *update_slot.borrow_mut() = Some(update);
             }
             Message::UpdateFailed(error) => ui.show_update_error(&error),
-            Message::Problem(text) => loading.problem(text),
+            Message::Problem(text) => {
+                ui.show_toast(&text);
+            }
         }
     }
 
