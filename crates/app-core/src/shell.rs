@@ -371,11 +371,12 @@ fn tick(
             }
             Message::Resolved(Err(error)) => {
                 ui.hide_toast();
+                loading.resolve_failed(error.clone());
                 // Schedule a retry for resolver errors
                 if let Some(url) = app.resolving_url() {
                     app.handle_resolver_error(url, error);
                 } else {
-                    loading.resolve_failed(error);
+                    ui.show_toast(&error);
                 }
             }
             Message::Pending(Ok(pending)) => {
@@ -385,7 +386,7 @@ fn tick(
             }
             Message::Pending(Err(error)) => {
                 ui.hide_toast();
-                loading.problem(error);
+                ui.show_toast(&error);
             }
             Message::ToolUpdated(path) => {
                 if !loading.tool_updated(&path) {
@@ -429,7 +430,9 @@ fn tick(
     match loading.status() {
         loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
         loading::Status::Info(text) => ui.set_status(text, StatusKind::Info),
-        loading::Status::Error(text) => ui.set_status(text, StatusKind::Error),
+        loading::Status::Error(_) => {
+            // Errors are shown as toasts when they occur; don't show on video.
+        }
     }
 
     // The time axis of a live stream is the window behind the live edge, so
