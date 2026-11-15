@@ -37,25 +37,24 @@ export component TopBar inherits Rectangle {
             border-color: url-input.has-focus ? Theme.accent : Theme.border;
             background: Theme.elevated;
 
-            HorizontalLayout {
-                padding: 10px;
-                cross-axis-alignment: center;
+            padding: 10px;
 
-                url-placeholder := Text {
-                    text: "Paste a video URL and press Enter";
-                    color: Theme.muted;
-                    font-size: 13px;
-                    visible: url-input.text == "";
-                }
+            url-placeholder := Text {
+                text: "Paste a video URL and press Enter";
+                color: Theme.muted;
+                font-size: 13px;
+                vertical-alignment: center;
+                visible: url-input.text == "" && !url-input.has-focus;
+            }
 
-                url-input := TextInput {
-                    horizontal-stretch: 1;
-                    text <=> root.url;
-                    color: Theme.fg;
-                    font-size: 13px;
-                    accepted => {
-                        root.load-requested();
-                    }
+            url-input := TextInput {
+                horizontal-stretch: 1;
+                text <=> root.url;
+                color: Theme.fg;
+                font-size: 13px;
+                vertical-alignment: center;
+                accepted => {
+                    root.load-requested();
                 }
             }
         }
