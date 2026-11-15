@@ -470,11 +470,16 @@ impl App {
         {
             crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
         }
-        Some(self.accept_current_source(source, url))
+        Some(self.accept_current_source(source, url, &current))
     }
 
     /// Builds playback state for the source already authorized by the queue.
-    fn accept_current_source(&self, source: MediaSource, url: &str) -> Loaded {
+    fn accept_current_source(
+        &self,
+        source: MediaSource,
+        url: &str,
+        current: &library::QueueEntry,
+    ) -> Loaded {
         let sources = source_lists(&source);
         let default = self
             .settings
@@ -485,6 +490,23 @@ impl App {
             })
             .ok();
         let (video, audio, muxed) = default.as_ref().map(selection_of).unwrap_or_default();
+
+        // Use saved selection from queue if available, otherwise use defaults
+        let saved_video = current
+            .selected_video
+            .as_deref()
+            .and_then(|s| parse_saved_selection(s, &source, false));
+        let saved_audio =
+            current.selected_audio.as_deref().and_then(|s| parse_saved_selection(s, &source, true));
+        let saved_muxed = current
+            .selected_muxed
+            .as_deref()
+            .and_then(|s| parse_saved_selection(s, &source, false));
+
+        let video = saved_video.or(video);
+        let audio = saved_audio.or(audio);
+        let muxed = saved_muxed.or(muxed);
+
         let loaded = Loaded {
             title: source.title.clone(),
             duration: source.duration,
@@ -593,9 +615,26 @@ impl App {
         self.live.lock().expect("the live axis is not poisoned").reset();
 
         let mut state = self.state.lock().expect("the state is not poisoned");
-        state.selected_video = video;
-        state.selected_audio = audio;
-        state.selected_muxed = muxed;
+        state.selected_video = video.clone();
+        state.selected_audio = audio.clone();
+        state.selected_muxed = muxed.clone();
+
+        // Save the selection to the queue
+        if let Ok(Some(current)) = self.queue.current() {
+            let source = state.source.as_ref().expect("source should exist");
+            let video_formatted =
+                video.as_ref().and_then(|id| format_saved_selection(id, source, false));
+            let audio_formatted =
+                audio.as_ref().and_then(|id| format_saved_selection(id, source, true));
+            let muxed_formatted =
+                muxed.as_ref().and_then(|id| format_saved_selection(id, source, false));
+            let _ = self.queue.set_selected_sources(
+                current.position,
+                video_formatted.as_deref(),
+                audio_formatted.as_deref(),
+                muxed_formatted.as_deref(),
+            );
+        }
     }
 
     /// Switches between playing and paused.
@@ -912,6 +951,39 @@ fn selection_of(plan: &PlaybackPlan) -> (Option<String>, Option<String>, Option<
             plan.audio.as_ref().map(|audio| audio.format_id.clone()),
             None,
         )
+    }
+}
+
+/// Parses a saved selection string (format "ID|value") and verifies the stream
+/// still exists in the source. Returns the format_id if valid.
+fn parse_saved_selection(saved: &str, source: &MediaSource, is_audio: bool) -> Option<String> {
+    let parts: Vec<&str> = saved.split('|').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let format_id = parts[0];
+    let _value = parts[1]; // We could verify this matches, but just check ID exists
+
+    if is_audio {
+        source.audio_streams.iter().find(|s| s.format_id == format_id).map(|s| s.format_id.clone())
+    } else {
+        source.video_streams.iter().find(|s| s.format_id == format_id).map(|s| s.format_id.clone())
+    }
+}
+
+/// Formats a selection as "ID|value" for storage. Value is height for video/muxed,
+/// bitrate for audio.
+fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool) -> Option<String> {
+    if is_audio {
+        source.audio_streams.iter().find(|s| s.format_id == format_id).map(|s| {
+            let bitrate = s.bitrate.unwrap_or(0);
+            format!("{}|{}", format_id, bitrate)
+        })
+    } else {
+        source.video_streams.iter().find(|s| s.format_id == format_id).map(|s| {
+            let height = s.height.unwrap_or(0);
+            format!("{}|{}", format_id, height)
+        })
     }
 }
 

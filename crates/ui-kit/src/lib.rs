@@ -197,9 +197,12 @@ impl PlayerUi {
         audio: Option<&str>,
         muxed: Option<&str>,
     ) {
-        self.window.set_selected_video_id(video.unwrap_or_default().into());
-        self.window.set_selected_audio_id(audio.unwrap_or_default().into());
-        self.window.set_selected_muxed_id(muxed.unwrap_or_default().into());
+        let video = video.unwrap_or_default();
+        let audio = audio.unwrap_or_default();
+        let muxed = muxed.unwrap_or_default();
+        self.window.set_selected_video_id(video.into());
+        self.window.set_selected_audio_id(audio.into());
+        self.window.set_selected_muxed_id(muxed.into());
     }
 
     /// Whether a media is loaded.

@@ -9,7 +9,7 @@ use crate::Error;
 
 /// The columns every queue query reads, in the order [`entry_from_row`]
 /// expects.
-const COLUMNS: &str = "position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, resolved_source, resolved_at";
+const COLUMNS: &str = "position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, resolved_source, resolved_at, selected_video, selected_audio, selected_muxed";
 
 /// One item of the active queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,12 @@ pub struct QueueEntry {
     pub resolved_source: Option<String>,
     /// Unix timestamp when the resolver result was created.
     pub resolved_at: Option<i64>,
+    /// The currently selected video-only stream (format_id|height).
+    pub selected_video: Option<String>,
+    /// The currently selected audio-only stream (format_id|bitrate).
+    pub selected_audio: Option<String>,
+    /// The currently selected combined stream (format_id|height).
+    pub selected_muxed: Option<String>,
 }
 
 /// A history entry tracking playback position for a video.
@@ -98,7 +104,10 @@ impl Queue {
                         id_hash TEXT NOT NULL DEFAULT '',
                         current INTEGER NOT NULL DEFAULT 0,
                         resolved_source TEXT,
-                        resolved_at INTEGER
+                        resolved_at INTEGER,
+                        selected_video TEXT,
+                        selected_audio TEXT,
+                        selected_muxed TEXT
                     );
                     CREATE TABLE IF NOT EXISTS history (
                         id_hash TEXT PRIMARY KEY,
@@ -116,6 +125,9 @@ impl Queue {
                 ensure_column(connection, "id_hash", "TEXT NOT NULL DEFAULT ''")?;
                 ensure_column(connection, "resolved_source", "TEXT")?;
                 ensure_column(connection, "resolved_at", "INTEGER")?;
+                ensure_column(connection, "selected_video", "TEXT")?;
+                ensure_column(connection, "selected_audio", "TEXT")?;
+                ensure_column(connection, "selected_muxed", "TEXT")?;
                 // Create indexes after columns exist
                 connection.execute_batch(
                     "CREATE INDEX IF NOT EXISTS active_queue_position
@@ -191,10 +203,13 @@ impl Queue {
                     current: count == 0,
                     resolved_source: None,
                     resolved_at: None,
+                    selected_video: None,
+                    selected_audio: None,
+                    selected_muxed: None,
                 };
                 connection.execute(
-                    "INSERT INTO active_queue (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO active_queue (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, selected_video, selected_audio, selected_muxed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         entry.position,
                         entry.url,
@@ -203,7 +218,10 @@ impl Queue {
                         entry.thumbnail_url,
                         entry.uploader,
                         entry.id_hash,
-                        entry.current as i64
+                        entry.current as i64,
+                        entry.selected_video,
+                        entry.selected_audio,
+                        entry.selected_muxed,
                     ],
                 )?;
                 Ok(entry)
@@ -243,10 +261,13 @@ impl Queue {
                     current: true,
                     resolved_source: None,
                     resolved_at: None,
+                    selected_video: None,
+                    selected_audio: None,
+                    selected_muxed: None,
                 };
                 connection.execute(
-                    "INSERT INTO active_queue (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT INTO active_queue (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, selected_video, selected_audio, selected_muxed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         entry.position,
                         entry.url,
@@ -255,7 +276,10 @@ impl Queue {
                         entry.thumbnail_url,
                         entry.uploader,
                         entry.id_hash,
-                        entry.current as i64
+                        entry.current as i64,
+                        entry.selected_video,
+                        entry.selected_audio,
+                        entry.selected_muxed,
                     ],
                 )?;
                 Ok(entry)
@@ -365,6 +389,26 @@ impl Queue {
                     "UPDATE active_queue
                      SET resolved_source = ?2, resolved_at = ?3 WHERE position = ?1",
                     params![position, source, resolved_at],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
+    /// Updates the selected streams for an entry.
+    pub fn set_selected_sources(
+        &self,
+        position: i64,
+        video: Option<&str>,
+        audio: Option<&str>,
+        muxed: Option<&str>,
+    ) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE active_queue
+                     SET selected_video = ?2, selected_audio = ?3, selected_muxed = ?4 WHERE position = ?1",
+                    params![position, video, audio, muxed],
                 )?;
                 Ok(())
             })
@@ -507,6 +551,9 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
         current: row.get::<_, i64>(7)? != 0,
         resolved_source: row.get(8)?,
         resolved_at: row.get(9)?,
+        selected_video: row.get(10)?,
+        selected_audio: row.get(11)?,
+        selected_muxed: row.get(12)?,
     })
 }
 
