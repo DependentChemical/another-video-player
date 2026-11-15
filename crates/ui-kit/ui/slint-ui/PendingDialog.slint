@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { FlatButton } from "../widgets.slint";
+import { CloseButton, FlatButton } from "../widgets.slint";
 
 export component PendingDialog inherits Rectangle {
     in property <string> pending-title: "";
@@ -37,6 +37,17 @@ export component PendingDialog inherits Rectangle {
         VerticalLayout {
             padding: 16px;
             spacing: 12px;
+
+            HorizontalLayout {
+                alignment: end;
+
+                CloseButton {
+                    clicked => {
+                        root.pending-open = false;
+                        root.pending-dismissed();
+                    }
+                }
+            }
 
             Rectangle {
                 height: 200px;

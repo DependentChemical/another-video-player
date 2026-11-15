@@ -1,5 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
+import { CloseButton } from "../widgets.slint";
 import { HistoryItem } from "types.slint";
 
 // The list of videos that were played before, shown from the sidebar.
@@ -36,12 +37,23 @@ export component HistoryDialog inherits Rectangle {
             padding: 16px;
             spacing: 12px;
 
-            Text {
-                text: "History";
-                color: Theme.fg;
-                font-size: 18px;
-                font-weight: 600;
-                vertical-alignment: center;
+            HorizontalLayout {
+                alignment: space-between;
+
+                Text {
+                    text: "History";
+                    color: Theme.fg;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                CloseButton {
+                    clicked => {
+                        root.open = false;
+                        root.dismissed();
+                    }
+                }
             }
 
             if root.items.length == 0: Text {

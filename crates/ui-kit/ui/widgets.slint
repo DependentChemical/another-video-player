@@ -87,6 +87,45 @@ export component ReplayIcon inherits Icon {
     glyph: "\u{e059}";
 }
 
+// The cross that marks the close button.
+export component CloseIcon inherits Icon {
+    glyph: "\u{e5cd}";
+    size: 16px;
+    ink: Theme.muted;
+}
+
+// The button that closes a dialog.
+//
+// It sits in the upper right corner of a modal and carries the same size as
+// the other small square buttons, so a dialog and the bars share one rhythm.
+export component CloseButton inherits Rectangle {
+    callback clicked();
+    callback pointer-activity();
+
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
+
+    CloseIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: touch.has-hover ? Theme.fg : Theme.muted;
+    }
+
+    touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 // A flat button with a text label.
 export component FlatButton inherits Rectangle {
     in property <string> label: "";
