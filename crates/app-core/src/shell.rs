@@ -146,6 +146,7 @@ impl Shell {
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
                     ui_for_pending.hide_toast();
+                    ui_for_pending.set_url("");
                     ui_for_pending.set_media_title(&loaded.title);
                     ui_for_pending
                         .set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
@@ -166,8 +167,10 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
             ui.on_pending_queue(move || {
                 let _ = app.queue_pending();
+                ui_for_pending.set_url("");
             });
         }
         {

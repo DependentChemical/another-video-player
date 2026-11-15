@@ -557,5 +557,11 @@ mod tests {
         }]);
         assert!(ui.window().get_history_open());
         assert_eq!(ui.window().get_history_items().row_count(), 1);
+
+        // The host clears the URL entry once it has been processed.
+        ui.set_url("https://example.com/video");
+        assert_eq!(ui.window().get_url(), "https://example.com/video");
+        ui.set_url("");
+        assert_eq!(ui.window().get_url(), "");
     }
 }
