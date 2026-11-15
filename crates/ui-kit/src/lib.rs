@@ -193,6 +193,11 @@ impl PlayerUi {
         self.window.set_media_title(title.into());
     }
 
+    /// The application version to show in the window title.
+    pub fn set_app_version(&self, version: &str) {
+        self.window.set_app_version(version.into());
+    }
+
     /// The channel or uploader of the media that is playing.
     pub fn set_media_uploader(&self, uploader: &str) {
         self.window.set_media_uploader(uploader.into());

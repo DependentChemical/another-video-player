@@ -38,6 +38,7 @@ impl Shell {
     /// Builds the window and connects it to the application.
     pub fn new(app: Arc<App>, program_dir: PathBuf) -> Result<Shell, Error> {
         let ui = Rc::new(PlayerUi::new().map_err(|error| Error::Ui(error.to_string()))?);
+        ui.set_app_version(crate::VERSION);
         let icon = image::load_from_memory(include_bytes!("../../../resources/flatline-256.png"))
             .map_err(|error| Error::Ui(format!("the window icon could not be decoded: {error}")))?
             .into_rgba8();
