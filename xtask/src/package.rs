@@ -26,7 +26,10 @@ pub fn package() -> Result<PathBuf, String> {
     }
     let session_helper = root.join("target").join("release").join(session_helper_name());
     if !session_helper.is_file() {
-        return Err("there is no release build of the sign-in helper yet; run `cargo xtask build` first".to_string());
+        return Err(
+            "there is no release build of the sign-in helper yet; run `cargo xtask build` first"
+                .to_string(),
+        );
     }
 
     let distribution = root.join("dist");

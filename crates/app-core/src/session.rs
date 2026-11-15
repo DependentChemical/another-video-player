@@ -55,12 +55,20 @@ impl Session {
 
     /// Signs in to a service and waits for the cookie file to be written.
     ///
-    /// A URL is only offered once: a second attempt for the same URL would
-    /// open the sign-in window again, and the user already said no.
+    /// A URL is only offered once per challenge: the helper runs in the
+    /// foreground of this call, so the retry loop cannot schedule another
+    /// attempt until the user has finished or closed the window. The URL is
+    /// released afterwards so a later challenge can ask again.
     pub fn sign_in(&self, service: Service, target: &str) -> Result<(), Error> {
         if !self.offer(target) {
             return Err(Error::AlreadyOffered);
         }
+        let result = self.run_sign_in(service, target);
+        self.release(target);
+        result
+    }
+
+    fn run_sign_in(&self, service: Service, target: &str) -> Result<(), Error> {
         if !self.is_available() {
             return Err(Error::Missing(self.helper.clone()));
         }
@@ -91,7 +99,7 @@ impl Session {
         }
     }
 
-    /// Remembers that a sign-in was offered for a URL.
+    /// Remembers that a sign-in is in progress for a URL.
     ///
     /// Returns whether this is the first offer.
     fn offer(&self, target: &str) -> bool {
@@ -99,6 +107,13 @@ impl Session {
             return true;
         };
         attempts.insert(target.to_string())
+    }
+
+    /// Allows the same URL to be offered again on a later challenge.
+    fn release(&self, target: &str) {
+        if let Ok(mut attempts) = self.attempts.lock() {
+            attempts.remove(target);
+        }
     }
 }
 
@@ -170,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn a_url_is_only_offered_once() {
+    fn a_url_can_be_offered_again_after_the_attempt_finishes() {
         let session = Session::new(
             "there-is-no-helper-here".into(),
             "cache/cookies".into(),
@@ -179,8 +194,9 @@ mod tests {
         let url = "https://www.youtube.com/watch?v=1";
         let first = session.sign_in(Service::YouTube, url).expect_err("the helper is missing");
         assert!(matches!(first, super::Error::Missing(_)));
-        let second = session.sign_in(Service::YouTube, url).expect_err("it was offered before");
-        assert!(matches!(second, super::Error::AlreadyOffered));
+        let second =
+            session.sign_in(Service::YouTube, url).expect_err("the helper is still missing");
+        assert!(matches!(second, super::Error::Missing(_)));
     }
 
     #[test]

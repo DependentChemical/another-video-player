@@ -1425,9 +1425,12 @@ fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
 
 /// Resolves a URL and asks the user to sign in when the service demands it.
 ///
-/// Only a sign-in challenge starts a browser; every other failure is handed
-/// to the caller as it is. The sign-in runs in a helper program, so the
-/// player keeps running while the user signs in.
+/// A sign-in challenge pauses this resolve: the helper runs before the retry
+/// loop is told about the failure, so the user can finish or close the
+/// window first. A successful sign-in is followed by one fresh resolve; if the
+/// user closes the window or the helper cannot run, the original challenge is
+/// returned so the normal retry flow can continue and a later challenge can
+/// ask again.
 fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
@@ -1443,8 +1446,8 @@ fn resolve_with_session(
     };
     // The helper opens a window of its own; the player says why it is there.
     let _ = notice.send(Box::new(Message::SigningIn(service)));
-    if let Err(problem) = session.sign_in(service, url) {
-        return Err(format!("{error} ({problem})"));
+    if session.sign_in(service, url).is_err() {
+        return Err(error);
     }
     resolver.resolve(url).map_err(|error| error.to_string())
 }
