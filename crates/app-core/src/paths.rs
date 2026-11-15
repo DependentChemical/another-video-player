@@ -106,11 +106,25 @@ impl AppPaths {
     }
 
     /// Creates the directories Flatline needs.
+    ///
+    /// Also clears any orphaned stream-buffer files that a crash or unclean
+    /// shutdown may have left behind.
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.tools())?;
         std::fs::create_dir_all(self.thumbnails())?;
         std::fs::create_dir_all(self.cache())?;
         std::fs::create_dir_all(self.stream_buffer())?;
+        // Best-effort cleanup of stale cache files from a previous run.
+        if let Ok(entries) = std::fs::read_dir(self.stream_buffer()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
         Ok(())
     }
 }

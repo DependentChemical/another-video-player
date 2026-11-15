@@ -286,10 +286,11 @@ impl App {
     /// Creates the application around a `yt-dlp` installation.
     pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
         let stream_buffer = paths.stream_buffer();
+        // Crash or unclean shutdown may have left cache files behind.
+        // Clear them before creating the engine so mpv never sees stale data.
+        clear_stream_buffer(&stream_buffer);
         let engine =
             Engine::new(&stream_buffer).map_err(|error| Error::Engine(error.to_string()))?;
-        // A cache from an earlier run belongs to a media nobody plays now.
-        clear_stream_buffer(&stream_buffer);
         let youtube_cookies = paths.youtube_cookies();
         let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
         let settings =
