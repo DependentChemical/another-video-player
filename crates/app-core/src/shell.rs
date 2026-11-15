@@ -136,6 +136,9 @@ impl Shell {
             let ui_for_load = Rc::clone(&ui);
             ui.on_load(move |url| {
                 last_pointer_activity.set(Instant::now());
+                let Some(url) = requested_url(url.as_str()) else {
+                    return;
+                };
                 if ui_for_load.has_media() {
                     // Something plays already, so the new URL must not
                     // interrupt it. A toast says the background is working
@@ -144,7 +147,7 @@ impl Shell {
                 } else {
                     loading.borrow_mut().resolve_started();
                 }
-                app.load(url);
+                app.load(url.to_string());
             });
         }
         {
@@ -278,6 +281,9 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        let Some(url) = requested_url(url) else {
+            return;
+        };
         self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
         self.loading.borrow_mut().resolve_started();
@@ -295,6 +301,15 @@ impl Shell {
     pub fn app(&self) -> &Arc<App> {
         &self.app
     }
+}
+
+/// Returns the URL to load, or `None` when the user submitted only whitespace.
+///
+/// Starting a resolution for an empty field would leave the spinner on with
+/// nothing to wait for.
+fn requested_url(url: &str) -> Option<&str> {
+    let url = url.trim();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Chooses the next volume and remembers a nonzero level for the mute button.
@@ -351,6 +366,12 @@ fn tick(
                     crate::diag::note(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
+                    // The spinner belongs to that discarded result; without
+                    // this it would keep claiming the app is resolving.
+                    loading.resolve_failed(
+                        "the resolved video is no longer in the active queue".to_string(),
+                    );
+                    ui.show_toast("The resolved video is no longer in the active queue");
                     continue;
                 };
                 ui.hide_toast();
@@ -399,9 +420,13 @@ fn tick(
             }
             Message::UpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => {
+                if loading.is_busy() {
+                    loading.problem(text.clone());
+                }
                 ui.show_toast(&text);
             }
             Message::RetryScheduled { error, delay_seconds, kind } => {
+                loading.retry_scheduled();
                 let prefix = match kind {
                     RetryKind::Resolver => "retrying yt-dlp",
                     RetryKind::Playback => "retrying playback",
@@ -412,8 +437,16 @@ fn tick(
         }
     }
 
-    // Check for pending retries
-    app.check_retries();
+    // Check for pending retries and show progress while the next attempt runs.
+    if let Some(kind) = app.check_retries() {
+        // The scheduled-retry toast only describes the wait; once the wait is
+        // over the spinner says what is happening now.
+        ui.hide_toast();
+        match kind {
+            RetryKind::Resolver | RetryKind::SourceSelection => loading.resolve_started(),
+            RetryKind::Playback => loading.resolved(),
+        }
+    }
 
     drain_engine_events(app, loading);
 
@@ -430,9 +463,7 @@ fn tick(
     match loading.status() {
         loading::Status::Busy(text) => ui.set_status(text, StatusKind::Busy),
         loading::Status::Info(text) => ui.set_status(text, StatusKind::Info),
-        loading::Status::Error(_) => {
-            // Errors are shown as toasts when they occur; don't show on video.
-        }
+        loading::Status::Error(_) => ui.set_status("", StatusKind::Info),
     }
 
     // The time axis of a live stream is the window behind the live edge, so
@@ -508,9 +539,24 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::{
-        player_to_slider_volume, slider_to_player_volume, slider_volume_changed, toggle_mute,
+        player_to_slider_volume, requested_url, slider_to_player_volume, slider_volume_changed,
+        toggle_mute,
     };
     use std::cell::Cell;
+
+    #[test]
+    fn a_blank_url_is_not_loaded() {
+        assert_eq!(requested_url("   \n\t "), None);
+        assert_eq!(requested_url(""), None);
+    }
+
+    #[test]
+    fn a_url_is_trimmed_before_it_is_loaded() {
+        assert_eq!(
+            requested_url("  https://example.com/video  "),
+            Some("https://example.com/video")
+        );
+    }
 
     #[test]
     fn mute_restores_the_previous_volume_once() {

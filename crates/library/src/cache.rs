@@ -8,11 +8,16 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::Error;
 use image_process::normalize_to_jpeg;
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
+
+/// A thumbnail is a preview, not the media: it must never keep a resolution
+/// waiting on a stalled server.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The extensions a downloaded thumbnail may have (used for the temp file).
 const DOWNLOAD_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
@@ -59,6 +64,9 @@ impl ThumbnailCache {
         {
             let mut response = ureq::get(url)
                 .header("User-Agent", USER_AGENT)
+                .config()
+                .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                .build()
                 .call()
                 .map_err(|error| Error::Http(error.to_string()))?;
             let mut file = fs::File::create(&temporary)?;

@@ -7,7 +7,6 @@ export struct ToastItem {
 
 export component Toast inherits Rectangle {
     in property <ToastItem> item;
-    in property <length> controls-height: 56px;
     in property <length> toast-max-width: 380px;
 
     max-width: root.toast-max-width;
@@ -32,7 +31,7 @@ export component Toast inherits Rectangle {
         }
 
         Text {
-            width: Math.min(root.toast-max-width - 42px, 338px);
+            width: Math.min(root.toast-max-width - 46px, 334px);
             text: root.item.text;
             color: Theme.fg;
             font-size: 13px;
@@ -45,7 +44,6 @@ export component Toast inherits Rectangle {
 
 export component ToastList inherits Rectangle {
     in property <[ToastItem]> toasts: [];
-    in property <length> controls-height: 56px;
     in property <length> toast-max-width: 380px;
     in property <length> spacing: 8px;
 
@@ -54,7 +52,6 @@ export component ToastList inherits Rectangle {
         alignment: end;
         for toast in root.toasts: Toast {
             item: toast;
-            controls-height: root.controls-height;
             toast-max-width: root.toast-max-width;
         }
     }

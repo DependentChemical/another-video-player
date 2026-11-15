@@ -221,10 +221,11 @@ export component MainWindow inherits Window {
 
     // Toast notifications (stacked, max 5)
     ToastList {
-        x: parent.width - min(380px, parent.width - 40px) - 20px;
-        y: parent.height - Theme.controls-height - 12px;
+        width: min(380px, parent.width - 40px);
+        x: parent.width - self.width - 20px;
+        y: parent.height - self.height - Theme.controls-height - 12px;
         toasts: root.toasts;
-        controls-height: Theme.controls-height;
+        toast-max-width: 380px;
     }
 
     // Source picker

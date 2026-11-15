@@ -115,6 +115,10 @@ pub struct Loaded {
 /// How long a persisted resolver result may be reused before it is refreshed.
 const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 
+/// How often a failing resolver, player or selection is retried before the
+/// failure is reported to the user instead of silently continuing.
+const MAX_RETRY_ATTEMPTS: u32 = 6;
+
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
     SystemTime::now()
@@ -221,13 +225,18 @@ impl RetryState {
 
     /// Schedules the next retry with exponential backoff (2, 4, 8, 16... seconds).
     fn schedule_next(&mut self) {
-        let delay = Duration::from_secs(2u64.pow(self.attempt.min(10)));
+        let delay = Duration::from_secs(2u64.pow(self.attempt.min(6) + 1).min(60));
         self.next_retry = Some(Instant::now() + delay);
     }
 
     /// Checks if it's time to retry.
     fn is_ready(&self) -> bool {
         self.next_retry.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Whether the retry budget is used up.
+    fn exhausted(&self) -> bool {
+        self.attempt >= MAX_RETRY_ATTEMPTS
     }
 
     /// Increments the attempt counter and schedules the next retry.
@@ -246,7 +255,8 @@ impl RetryState {
 
     /// Returns the delay until the next retry in seconds.
     fn next_delay_seconds(&self) -> Option<u64> {
-        self.next_retry.map(|t| t.saturating_duration_since(Instant::now()).as_secs())
+        self.next_retry
+            .map(|t| t.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64)
     }
 }
 
@@ -322,6 +332,9 @@ impl App {
         if url.is_empty() {
             return;
         }
+        // A retry belongs to whatever was current before the user asked for
+        // something else; letting it fire would bring the old media back.
+        self.clear_retry();
         if self.has_media() {
             self.resolve_pending(url);
         } else {
@@ -537,9 +550,10 @@ impl App {
                     self.resolve_play(entry.url);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => self.report("the active queue has nothing to play".to_string()),
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"));
+                self.report(format!("the active queue could not be read: {error}"));
             }
         }
     }
@@ -683,46 +697,57 @@ impl App {
 
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
-        let mut state = self.state.lock().expect("the state is not poisoned");
-        state.retry.start(url.clone(), RetryErrorKind::Playback);
-        let delay = state.retry.next_delay_seconds().unwrap_or(2);
-        drop(state);
-        self.report_retry(error, delay, RetryKind::Playback);
+        self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
     }
 
     /// Handles a source selection error by scheduling a retry with fresh resolution.
     fn handle_source_selection_error(&self, url: String) {
-        let mut state = self.state.lock().expect("the state is not poisoned");
-        state.retry.start(url.clone(), RetryErrorKind::SourceSelection);
-        let delay = state.retry.next_delay_seconds().unwrap_or(2);
-        drop(state);
-        self.report_retry(
-            "this source has no playable stream".to_string(),
-            delay,
+        self.schedule_retry(
+            url,
+            RetryErrorKind::SourceSelection,
             RetryKind::SourceSelection,
+            "this source has no playable stream".to_string(),
         );
     }
 
     /// Handles a resolver error by scheduling a retry.
     pub fn handle_resolver_error(&self, url: String, error: String) {
+        self.state.lock().expect("the state is not poisoned").resolving_url = None;
+        self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+    }
+
+    /// Schedules another attempt, or reports the failure once the budget is
+    /// used up so a permanently broken source does not retry forever.
+    fn schedule_retry(
+        &self,
+        url: String,
+        kind: RetryErrorKind,
+        report_kind: RetryKind,
+        message: String,
+    ) {
         let mut state = self.state.lock().expect("the state is not poisoned");
-        state.retry.start(url.clone(), RetryErrorKind::Resolver);
-        state.resolving_url = None;
+        state.retry.start(url, kind);
+        let attempt = state.retry.attempt;
+        if state.retry.exhausted() {
+            state.retry.clear();
+            drop(state);
+            self.report(format!("{message} (gave up after {attempt} retries)"));
+            return;
+        }
         let delay = state.retry.next_delay_seconds().unwrap_or(2);
         drop(state);
-        self.report_retry(error, delay, RetryKind::Resolver);
+        self.report_retry(message, delay, report_kind);
     }
 
     /// Sends a retry notification to the UI.
     fn report_retry(&self, error: String, delay_seconds: u64, kind: RetryKind) {
-        let msg = format!("{error}; retrying in {delay_seconds}s");
         let _ = self.outbox.lock().map(|sender| {
-            sender.send(Box::new(Message::RetryScheduled { error: msg, delay_seconds, kind }))
+            sender.send(Box::new(Message::RetryScheduled { error, delay_seconds, kind }))
         });
     }
 
     /// Checks if any retry is due and executes it.
-    pub fn check_retries(&self) {
+    pub fn check_retries(&self) -> Option<RetryKind> {
         let (url, kind) = {
             let mut state = self.state.lock().expect("the state is not poisoned");
             if let (Some(url), Some(kind)) = (state.retry.url.clone(), state.retry.error_kind)
@@ -736,17 +761,24 @@ impl App {
         };
 
         if let (Some(url), Some(kind)) = (url, kind) {
-            match kind {
-                RetryErrorKind::Resolver => self.resolve_play(url),
+            Some(match kind {
+                RetryErrorKind::Resolver => {
+                    self.resolve_play(url);
+                    RetryKind::Resolver
+                }
                 RetryErrorKind::Playback => {
                     // Re-try with the same source selection
                     self.consume_current();
+                    RetryKind::Playback
                 }
                 RetryErrorKind::SourceSelection => {
                     // Re-resolve to get fresh sources
                     self.resolve_play(url);
+                    RetryKind::SourceSelection
                 }
-            }
+            })
+        } else {
+            None
         }
     }
 
@@ -1445,6 +1477,30 @@ mod tests {
 
         retry.start("https://example.com/other".into(), RetryErrorKind::Resolver);
         assert_eq!(retry.attempt, 0);
+    }
+
+    #[test]
+    fn retry_backoff_starts_at_two_seconds_and_stops_growing_at_one_minute() {
+        let mut retry = RetryState::default();
+        retry.schedule_next();
+        assert_eq!(retry.next_delay_seconds(), Some(2));
+
+        retry.attempt = 20;
+        retry.schedule_next();
+        assert_eq!(retry.next_delay_seconds(), Some(60));
+    }
+
+    #[test]
+    fn a_retry_stops_after_the_attempt_budget_is_used_up() {
+        let mut retry = RetryState::default();
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+
+        for _ in 0..MAX_RETRY_ATTEMPTS {
+            assert!(!retry.exhausted());
+            retry.next_attempt();
+        }
+
+        assert!(retry.exhausted());
     }
 
     #[test]

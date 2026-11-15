@@ -12,10 +12,16 @@
 pub mod parse;
 pub mod plan;
 
+use std::io::{self, Read};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use media_model::MediaSource;
+
+/// A resolver process must not leave the UI waiting indefinitely.
+const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub use parse::parse_catalog;
 pub use plan::plan;
@@ -40,6 +46,14 @@ pub enum Error {
     UnknownStream(String),
     /// The selection names neither a video nor an audio stream.
     NoStream,
+    /// The resolver process did not finish before its deadline.
+    Timeout(u64),
+    /// The resolver's captured output could not be read.
+    Output(io::Error),
+    /// A resolver output reader stopped unexpectedly.
+    OutputReaderPanicked,
+    /// Captured output was missing from a resolver process.
+    MissingOutputPipe,
 }
 
 /// How to invoke `yt-dlp`.
@@ -107,6 +121,12 @@ impl std::fmt::Display for Error {
             Error::Empty => write!(f, "the URL did not lead to any media"),
             Error::UnknownStream(name) => write!(f, "the stream {name} is not available"),
             Error::NoStream => write!(f, "no stream was selected"),
+            Error::Timeout(seconds) => {
+                write!(f, "yt-dlp did not respond within {seconds} seconds")
+            }
+            Error::Output(error) => write!(f, "yt-dlp output could not be read: {error}"),
+            Error::OutputReaderPanicked => write!(f, "yt-dlp output reader stopped unexpectedly"),
+            Error::MissingOutputPipe => write!(f, "yt-dlp output could not be captured"),
         }
     }
 }
@@ -153,11 +173,14 @@ impl Resolver {
             .arg("--dump-single-json")
             .arg("--no-warnings")
             .arg("--no-progress")
-            .arg("--ignore-config");
+            .arg("--ignore-config")
+            .arg("--socket-timeout")
+            .arg("20");
         if let Some(cookies) = self.youtube_cookies_for_url(url) {
             command.arg("--cookies").arg(cookies);
         }
-        let output = command.arg(url).output().map_err(Error::Spawn)?;
+        command.arg(url);
+        let output = run_command(command, RESOLUTION_TIMEOUT)?;
 
         if !output.status.success() {
             return Err(Error::Failed {
@@ -179,10 +202,104 @@ impl Resolver {
     }
 }
 
+/// Captures a resolver process while enforcing a finite deadline.
+///
+/// The output is drained on two threads while the process runs, so a child
+/// that fills its pipe can never deadlock. When the deadline passes the child
+/// is killed and the timeout is returned immediately; the readers are left
+/// to finish on their own, because a descendant that inherited the pipe may
+/// otherwise keep `join` blocked forever.
+fn run_command(mut command: Command, timeout: Duration) -> Result<Output, Error> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(Error::Spawn)?;
+    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::MissingOutputPipe);
+        }
+    };
+    let stdout_reader = thread::spawn(move || read_all(stdout));
+    let stderr_reader = thread::spawn(move || read_all(stderr));
+    let deadline = Instant::now() + timeout;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Timeout(timeout.as_secs()));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Spawn(error));
+            }
+        }
+    };
+
+    let stdout = join_output(stdout_reader)?;
+    let stderr = join_output(stderr_reader)?;
+    Ok(Output { status, stdout, stderr })
+}
+
+/// Reads one child output stream to completion.
+fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+/// Collects one output reader after the child exits.
+fn join_output(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, Error> {
+    reader.join().map_err(|_| Error::OutputReaderPanicked)?.map_err(Error::Output)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CommandSpec, Resolver, is_youtube_url};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use super::{CommandSpec, Error, Resolver, is_youtube_url, run_command};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn timeout_test_child() {
+        if std::env::var_os("FLATLINE_RESOLVER_TIMEOUT_TEST_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn a_hung_resolver_process_is_stopped_at_its_deadline() {
+        let executable = std::env::current_exe().expect("test executable path is available");
+        let mut command = Command::new(executable);
+        command
+            .arg("--exact")
+            .arg("tests::timeout_test_child")
+            .arg("--nocapture")
+            .env("FLATLINE_RESOLVER_TIMEOUT_TEST_CHILD", "1");
+
+        let started = Instant::now();
+        let result = run_command(command, Duration::from_secs(1));
+
+        assert!(matches!(result, Err(Error::Timeout(1))));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_finished_resolver_process_reports_its_output() {
+        let executable = std::env::current_exe().expect("test executable path is available");
+        let mut command = Command::new(executable);
+        command.arg("--list");
+
+        let output = run_command(command, Duration::from_secs(10)).expect("the output is captured");
+
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+    }
 
     #[test]
     fn youtube_cookie_matching_is_limited_to_youtube_hosts() {
