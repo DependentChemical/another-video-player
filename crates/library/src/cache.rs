@@ -5,6 +5,7 @@
 //! beside the program, keyed by the URL it came from, so the same video is
 //! never fetched twice.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -122,6 +123,36 @@ impl ThumbnailCache {
         Ok(())
     }
 
+    /// Removes cached thumbnails that are no longer referenced, plus any
+    /// file that is not a healthy JPEG.
+    ///
+    /// The caller's job is to pass every thumbnail URL that is still in use,
+    /// most conveniently the ones from the active queue and the history.
+    /// Files that miss from that set, or that a fetch left behind in a bad
+    /// state, are deleted, so the cache does not grow with dead weight.
+    pub fn prune(&self, keep: &[String]) -> Result<(), Error> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let keep_names: HashSet<String> = keep.iter().map(|url| file_name_for(url)).collect();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            if !name.ends_with(".jpg") || !keep_names.contains(name) || !is_renderable_jpeg(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        Ok(())
+    }
+
     /// Removes scratch files left behind by an interrupted download.
     fn remove_stale_partials(&self) {
         let Ok(entries) = fs::read_dir(&self.directory) else {
@@ -232,5 +263,47 @@ mod tests {
         }
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn prune_removes_orphaned_files_and_keeps_known_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let keep = "https://example.com/a.jpg";
+        let remove = "https://example.com/b.jpg";
+        write_valid_jpeg(&cache.path_for(keep));
+        write_valid_jpeg(&cache.path_for(remove));
+
+        cache.prune(&[keep.to_string()]).unwrap();
+
+        assert!(cache.path_for(keep).is_file());
+        assert!(!cache.path_for(remove).is_file());
+    }
+
+    #[test]
+    fn prune_removes_non_jpeg_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let jpg = cache.path_for("https://example.com/a.jpg");
+        write_valid_jpeg(&jpg);
+        let exe = temp.path().join("malware.exe");
+        fs::write(&exe, b"bad").unwrap();
+        let part = temp.path().join("scratch.part");
+        fs::write(&part, b"partial").unwrap();
+
+        cache.prune(&["https://example.com/a.jpg".to_string()]).unwrap();
+
+        assert!(jpg.is_file());
+        assert!(!exe.is_file());
+        assert!(!part.is_file());
+    }
+
+    fn write_valid_jpeg(path: &Path) {
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .expect("a valid JPEG encodes");
+        fs::write(path, &bytes).unwrap();
     }
 }

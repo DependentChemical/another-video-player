@@ -1,6 +1,6 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { CloseButton } from "../widgets.slint";
+import { CloseButton, PlayIcon } from "../widgets.slint";
 import { QueueItem } from "types.slint";
 
 // The list of the active queue, shown from the sidebar.
@@ -68,11 +68,12 @@ export component QueueDialog inherits Rectangle {
 
                 VerticalLayout {
                     spacing: 4px;
+                    padding-right: 12px;
 
                     for item in root.items: Rectangle {
                         height: 76px;
                         border-radius: 8px;
-                        background: item.current ? Theme.elevated : transparent;
+                        background: item.current ? Theme.elevated : (touch.has-hover ? Theme.elevated : transparent);
 
                         HorizontalLayout {
                             padding-left: 8px;
@@ -80,6 +81,12 @@ export component QueueDialog inherits Rectangle {
                             spacing: 12px;
                             alignment: start;
                             cross-axis-alignment: center;
+
+                            if item.current: PlayIcon {
+                                width: 16px;
+                                height: 16px;
+                                ink: Theme.accent;
+                            }
 
                             Rectangle {
                                 width: 96px;
@@ -130,7 +137,7 @@ export component QueueDialog inherits Rectangle {
                             }
                         }
 
-                        TouchArea {
+                        touch := TouchArea {
                             clicked => {
                                 root.open = false;
                                 root.item-selected(item.position);

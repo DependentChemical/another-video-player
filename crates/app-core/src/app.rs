@@ -300,6 +300,11 @@ impl App {
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
+        let cache = ThumbnailCache::new(paths.cache().join("thumbnails"));
+        // Drop thumbnails that no longer point at a live queue or history
+        // entry, plus any file that is not a healthy JPEG, so the cache does
+        // not grow with broken or orphaned images.
+        prune_thumbnail_cache(&cache, &queue);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -318,7 +323,7 @@ impl App {
             state: Mutex::new(State::default()),
             live: Mutex::new(LiveAxis::new()),
             queue,
-            cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
+            cache,
             stream_buffer,
             pending: Mutex::new(None),
         })
@@ -1236,6 +1241,38 @@ fn clear_stream_buffer(directory: &Path) {
         if let Err(error) = result {
             crate::diag::note(&format!("a stream buffer file could not be removed: {error}"));
         }
+    }
+}
+
+/// Cleans the thumbnail cache at start-up.
+///
+/// Every thumbnail that the active queue or the history still points at is
+/// kept; a leftover from an older run, a file that is not a JPEG and a
+/// broken image are all removed. The URLs are collected from the two lists
+/// the user can still see, so the cleanup only deletes what cannot be shown
+/// again anyway.
+fn prune_thumbnail_cache(cache: &ThumbnailCache, queue: &Queue) {
+    let mut keep: Vec<String> = Vec::new();
+    match queue.entries() {
+        Ok(entries) => {
+            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
+        }
+        Err(error) => {
+            crate::diag::note(&format!("the active queue could not be read: {error}"));
+            return;
+        }
+    }
+    match queue.history_all() {
+        Ok(entries) => {
+            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
+        }
+        Err(error) => {
+            crate::diag::note(&format!("the history could not be read: {error}"));
+            return;
+        }
+    }
+    if let Err(error) = cache.prune(&keep) {
+        crate::diag::note(&format!("the thumbnail cache could not be pruned: {error}"));
     }
 }
 
