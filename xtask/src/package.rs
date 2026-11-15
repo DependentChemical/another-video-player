@@ -24,6 +24,10 @@ pub fn package() -> Result<PathBuf, String> {
     if !binary.is_file() {
         return Err("there is no release build yet; run `cargo xtask build` first".to_string());
     }
+    let session_helper = root.join("target").join("release").join(session_helper_name());
+    if !session_helper.is_file() {
+        return Err("there is no release build of the sign-in helper yet; run `cargo xtask build` first".to_string());
+    }
 
     let distribution = root.join("dist");
     let staging = distribution
@@ -37,6 +41,9 @@ pub fn package() -> Result<PathBuf, String> {
     // The player itself.
     copy(&binary, &staging.join(platform.executable_name()))?;
 
+    // The sign-in helper used for cookie refresh on supported sites.
+    copy(&session_helper, &staging.join(session_helper_name()))?;
+
     // The mpv runtime has to sit next to the executable: the loader searches
     // the directory of the executable, not a subdirectory of it.
     copy_mpv_runtime(&staging)?;
@@ -48,9 +55,6 @@ pub fn package() -> Result<PathBuf, String> {
 
     // The tool that resolves the URLs, so the folder works offline.
     copy_ytdlp(&staging, platform)?;
-
-    // The helper that signs the user in when a service demands it.
-    copy_session_helper(&staging)?;
 
     // Files bundled with the player, placed next to the executable.
     copy_includes(&root, &staging)?;
@@ -141,19 +145,6 @@ fn copy_ytdlp(staging: &Path, platform: Platform) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// Puts the sign-in helper next to the player.
-///
-/// Without it the player cannot sign in, so a release without it would only
-/// play the media that needs no account.
-fn copy_session_helper(staging: &Path) -> Result<(), String> {
-    let name = session_helper_name();
-    let binary = workspace_root().join("target").join("release").join(name);
-    if !binary.is_file() {
-        return Err("there is no release build of the sign-in helper yet".to_string());
-    }
-    copy(&binary, &staging.join(name))
 }
 
 /// The name of the sign-in helper on this platform.
