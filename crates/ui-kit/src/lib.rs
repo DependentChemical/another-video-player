@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
 
 slint::include_modules!();
 
@@ -270,14 +270,22 @@ impl PlayerUi {
     }
 
     /// Shows a short note in the corner of the window.
+    ///
+    /// Toasts are stacked (max 5); older ones are removed.
     pub fn show_toast(&self, text: &str) {
-        self.window.set_toast_text(text.into());
-        self.window.set_toast_visible(true);
+        let mut toasts: Vec<ToastItem> = self.window.get_toasts().iter().collect();
+        let id = toasts.len() as i32;
+        toasts.push(ToastItem { text: text.into(), id });
+        // Keep only the last 5 toasts
+        if toasts.len() > 5 {
+            toasts = toasts.split_off(toasts.len() - 5);
+        }
+        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(toasts)));
     }
 
-    /// Hides the note in the corner of the window.
+    /// Hides all toasts.
     pub fn hide_toast(&self) {
-        self.window.set_toast_visible(false);
+        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(Vec::<ToastItem>::new())));
     }
 
     /// Opens the dialog that asks what to do with a resolved media.

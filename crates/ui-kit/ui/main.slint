@@ -7,7 +7,7 @@ import { VideoHeader } from "slint-ui/VideoHeader.slint";
 import { PlayerControls } from "slint-ui/PlayerControls.slint";
 import { SourcePicker } from "slint-ui/SourcePicker.slint";
 import { PendingDialog } from "slint-ui/PendingDialog.slint";
-import { Toast } from "slint-ui/Toast.slint";
+import { ToastList, ToastItem } from "slint-ui/Toast.slint";
 import { SourceColumn } from "slint-ui/SourceColumn.slint";
 import { StreamItem } from "slint-ui/types.slint";
 
@@ -60,8 +60,7 @@ export component MainWindow inherits Window {
     in property <bool> fullscreen: false;
     // The small note in the corner, shown while a URL is parsed in the
     // background.
-    in-out property <bool> toast-visible: false;
-    in property <string> toast-text: "";
+    in-out property <[ToastItem]> toasts: [];
     // The dialog that asks what to do with a media that was resolved while
     // another one already plays.
     in-out property <bool> pending-open: false;
@@ -220,10 +219,11 @@ export component MainWindow inherits Window {
         sources-toggled => { root.toggle-sources(); }
     }
 
-    // Toast notification
-    Toast {
-        toast-text: root.toast-text;
-        toast-visible: root.toast-visible;
+    // Toast notifications (stacked, max 5)
+    ToastList {
+        x: parent.width - min(380px, parent.width - 40px) - 20px;
+        y: parent.height - Theme.controls-height - 12px;
+        toasts: root.toasts;
         controls-height: Theme.controls-height;
     }
 

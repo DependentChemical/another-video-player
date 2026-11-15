@@ -1,44 +1,61 @@
 import { Theme } from "../theme.slint";
 
+export struct ToastItem {
+    text: string,
+    id: int,
+}
+
 export component Toast inherits Rectangle {
-    in property <string> toast-text: "";
-    in property <bool> toast-visible: false;
+    in property <ToastItem> item;
     in property <length> controls-height: 56px;
     in property <length> toast-max-width: 380px;
 
-    if root.toast-visible: Rectangle {
-        x: parent.width - self.width - 20px;
-        y: parent.height - self.height - root.controls-height - 12px;
-        max-width: root.toast-max-width;
-        min-width: 220px;
-        border-radius: 8px;
-        border-width: 1px;
-        border-color: Theme.border;
-        background: Theme.panel;
-        drop-shadow-blur: 16px;
-        drop-shadow-color: #000000a0;
+    max-width: root.toast-max-width;
+    min-width: 220px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.panel;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #000000a0;
 
-        HorizontalLayout {
-            padding: 12px;
-            spacing: 12px;
-            cross-axis-alignment: center;
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 12px;
+        cross-axis-alignment: center;
 
-            Rectangle {
-                width: 8px;
-                height: 8px;
-                border-radius: 4px;
-                background: Theme.danger;
-            }
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.danger;
+        }
 
-            Text {
-                width: Math.min(root.toast-max-width - 42px, 338px);
-                text: root.toast-text;
-                color: Theme.fg;
-                font-size: 13px;
-                vertical-alignment: top;
-                horizontal-alignment: left;
-                wrap: word-wrap;
-            }
+        Text {
+            width: Math.min(root.toast-max-width - 42px, 338px);
+            text: root.item.text;
+            color: Theme.fg;
+            font-size: 13px;
+            vertical-alignment: top;
+            horizontal-alignment: left;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component ToastList inherits Rectangle {
+    in property <[ToastItem]> toasts: [];
+    in property <length> controls-height: 56px;
+    in property <length> toast-max-width: 380px;
+    in property <length> spacing: 8px;
+
+    VerticalLayout {
+        spacing: root.spacing;
+        alignment: end;
+        for toast in root.toasts: Toast {
+            item: toast;
+            controls-height: root.controls-height;
+            toast-max-width: root.toast-max-width;
         }
     }
 }

@@ -36,6 +36,26 @@ pub enum Message {
     UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+    /// A retry is scheduled.
+    RetryScheduled {
+        /// The error message.
+        error: String,
+        /// Seconds until retry.
+        delay_seconds: u64,
+        /// The kind of error being retried.
+        kind: RetryKind,
+    },
+}
+
+/// The kind of error that triggered a retry, for display purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryKind {
+    /// yt-dlp resolution failed.
+    Resolver,
+    /// mpv playback failed.
+    Playback,
+    /// Source selection failed.
+    SourceSelection,
 }
 
 /// A URL that was resolved and is ready to play.
@@ -158,6 +178,75 @@ struct State {
     current_uploader: Option<String>,
     /// Last time we saved history position (to throttle saves to ~20s intervals).
     last_history_save: Option<Instant>,
+    /// The URL currently being resolved (for retry purposes).
+    resolving_url: Option<String>,
+    /// Retry state for the current URL.
+    retry: RetryState,
+}
+
+/// Retry state for a URL being resolved or played.
+#[derive(Debug, Default)]
+struct RetryState {
+    /// The URL being retried.
+    url: Option<String>,
+    /// Number of retry attempts made.
+    attempt: u32,
+    /// When the next retry should happen.
+    next_retry: Option<Instant>,
+    /// The type of error being retried.
+    error_kind: Option<RetryErrorKind>,
+}
+
+/// The kind of error that triggered a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryErrorKind {
+    /// yt-dlp resolution failed (e.g., bot detection).
+    Resolver,
+    /// mpv playback failed.
+    Playback,
+    /// Source selection failed (no playable streams).
+    SourceSelection,
+}
+
+impl RetryState {
+    /// Starts a retry for the given URL and error kind.
+    fn start(&mut self, url: String, kind: RetryErrorKind) {
+        self.url = Some(url);
+        self.error_kind = Some(kind);
+        self.attempt = 0;
+        self.schedule_next();
+    }
+
+    /// Schedules the next retry with exponential backoff (2, 4, 8, 16... seconds).
+    fn schedule_next(&mut self) {
+        let delay = Duration::from_secs(2u64.pow(self.attempt.min(10)));
+        self.next_retry = Some(Instant::now() + delay);
+    }
+
+    /// Checks if it's time to retry.
+    fn is_ready(&self) -> bool {
+        self.next_retry.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Increments the attempt counter and schedules the next retry.
+    fn next_attempt(&mut self) {
+        self.attempt += 1;
+        self.schedule_next();
+    }
+
+    /// Clears the retry state.
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        self.url = None;
+        self.error_kind = None;
+        self.attempt = 0;
+        self.next_retry = None;
+    }
+
+    /// Returns the delay until the next retry in seconds.
+    fn next_delay_seconds(&self) -> Option<u64> {
+        self.next_retry.map(|t| t.saturating_duration_since(Instant::now()).as_secs())
+    }
 }
 
 /// The application, without a user interface.
@@ -245,8 +334,21 @@ impl App {
         self.state.lock().expect("the state is not poisoned").source.is_some()
     }
 
+    /// Returns the URL currently being resolved, if any.
+    pub fn resolving_url(&self) -> Option<String> {
+        self.state.lock().expect("the state is not poisoned").resolving_url.clone()
+    }
+
+    /// Returns the currently playing URL, if any.
+    pub fn current_url(&self) -> Option<String> {
+        self.state.lock().expect("the state is not poisoned").current_url.clone()
+    }
+
     /// Resolves the URL read from the active queue in the background.
     fn resolve_play(&self, url: String) {
+        // Track the URL being resolved for retry purposes
+        self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
+
         let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
@@ -541,23 +643,101 @@ impl App {
             state.current_id_hash = Some(id_hash.clone());
             state.current_url = Some(url.to_string());
             state.current_title = Some(loaded.title.clone());
-            state.current_thumbnail_url = loaded.thumbnail_url.clone(); // We'll need to add this to Loaded
-            state.current_uploader = loaded.uploader.clone(); // We'll need to add this to Loaded
+            state.current_thumbnail_url = loaded.thumbnail_url.clone();
+            state.current_uploader = loaded.uploader.clone();
             state.last_history_save = None;
+            // Clear the resolving URL since we successfully started playing
+            state.resolving_url = None;
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
         match default {
             Some(plan) => {
                 if let Err(error) = self.start(&plan) {
-                    self.report(error);
+                    self.handle_playback_error(url.to_string(), error);
                 } else if let Err(error) = self.engine.play() {
-                    self.report(error.to_string());
+                    self.handle_playback_error(url.to_string(), error.to_string());
                 }
             }
-            None => self.report("this source has no playable stream".to_string()),
+            None => self.handle_source_selection_error(url.to_string()),
         }
         loaded
+    }
+
+    /// Handles a playback error by scheduling a retry.
+    pub fn handle_playback_error(&self, url: String, error: String) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.start(url.clone(), RetryErrorKind::Playback);
+        let delay = state.retry.next_delay_seconds().unwrap_or(2);
+        drop(state);
+        self.report_retry(error, delay, RetryKind::Playback);
+    }
+
+    /// Handles a source selection error by scheduling a retry with fresh resolution.
+    fn handle_source_selection_error(&self, url: String) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.start(url.clone(), RetryErrorKind::SourceSelection);
+        let delay = state.retry.next_delay_seconds().unwrap_or(2);
+        drop(state);
+        self.report_retry(
+            "this source has no playable stream".to_string(),
+            delay,
+            RetryKind::SourceSelection,
+        );
+    }
+
+    /// Handles a resolver error by scheduling a retry.
+    pub fn handle_resolver_error(&self, url: String, error: String) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.start(url.clone(), RetryErrorKind::Resolver);
+        state.resolving_url = None;
+        let delay = state.retry.next_delay_seconds().unwrap_or(2);
+        drop(state);
+        self.report_retry(error, delay, RetryKind::Resolver);
+    }
+
+    /// Sends a retry notification to the UI.
+    fn report_retry(&self, error: String, delay_seconds: u64, kind: RetryKind) {
+        let msg = format!("{error}; retrying in {delay_seconds}s");
+        let _ = self.outbox.lock().map(|sender| {
+            sender.send(Box::new(Message::RetryScheduled { error: msg, delay_seconds, kind }))
+        });
+    }
+
+    /// Checks if any retry is due and executes it.
+    pub fn check_retries(&self) {
+        let (url, kind) = {
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            if let (Some(url), Some(kind)) = (state.retry.url.clone(), state.retry.error_kind)
+                && state.retry.is_ready()
+            {
+                state.retry.next_attempt();
+                (Some(url), Some(kind))
+            } else {
+                (None, None)
+            }
+        };
+
+        if let (Some(url), Some(kind)) = (url, kind) {
+            match kind {
+                RetryErrorKind::Resolver => self.resolve_play(url),
+                RetryErrorKind::Playback => {
+                    // Re-try with the same source selection
+                    self.consume_current();
+                }
+                RetryErrorKind::SourceSelection => {
+                    // Re-resolve to get fresh sources
+                    self.resolve_play(url);
+                }
+            }
+        }
+    }
+
+    /// Clears any pending retry state.
+    #[allow(dead_code)]
+    fn clear_retry(&self) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.retry.clear();
     }
 
     /// Plays a source selection.

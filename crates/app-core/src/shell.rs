@@ -18,7 +18,7 @@ use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
 use ui_kit::{PlayerUi, StatusKind};
 
-use crate::app::{App, Message};
+use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
 
 /// How often the interface is refreshed.
@@ -371,7 +371,12 @@ fn tick(
             }
             Message::Resolved(Err(error)) => {
                 ui.hide_toast();
-                loading.resolve_failed(error);
+                // Schedule a retry for resolver errors
+                if let Some(url) = app.resolving_url() {
+                    app.handle_resolver_error(url, error);
+                } else {
+                    loading.resolve_failed(error);
+                }
             }
             Message::Pending(Ok(pending)) => {
                 ui.hide_toast();
@@ -395,8 +400,19 @@ fn tick(
             Message::Problem(text) => {
                 ui.show_toast(&text);
             }
+            Message::RetryScheduled { error, delay_seconds, kind } => {
+                let prefix = match kind {
+                    RetryKind::Resolver => "retrying yt-dlp",
+                    RetryKind::Playback => "retrying playback",
+                    RetryKind::SourceSelection => "retrying source selection",
+                };
+                ui.show_toast(&format!("{} after {}s: {}", prefix, delay_seconds, error));
+            }
         }
     }
+
+    // Check for pending retries
+    app.check_retries();
 
     drain_engine_events(app, loading);
 
@@ -445,10 +461,18 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
             EngineEvent::EndFile { reason, error } => {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
-                loading.file_ended(failure);
+                loading.file_ended(failure.clone());
                 // Reset history position when video finishes normally (not error/stop)
                 if reason == EndReason::Eof {
                     app.reset_history_position();
+                } else if reason == EndReason::Error {
+                    // Schedule a retry for playback errors
+                    if let Some(url) = app.current_url() {
+                        app.handle_playback_error(
+                            url,
+                            failure.unwrap_or_else(|| "playback failed".to_string()),
+                        );
+                    }
                 }
             }
             EngineEvent::Log { level, text } => {
