@@ -261,6 +261,20 @@ impl PlayerUi {
         self.window.set_duration(seconds as f32);
     }
 
+    /// The spans of the media that are already downloaded.
+    ///
+    /// Each span is a fraction between zero and one of the shown axis, so the
+    /// scrubber can draw them without knowing which time axis it is on.
+    pub fn set_buffered_ranges(&self, ranges: &[(f64, f64)]) {
+        let ranges: Vec<BufferedRange> = ranges
+            .iter()
+            .filter_map(|&(start, end)| {
+                (end > start).then_some(BufferedRange { start: start as f32, end: end as f32 })
+            })
+            .collect();
+        self.window.set_buffered_ranges(slint::ModelRc::new(slint::VecModel::from(ranges)));
+    }
+
     /// The volume slider position, from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.window.set_volume(volume as f32);

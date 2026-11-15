@@ -528,6 +528,7 @@ fn tick(
     let timeline = app.timeline();
     ui.set_position(timeline.position);
     ui.set_duration(timeline.duration);
+    ui.set_buffered_ranges(&app.buffered_ranges());
     ui.set_time_text(&crate::time::format_timeline(&timeline));
     let playing = !app.engine().is_idle() && !app.engine().is_paused();
     ui.set_at_live_edge(timeline.live && timeline.behind <= crate::timeline::LIVE_BUFFER);

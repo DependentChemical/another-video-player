@@ -92,6 +92,14 @@ impl AppPaths {
         self.root.join("cache")
     }
 
+    /// The directory the player buffers downloaded media in.
+    ///
+    /// It sits below [`AppPaths::cache`] so that everything the app can
+    /// recreate without the user's help is in one place.
+    pub fn stream_buffer(&self) -> PathBuf {
+        self.cache().join("stream_buffer")
+    }
+
     /// The file the diagnostics are written to.
     pub fn log_file(&self) -> PathBuf {
         self.root.join("flatline.log")
@@ -102,6 +110,7 @@ impl AppPaths {
         std::fs::create_dir_all(self.tools())?;
         std::fs::create_dir_all(self.thumbnails())?;
         std::fs::create_dir_all(self.cache())?;
+        std::fs::create_dir_all(self.stream_buffer())?;
         Ok(())
     }
 }
@@ -179,6 +188,7 @@ mod tests {
         assert_eq!(paths.thumbnails(), PathBuf::from("/tmp/flatline").join("thumbnails"));
         assert_eq!(paths.database(), PathBuf::from("/tmp/flatline").join("app.db"));
         assert_eq!(paths.cache(), PathBuf::from("/tmp/flatline").join("cache"));
+        assert_eq!(paths.stream_buffer(), paths.cache().join("stream_buffer"));
         assert_eq!(paths.log_file(), PathBuf::from("/tmp/flatline").join("flatline.log"));
         assert_eq!(
             paths.youtube_cookies(),

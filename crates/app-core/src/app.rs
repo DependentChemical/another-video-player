@@ -5,7 +5,7 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -276,6 +276,8 @@ pub struct App {
     queue: Queue,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
+    /// The directory the player buffers downloaded media in.
+    stream_buffer: PathBuf,
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
 }
@@ -283,7 +285,11 @@ pub struct App {
 impl App {
     /// Creates the application around a `yt-dlp` installation.
     pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
-        let engine = Engine::new().map_err(|error| Error::Engine(error.to_string()))?;
+        let stream_buffer = paths.stream_buffer();
+        let engine =
+            Engine::new(&stream_buffer).map_err(|error| Error::Engine(error.to_string()))?;
+        // A cache from an earlier run belongs to a media nobody plays now.
+        clear_stream_buffer(&stream_buffer);
         let youtube_cookies = paths.youtube_cookies();
         let resolver = Resolver::new(command_spec(ytdlp, &youtube_cookies));
         let settings =
@@ -309,6 +315,7 @@ impl App {
             live: Mutex::new(LiveAxis::new()),
             queue,
             cache: ThumbnailCache::new(paths.cache().join("thumbnails")),
+            stream_buffer,
             pending: Mutex::new(None),
         })
     }
@@ -981,6 +988,30 @@ impl App {
         }
     }
 
+    /// The downloaded spans of the current media, as fractions of the axis.
+    ///
+    /// The interface draws them as the secondary bar of the scrubber, so the
+    /// user can see where a paused media has already buffered to and which
+    /// parts a seek would have to download again.
+    pub fn buffered_ranges(&self) -> Vec<(f64, f64)> {
+        let ranges: Vec<(f64, f64)> = self
+            .engine
+            .buffered_ranges()
+            .into_iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+        if ranges.is_empty() {
+            return Vec::new();
+        }
+
+        if self.is_live() {
+            let origin = self.live.lock().expect("the live axis is not poisoned").window_start();
+            crate::timeline::buffered_fractions(crate::timeline::LIVE_WINDOW, origin, &ranges)
+        } else {
+            crate::timeline::buffered_fractions(self.engine.duration(), 0.0, &ranges)
+        }
+    }
+
     /// Changes the volume.
     pub fn set_volume(&self, volume: f64) {
         if let Err(error) = self.engine.set_volume(volume) {
@@ -1157,6 +1188,9 @@ impl App {
 
     /// Loads a finished playback plan into the player.
     fn start(&self, plan: &PlaybackPlan) -> Result<(), String> {
+        // Every load belongs to a different media, and a cached packet from
+        // the old source would be plain garbage to the new demuxer.
+        clear_stream_buffer(&self.stream_buffer);
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
@@ -1167,6 +1201,28 @@ impl App {
     /// Sends a problem to the user interface.
     fn report(&self, text: String) {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
+    }
+}
+
+/// Removes the media a previous source buffered.
+///
+/// The player may still have a cache file open while it replaces the old
+/// media, and such a file cannot be removed on every platform. Those leftovers
+/// are picked up by the next load and by the cleanup at start-up.
+fn clear_stream_buffer(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(error) = result {
+            crate::diag::note(&format!("a stream buffer file could not be removed: {error}"));
+        }
     }
 }
 
@@ -1574,5 +1630,24 @@ mod tests {
         assert_eq!(lists.video[0].label, "1080p");
         assert!(lists.video[0].detail.contains("1920×1080"));
         assert!(lists.audio[0].label.contains("128"));
+    }
+
+    #[test]
+    fn clearing_the_stream_buffer_removes_every_downloaded_file() {
+        let directory = std::env::temp_dir().join("flatline-stream-buffer-test");
+        let nested = directory.join("nested");
+        std::fs::create_dir_all(&nested).expect("the test directory can be created");
+        std::fs::write(directory.join("cache.bin"), b"media").expect("a cache file can be written");
+        std::fs::write(nested.join("part.bin"), b"more").expect("a nested file can be written");
+
+        clear_stream_buffer(&directory);
+
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("the buffer directory stays in place")
+                .next()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

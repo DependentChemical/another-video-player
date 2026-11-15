@@ -1,4 +1,5 @@
 import { Theme } from "theme.slint";
+import { BufferedRange } from "slint-ui/types.slint";
 
 // The font that carries the icons.
 //
@@ -286,6 +287,8 @@ export component GearButton inherits Rectangle {
 export component SeekBar inherits Rectangle {
     in property <float> value: 0;
     in property <float> maximum: 1;
+    // The spans that are already downloaded, as fractions of the track.
+    in property <[BufferedRange]> buffered-ranges: [];
     in property <bool> interactive: true;
     callback moved(float);
     callback pointer-activity();
@@ -301,26 +304,40 @@ export component SeekBar inherits Rectangle {
         ? clamp(root.value / root.maximum, 0.0, 1.0)
         : 0.0;
 
+    // The width of the part of the slider that carries the track.
+    private property <length> track-width: max(0px, root.width - 12px);
+
     track := Rectangle {
         x: 6px;
         y: (parent.height - self.height) / 2;
-        width: max(0px, parent.width - 12px);
+        width: root.track-width;
         height: 4px;
         border-radius: 2px;
         background: Theme.border;
     }
 
+    // The downloaded part sits under the played part, so the played part keeps
+    // the accent colour while the run-ahead is visible in a lighter tint.
+    for span in root.buffered-ranges: Rectangle {
+        x: 6px + root.track-width * span.start;
+        y: (parent.height - self.height) / 2;
+        width: root.track-width * (span.end - span.start);
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.buffered;
+    }
+
     fill := Rectangle {
         x: 6px;
         y: (parent.height - self.height) / 2;
-        width: max(0px, parent.width - 12px) * root.ratio;
+        width: root.track-width * root.ratio;
         height: 4px;
         border-radius: 2px;
         background: Theme.accent;
     }
 
     knob := Rectangle {
-        x: 6px + max(0px, parent.width - 12px) * root.ratio - self.width / 2;
+        x: 6px + root.track-width * root.ratio - self.width / 2;
         y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;

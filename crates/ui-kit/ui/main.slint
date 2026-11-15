@@ -12,7 +12,7 @@ import { SourceColumn } from "slint-ui/SourceColumn.slint";
 import { Sidebar } from "slint-ui/Sidebar.slint";
 import { QueueDialog } from "slint-ui/QueueDialog.slint";
 import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
-import { StreamItem, QueueItem, HistoryItem } from "slint-ui/types.slint";
+import { StreamItem, QueueItem, HistoryItem, BufferedRange } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
 
@@ -53,6 +53,8 @@ export component MainWindow inherits Window {
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
+    // The parts of the axis that are already downloaded, as fractions.
+    in property <[BufferedRange]> buffered-ranges: [];
     in property <float> volume: 100;
     // The playback position, formatted for the user.
     in property <string> time-text: "0:00 / 0:00";
@@ -215,6 +217,7 @@ export component MainWindow inherits Window {
         playing: root.playing;
         position: root.position;
         duration: root.duration;
+        buffered-ranges: root.buffered-ranges;
         volume: root.volume;
         time-text: root.time-text;
         live: root.live;
