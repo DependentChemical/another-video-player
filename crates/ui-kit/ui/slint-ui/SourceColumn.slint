@@ -52,7 +52,7 @@ export component SourceColumn inherits Rectangle {
                         border-radius: 4px;
                         background: touch.pressed
                             ? Theme.border
-                            : (root.selected == item.id ? #4c8bf540 : transparent);
+                            : (touch.has-hover ? Theme.border : (root.selected == item.id ? #4c8bf540 : transparent));
 
                         VerticalLayout {
                             padding-left: 8px;

@@ -1,4 +1,4 @@
-import { Button, ProgressIndicator, ScrollView } from "std-widgets.slint";
+import { ProgressIndicator, ScrollView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "widgets.slint";
 import { TopBar } from "slint-ui/TopBar.slint";
@@ -275,10 +275,28 @@ export component MainWindow inherits Window {
                 if root.update-error != "": Text { text: root.update-error; color: Theme.danger; wrap: word-wrap; }
                 HorizontalLayout {
                     alignment: end; spacing: 8px;
-                    if !root.update-installing && root.update-error == "": Button { text: "No"; clicked => { root.update-open = false; root.update-dismissed(); } }
-                    if !root.update-installing && root.update-error == "": Button { text: "Yes, download and install"; clicked => { root.update-installing = true; root.update-accepted(); } }
+                    if !root.update-installing && root.update-error == "": Rectangle {
+                        width: 80px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        background: btn1.pressed ? Theme.elevated : (btn1.has-hover ? Theme.elevated : Theme.panel);
+                        Text { text: "No"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn1 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                    }
+                    if !root.update-installing && root.update-error == "": Rectangle {
+                        width: 200px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.accent;
+                        background: btn2.pressed ? #5a9bf5 : (btn2.has-hover ? #5a9bf5 : Theme.accent);
+                        Text { text: "Yes, download and install"; color: Theme.on-accent; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn2 := TouchArea { clicked => { root.update-installing = true; root.update-accepted(); } }
+                    }
                     if root.update-installing: ProgressIndicator { indeterminate: true; }
-                    if root.update-error != "": Button { text: "Close"; clicked => { root.update-open = false; root.update-dismissed(); } }
+                    if root.update-error != "": Rectangle {
+                        width: 80px; height: 34px;
+                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        background: btn3.pressed ? Theme.elevated : (btn3.has-hover ? Theme.elevated : Theme.panel);
+                        Text { text: "Close"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        btn3 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                    }
                 }
             }
         }

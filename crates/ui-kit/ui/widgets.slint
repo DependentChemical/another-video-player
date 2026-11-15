@@ -96,8 +96,8 @@ export component FlatButton inherits Rectangle {
 
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.primary ? Theme.accent : Theme.border;
-    background: root.primary ? Theme.accent : (touch.pressed ? Theme.elevated : Theme.panel);
+    border-color: root.primary ? Theme.accent : (touch.has-hover && root.enabled ? Theme.accent : Theme.border);
+    background: root.primary ? (touch.has-hover ? #5a9bf5 : Theme.accent) : (touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel));
     opacity: root.enabled ? 1 : 0.45;
 
     Text {
@@ -130,8 +130,8 @@ export component PlayPauseButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     icon := Rectangle {
         x: (parent.width - self.width) / 2;
@@ -175,8 +175,8 @@ export component FullscreenButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     if !root.fullscreen: FullscreenIcon {
         x: (parent.width - self.width) / 2;
@@ -214,8 +214,8 @@ export component LiveButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.at-edge ? Theme.danger : Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: root.at-edge ? Theme.danger : (touch.has-hover ? Theme.accent : Theme.border);
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
 
     LiveDot {
         x: 8px;
@@ -255,14 +255,14 @@ export component GearButton inherits Rectangle {
     height: 32px;
     border-radius: 6px;
     border-width: 1px;
-    border-color: root.active ? Theme.accent : Theme.border;
-    background: touch.pressed ? Theme.elevated : Theme.panel;
+    border-color: root.active ? Theme.accent : (touch.has-hover && root.enabled ? Theme.accent : Theme.border);
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
     opacity: root.enabled ? 1 : 0.45;
 
     GearIcon {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        ink: root.active ? Theme.accent : Theme.muted;
+        ink: root.active ? Theme.accent : (touch.has-hover ? Theme.accent : Theme.muted);
     }
 
     touch := TouchArea {
@@ -279,20 +279,20 @@ export component GearButton inherits Rectangle {
 
 // A horizontal slider.
 //
- // The slider reports the position the user picked through the `moved`
+// The slider reports the position the user picked through the `moved`
  // callback; the caller decides what to do with it. The part that has been
  // played is filled from the left and grows to the right, the same way a
  // progress bar does.
- export component SeekBar inherits Rectangle {
-     in property <float> value: 0;
-     in property <float> maximum: 1;
-     in property <bool> interactive: true;
-     callback moved(float);
-     callback pointer-activity();
-     callback drag-started();
-     callback drag-ended();
+export component SeekBar inherits Rectangle {
+    in property <float> value: 0;
+    in property <float> maximum: 1;
+    in property <bool> interactive: true;
+    callback moved(float);
+    callback pointer-activity();
+    callback drag-started();
+    callback drag-ended();
 
-     height: 18px;
+    height: 18px;
 
     // The position of the handle, between 0 and 1. The clamp keeps a slider
     // whose maximum is still unknown (a live stream before the first tick)
@@ -325,7 +325,7 @@ export component GearButton inherits Rectangle {
         width: 12px;
         height: 12px;
         border-radius: 6px;
-        background: Theme.accent;
+        background: area.has-hover ? #5a9bf5 : Theme.accent;
         visible: root.interactive && root.maximum > 0;
     }
 
