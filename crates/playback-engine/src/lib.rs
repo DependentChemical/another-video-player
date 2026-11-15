@@ -248,10 +248,12 @@ impl Engine {
         seekable_end_from_cache(&state)
     }
 
-    /// Sets the volume, in percent.
+    /// Sets the volume, in mpv's cubic percent.
     ///
     /// The value is clamped to `0..=`[`MAX_VOLUME`], so a stray click on the
-    /// slider can never ask mpv for something it refuses.
+    /// slider can never ask mpv for something it refuses. Note that mpv maps
+    /// this percent to a linear gain with `(volume / 100)^3`; callers that want
+    /// a linear-gain slider have to undo that curve before calling.
     pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
         self.core.set_property("volume", clamp_volume(volume))?;
         Ok(())

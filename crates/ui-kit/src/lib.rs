@@ -256,7 +256,7 @@ impl PlayerUi {
         self.window.set_duration(seconds as f32);
     }
 
-    /// The volume, in the range mpv uses.
+    /// The volume slider position, from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.window.set_volume(volume as f32);
     }

@@ -384,25 +384,22 @@ fn slider_volume_changed(saved: &Cell<Option<f64>>, volume: f64) -> f64 {
     volume
 }
 
-/// Converts the UI slider value to mpv's linear gain percent.
+/// Converts the UI slider value to mpv's cubic soft-volume percent.
 ///
-/// The slider uses a perceptual scale (quadratic) where 100% is unity gain
-/// and 0% is mute. The quadratic curve matches human loudness perception.
+/// mpv does not treat `volume` as a linear gain: since 0.18.1 it cubes the
+/// value, so `v` percent produces a gain of `(v / 100)^3`. The slider should
+/// behave like YouTube's, where the position is the linear gain, so this takes
+/// the cube root to undo mpv's curve. Without it the two tapers compound and
+/// the lower half of the slider becomes inaudible.
 fn slider_to_player_volume(slider: f64) -> f64 {
     let slider = slider.clamp(0.0, 100.0);
-    if slider <= 0.0 {
-        0.0
-    } else {
-        // Perceptual taper: quadratic curve for gradual attenuation.
-        let position = slider / 100.0;
-        100.0 * position * position
-    }
+    if slider <= 0.0 { 0.0 } else { 100.0 * (slider / 100.0).cbrt() }
 }
 
-/// Converts mpv's linear gain percent back to the UI slider position.
+/// Converts mpv's cubic soft-volume percent back to the UI slider position.
 fn player_to_slider_volume(volume: f64) -> f64 {
     let volume = volume.clamp(0.0, 100.0);
-    if volume <= 0.0 { 0.0 } else { 100.0 * (volume / 100.0).sqrt() }
+    100.0 * (volume / 100.0).powi(3)
 }
 
 /// Brings the interface and the player back in sync.
@@ -646,9 +643,19 @@ mod tests {
             let player = slider_to_player_volume(slider);
             assert!((player_to_slider_volume(player) - slider).abs() < 1e-9);
         }
-        // Below unity the volume should fall off gradually, not collapse instantly.
-        assert!((slider_to_player_volume(50.0) - 25.0).abs() < 1e-9);
-        assert!(slider_to_player_volume(50.0) < slider_to_player_volume(75.0));
-        assert!(slider_to_player_volume(25.0) > 0.0);
+    }
+
+    #[test]
+    fn volume_slider_matches_youtube_linear_gain() {
+        // mpv's soft volume is cubic, so taking the cube root leaves the slider
+        // position equal to the linear gain, exactly like YouTube's slider.
+        for slider in [1.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0] {
+            let player = slider_to_player_volume(slider);
+            let gain = (player / 100.0).powi(3);
+            assert!((gain - slider / 100.0).abs() < 1e-12);
+        }
+        // Low positions must stay audible rather than collapsing to silence.
+        assert!(slider_to_player_volume(5.0) > 30.0);
+        assert!(slider_to_player_volume(10.0) > slider_to_player_volume(5.0));
     }
 }
