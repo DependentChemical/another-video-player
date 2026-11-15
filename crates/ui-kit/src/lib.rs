@@ -10,11 +10,70 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model};
+use slint::{ComponentHandle, Timer, TimerMode};
 
 slint::include_modules!();
+
+/// How long a toast stays on screen before it is removed on its own.
+const TOAST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many toasts are kept at once; newer ones push out the oldest.
+const TOAST_LIMIT: usize = 5;
+
+/// How often expired toasts are swept away.
+const TOAST_SWEEP: Duration = Duration::from_millis(500);
+
+/// One toast that is currently on screen and the moment it was shown.
+struct ActiveToast {
+    item: ToastItem,
+    shown_at: Instant,
+}
+
+/// The toasts the window is showing.
+///
+/// The store owns their lifetime: callers only add to it, and the sweep
+/// removes a toast once it is older than [`TOAST_TIMEOUT`] or has been
+/// pushed past [`TOAST_LIMIT`].
+#[derive(Default)]
+struct ToastStore {
+    toasts: Vec<ActiveToast>,
+    next_id: i32,
+}
+
+impl ToastStore {
+    /// Adds a toast, evicting the oldest when the limit is exceeded.
+    fn show(&mut self, text: &str, now: Instant) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.toasts.push(ActiveToast { item: ToastItem { text: text.into(), id }, shown_at: now });
+        if self.toasts.len() > TOAST_LIMIT {
+            let excess = self.toasts.len() - TOAST_LIMIT;
+            self.toasts.drain(..excess);
+        }
+    }
+
+    /// Removes expired toasts and reports whether the set changed.
+    fn prune(&mut self, now: Instant) -> bool {
+        let before = self.toasts.len();
+        self.toasts.retain(|toast| now.duration_since(toast.shown_at) < TOAST_TIMEOUT);
+        self.toasts.len() != before
+    }
+
+    /// Whether no toast is left.
+    fn is_empty(&self) -> bool {
+        self.toasts.is_empty()
+    }
+
+    /// The items the Slint model expects.
+    fn items(&self) -> Vec<ToastItem> {
+        self.toasts.iter().map(|toast| toast.item.clone()).collect()
+    }
+}
 
 /// How prominent a status message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +159,15 @@ pub struct HistoryListEntry {
 /// The player window.
 pub struct PlayerUi {
     window: MainWindow,
-    fullscreen: std::cell::Cell<bool>,
+    fullscreen: Cell<bool>,
+    toasts: Rc<RefCell<ToastStore>>,
+    toast_timer: Rc<Timer>,
+}
+
+impl Drop for PlayerUi {
+    fn drop(&mut self) {
+        self.toast_timer.stop();
+    }
 }
 
 /// A handle that asks the toolkit to draw another frame.
@@ -133,7 +200,12 @@ impl Default for PlayerUi {
 impl PlayerUi {
     /// Creates the window.
     pub fn new() -> Result<PlayerUi, slint::PlatformError> {
-        Ok(PlayerUi { window: MainWindow::new()?, fullscreen: std::cell::Cell::new(false) })
+        Ok(PlayerUi {
+            window: MainWindow::new()?,
+            fullscreen: Cell::new(false),
+            toasts: Rc::new(RefCell::new(ToastStore::default())),
+            toast_timer: Rc::new(Timer::default()),
+        })
     }
 
     /// The underlying component.
@@ -316,21 +388,44 @@ impl PlayerUi {
 
     /// Shows a short note in the corner of the window.
     ///
-    /// Toasts are stacked (max 5); older ones are removed.
+    /// This is fire-and-forget: the caller never has to remove it. The toast
+    /// disappears on its own after ten seconds, and when more than five are
+    /// shown at once the oldest are dropped to make room.
     pub fn show_toast(&self, text: &str) {
-        let mut toasts: Vec<ToastItem> = self.window.get_toasts().iter().collect();
-        let id = toasts.len() as i32;
-        toasts.push(ToastItem { text: text.into(), id });
-        // Keep only the last 5 toasts
-        if toasts.len() > 5 {
-            toasts = toasts.split_off(toasts.len() - 5);
-        }
-        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(toasts)));
+        let items = {
+            let mut toasts = self.toasts.borrow_mut();
+            toasts.show(text, Instant::now());
+            toasts.items()
+        };
+        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(items)));
+        self.sweep_toasts();
     }
 
-    /// Hides all toasts.
-    pub fn hide_toast(&self) {
-        self.window.set_toasts(slint::ModelRc::new(slint::VecModel::from(Vec::<ToastItem>::new())));
+    /// Makes sure the sweep timer runs while any toast is on screen.
+    fn sweep_toasts(&self) {
+        if self.toast_timer.running() {
+            return;
+        }
+        let toasts = Rc::clone(&self.toasts);
+        let weak_window = self.window.as_weak();
+        let weak_timer = Rc::downgrade(&self.toast_timer);
+        self.toast_timer.start(TimerMode::Repeated, TOAST_SWEEP, move || {
+            let items = {
+                let mut toasts = toasts.borrow_mut();
+                if !toasts.prune(Instant::now()) {
+                    return;
+                }
+                if toasts.is_empty()
+                    && let Some(timer) = weak_timer.upgrade()
+                {
+                    timer.stop();
+                }
+                toasts.items()
+            };
+            if let Some(window) = weak_window.upgrade() {
+                window.set_toasts(slint::ModelRc::new(slint::VecModel::from(items)));
+            }
+        });
     }
 
     /// Opens the dialog that asks what to do with a resolved media.
@@ -549,6 +644,8 @@ fn non_empty(value: slint::SharedString) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use slint::Model;
+
     use super::*;
 
     #[test]
@@ -582,5 +679,35 @@ mod tests {
         assert_eq!(ui.window().get_url(), "https://example.com/video");
         ui.set_url("");
         assert_eq!(ui.window().get_url(), "");
+
+        ui.show_toast("hello");
+        let toasts = ui.window().get_toasts();
+        assert_eq!(toasts.row_count(), 1);
+        assert_eq!(toasts.row_data(0).expect("one toast").text, "hello");
+    }
+
+    #[test]
+    fn a_toast_disappears_after_its_timeout() {
+        let mut store = ToastStore::default();
+        let shown_at = Instant::now();
+        store.show("hello", shown_at);
+
+        assert!(!store.prune(shown_at + TOAST_TIMEOUT - Duration::from_millis(1)));
+        assert_eq!(store.toasts.len(), 1);
+        assert!(store.prune(shown_at + TOAST_TIMEOUT));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn older_toasts_are_dropped_beyond_the_limit() {
+        let mut store = ToastStore::default();
+        let now = Instant::now();
+        for index in 0..(TOAST_LIMIT + 2) {
+            store.show(&format!("toast {index}"), now);
+        }
+
+        assert_eq!(store.toasts.len(), TOAST_LIMIT);
+        assert_eq!(store.toasts[0].item.text, "toast 2");
+        assert_eq!(store.toasts[TOAST_LIMIT - 1].item.text, format!("toast {}", TOAST_LIMIT + 1));
     }
 }

@@ -146,7 +146,6 @@ impl Shell {
             let loading = Rc::clone(&loading);
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
-                    ui_for_pending.hide_toast();
                     ui_for_pending.set_url("");
                     ui_for_pending.set_media_title(&loaded.title);
                     ui_for_pending
@@ -431,7 +430,6 @@ fn tick(
                     ui.show_toast("The resolved video is no longer in the active queue");
                     continue;
                 };
-                ui.hide_toast();
                 ui.set_media_title(&loaded.title);
                 ui.set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                 ui.set_sources(&loaded.sources);
@@ -448,7 +446,6 @@ fn tick(
                 }
             }
             Message::Resolved(Err(error)) => {
-                ui.hide_toast();
                 loading.resolve_failed(error.clone());
                 // Schedule a retry for resolver errors
                 if let Some(url) = app.resolving_url() {
@@ -458,12 +455,10 @@ fn tick(
                 }
             }
             Message::Pending(Ok(pending)) => {
-                ui.hide_toast();
                 ui.show_pending(&pending.title, pending.thumbnail.as_deref());
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {
-                ui.hide_toast();
                 ui.show_toast(&error);
             }
             Message::ToolUpdated(path) => {
@@ -496,9 +491,6 @@ fn tick(
 
     // Check for pending retries and show progress while the next attempt runs.
     if let Some(kind) = app.check_retries() {
-        // The scheduled-retry toast only describes the wait; once the wait is
-        // over the spinner says what is happening now.
-        ui.hide_toast();
         match kind {
             RetryKind::Resolver | RetryKind::SourceSelection => loading.resolve_started(),
             RetryKind::Playback => loading.resolved(),

@@ -254,7 +254,7 @@ export component MainWindow inherits Window {
         dismissed => { root.sidebar-open = false; }
     }
 
-    // Toast notifications (stacked, max 5)
+    // Toast notifications (auto-dismiss after 10s, stacked, max 5)
     ToastList {
         width: min(380px, parent.width - 40px);
         x: parent.width - self.width - 20px;
