@@ -12,9 +12,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::Error;
-use image_process::{is_renderable_jpeg, normalize_to_jpeg};
+use image_process::{is_renderable_jpeg, normalize_to_jpeg, write_scaled_jpeg};
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
+
+/// The largest preview the queue list needs; the row itself only draws it at
+/// 96 by 54 logical pixels, but a little headroom keeps it sharp on HiDPI.
+const PREVIEW_MAX_WIDTH: u32 = 320;
+const PREVIEW_MAX_HEIGHT: u32 = 180;
 
 /// A thumbnail is a preview, not the media: it must never keep a resolution
 /// waiting on a stalled server.
@@ -88,6 +93,9 @@ impl ThumbnailCache {
 
         // Normalize to JPEG (converts if needed, cleans up original temp file)
         normalize_to_jpeg(&temporary, &jpeg_path)?;
+        // A preview is what the queue list draws; making it now keeps the
+        // queue dialog from re-encoding every cached full-size image later.
+        let _ = self.write_preview(&jpeg_path);
 
         Ok(jpeg_path)
     }
@@ -95,6 +103,50 @@ impl ThumbnailCache {
     /// The path a thumbnail is cached at (always .jpg).
     pub fn path_for(&self, url: &str) -> PathBuf {
         self.directory.join(file_name_for(url))
+    }
+
+    /// Returns the small copy of a cached thumbnail, making it when needed.
+    ///
+    /// The full-size image is left untouched, so screens that want a larger
+    /// preview keep using it. Callers that only draw a list should use this
+    /// path: it decodes much faster and keeps far less pixel memory alive.
+    pub fn preview(&self, source: &Path) -> Result<Option<PathBuf>, Error> {
+        if !source.is_file() {
+            return Ok(None);
+        }
+        let preview = self.preview_path_for(source);
+        if preview.is_file() && is_renderable_jpeg(&preview) {
+            return Ok(Some(preview));
+        }
+        self.write_preview(source)?;
+        Ok(Some(preview))
+    }
+
+    /// Returns an already prepared preview without doing any image work.
+    ///
+    /// The queue list draws on the event loop, so it must never decode a
+    /// full-size thumbnail there. A missing preview simply means the
+    /// background warm-up has not reached that file yet.
+    pub fn preview_if_present(&self, source: &Path) -> Option<PathBuf> {
+        let preview = self.preview_path_for(source);
+        (preview.is_file() && is_renderable_jpeg(&preview)).then_some(preview)
+    }
+
+    /// Writes the bounded preview next to a cached thumbnail.
+    fn write_preview(&self, source: &Path) -> Result<(), Error> {
+        write_scaled_jpeg(
+            source,
+            &self.preview_path_for(source),
+            PREVIEW_MAX_WIDTH,
+            PREVIEW_MAX_HEIGHT,
+        )
+        .map_err(Error::from)
+    }
+
+    /// The path a preview is cached at, derived from the full-size name.
+    fn preview_path_for(&self, source: &Path) -> PathBuf {
+        let stem = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or("thumbnail");
+        self.directory.join(format!("{stem}.preview.jpg"))
     }
 
     /// Removes cached thumbnails when the active queue is replaced.
@@ -116,7 +168,11 @@ impl ThumbnailCache {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if thumbnail != Some(path.as_path()) && entry.file_type()?.is_file() {
+            let preview = thumbnail.map(|thumbnail| self.preview_path_for(thumbnail));
+            if thumbnail != Some(path.as_path())
+                && preview.as_deref() != Some(path.as_path())
+                && entry.file_type()?.is_file()
+            {
                 fs::remove_file(path)?;
             }
         }
@@ -136,7 +192,14 @@ impl ThumbnailCache {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(Error::Io(error)),
         };
-        let keep_names: HashSet<String> = keep.iter().map(|url| file_name_for(url)).collect();
+        let mut keep_names: HashSet<String> = HashSet::new();
+        for url in keep {
+            let name = file_name_for(url);
+            if let Some(stem) = Path::new(&name).file_stem().and_then(|stem| stem.to_str()) {
+                keep_names.insert(format!("{stem}.preview.jpg"));
+            }
+            keep_names.insert(name);
+        }
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -263,6 +326,49 @@ mod tests {
         }
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_preview_is_written_beside_the_full_thumbnail() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let full = cache.path_for("https://example.com/a.jpg");
+        write_valid_jpeg(&full);
+
+        let preview = cache.preview(&full).expect("preview works").expect("preview exists");
+
+        assert!(full.is_file());
+        assert!(preview.is_file());
+        let expected =
+            format!("{}.preview.jpg", full.file_stem().and_then(|stem| stem.to_str()).unwrap());
+        assert_eq!(preview.file_name().and_then(|name| name.to_str()), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn a_missing_preview_is_not_written_while_reading_the_present_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let full = cache.path_for("https://example.com/a.jpg");
+        write_valid_jpeg(&full);
+
+        assert!(cache.preview_if_present(&full).is_none());
+        let expected = cache.preview(&full).expect("preview works").expect("preview exists");
+        assert_eq!(cache.preview_if_present(&full), Some(expected));
+    }
+
+    #[test]
+    fn prune_keeps_the_preview_of_a_known_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = ThumbnailCache::new(temp.path());
+        let keep = "https://example.com/a.jpg";
+        let full = cache.path_for(keep);
+        write_valid_jpeg(&full);
+        let preview = cache.preview(&full).expect("preview works").expect("preview exists");
+
+        cache.prune(&[keep.to_string()]).unwrap();
+
+        assert!(full.is_file());
+        assert!(preview.is_file());
     }
 
     #[test]
