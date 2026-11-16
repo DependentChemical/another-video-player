@@ -369,15 +369,29 @@ fn requested_url(url: &str) -> Option<&str> {
     (!url.is_empty()).then_some(url)
 }
 
-/// The test URL that forces the update prompt to open immediately, even
-/// when the running version already is the latest one.
+/// The internal `test://` URL that forces the update prompt to open.
+///
+/// These URLs never reach the resolver: they are commands that exercise the
+/// interface directly, so `yt-dlp` never sees them.
 const TEST_UPDATE_URL: &str = "test://update-modal";
 
+/// Whether the given URL is one of the internal `test://` commands.
+fn is_test_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("test://")
+}
+
 /// Starts loading a URL for the user, from the bar or from the history.
+///
+/// A `test://` URL never reaches the resolver: it is an internal command that
+/// exercises the interface directly, so the resolver never sees it.
 fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
     let Some(url) = requested_url(url) else {
         return;
     };
+    if is_test_url(url) {
+        handle_test_url(ui, url);
+        return;
+    }
     if ui.has_media() {
         // Something plays already, so the new URL must not interrupt it. A
         // toast says the background is working and the dialog appears once
@@ -387,6 +401,31 @@ fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
         loading.borrow_mut().resolve_started();
     }
     app.load(url.to_string());
+}
+
+/// Handles the internal `test://` commands that exercise the interface.
+fn handle_test_url(ui: &PlayerUi, url: &str) {
+    match url.trim().to_ascii_lowercase().as_str() {
+        TEST_UPDATE_URL => {
+            let notes = "\
+## Test Update
+
+This is a test update notice shown when the `test://update-modal` URL is loaded.
+
+- First item
+- Second item
+- Third item
+- Fourth item
+- Fifth item
+- Sixth item
+- Seventh item
+- Eighth item
+- Ninth item
+- Tenth item";
+            ui.show_update("99.0.0", notes);
+        }
+        other => ui.show_toast(&format!("unknown test url: {other}")),
+    }
 }
 
 /// Chooses the next volume and remembers a nonzero level for the mute button.
