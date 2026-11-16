@@ -1,4 +1,4 @@
-﻿//! The SQLite database of Flatline.
+//! The SQLite database of Flatline.
 //!
 //! # Layer 1 of the isolation ladder
 //!
@@ -7,7 +7,7 @@
 //! mean; other crates such as `library` build their models on top of it.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub use rusqlite;
 use rusqlite::Connection;
@@ -36,8 +36,13 @@ impl From<rusqlite::Error> for Error {
 }
 
 /// A shared handle to the program database.
+///
+/// Cloning the handle shares the same underlying connection, so several
+/// capabilities (the queue and the thumbnail cache, for instance) can talk to
+/// one `app.db` without opening the file twice.
+#[derive(Debug, Clone)]
 pub struct Database {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl Database {
@@ -45,14 +50,14 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Database, Error> {
         let connection = Connection::open(path)?;
         configure(&connection)?;
-        Ok(Database { connection: Mutex::new(connection) })
+        Ok(Database { connection: Arc::new(Mutex::new(connection)) })
     }
 
     /// Opens a database that lives only in memory, which is what tests use.
     pub fn in_memory() -> Result<Database, Error> {
         let connection = Connection::open_in_memory()?;
         configure(&connection)?;
-        Ok(Database { connection: Mutex::new(connection) })
+        Ok(Database { connection: Arc::new(Mutex::new(connection)) })
     }
 
     /// Runs work against the underlying connection.

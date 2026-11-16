@@ -5,11 +5,24 @@ export component VideoPlayer inherits Rectangle {
     in property <string> status-kind: "info";
     in property <int> spinner-step: 0;
     in property <bool> has-media: false;
+    // Whether the media that plays has no video track (audio only source).
+    in property <bool> audio-only: false;
+    // The full-size thumbnail to show when the media is audio only.
+    in property <image> video-thumbnail;
     in property <bool> controls-visible: true;
     in property <length> container-height: 0;
     callback pointer-activity();
 
     background: transparent;
+
+    // When the media is audio only, mpv draws no video, so the full-size
+    // thumbnail fills the video area instead of a black screen.
+    if root.audio-only && root.has-media: Image {
+        width: parent.width;
+        height: parent.container-height;
+        source: root.video-thumbnail;
+        image-fit: contain;
+    }
 
     TouchArea {
         width: root.width;

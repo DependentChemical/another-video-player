@@ -317,6 +317,18 @@ impl PlayerUi {
         self.window.set_has_media(has_media);
     }
 
+    /// Whether the media that is playing has no video track.
+    pub fn set_audio_only(&self, audio_only: bool) {
+        self.window.set_audio_only(audio_only);
+    }
+
+    /// The full-size thumbnail to show when the media is audio only.
+    pub fn set_video_thumbnail(&self, thumbnail: Option<&Path>) {
+        let image =
+            thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
+        self.window.set_video_thumbnail(image);
+    }
+
     /// Whether the window has loaded media.
     pub fn has_media(&self) -> bool {
         self.window.get_has_media()

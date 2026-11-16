@@ -50,6 +50,9 @@ export component MainWindow inherits Window {
     // Whether the source picker is open. The host closes it on a new load.
     in-out property <bool> sources-open: false;
     in property <bool> has-media: false;
+    in property <image> video-thumbnail;
+    // Whether the media that plays has no video track (audio only source).
+    in property <bool> audio-only: false;
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
@@ -186,6 +189,8 @@ export component MainWindow inherits Window {
         status-kind: root.status-kind;
         spinner-step: root.spinner-step;
         has-media: root.has-media;
+        audio-only: root.audio-only;
+        video-thumbnail: root.video-thumbnail;
         controls-visible: root.controls-visible;
         pointer-activity => { root.pointer-activity(); }
     }

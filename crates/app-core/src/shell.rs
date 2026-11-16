@@ -158,6 +158,10 @@ impl Shell {
                     );
                     ui_for_pending.set_has_media(true);
                     ui_for_pending.set_live(loaded.is_live);
+                    ui_for_pending.set_video_thumbnail(loaded.thumbnail.as_deref());
+                    ui_for_pending.set_audio_only(
+                        loaded.video.is_none() && loaded.muxed.is_none() && loaded.audio.is_some(),
+                    );
                     loading.borrow_mut().resolved();
                     if let Some(duration) = loaded.duration {
                         ui_for_pending.set_duration(duration);
@@ -530,6 +534,10 @@ fn tick(
                 );
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
+                ui.set_video_thumbnail(loaded.thumbnail.as_deref());
+                ui.set_audio_only(
+                    loaded.video.is_none() && loaded.muxed.is_none() && loaded.audio.is_some(),
+                );
                 loading.resolved();
                 if let Some(duration) = loaded.duration {
                     ui.set_duration(duration);
@@ -577,10 +585,11 @@ fn tick(
                 }
                 ui.show_toast(&text);
             }
-            Message::QueuePreviewsReady => {
-                if ui.window().get_queue_open() {
-                    ui.show_queue(&queue_list(app));
-                }
+            Message::ThumbnailMigrationStarted { count } => {
+                ui.show_toast(&format!("Migrating {count} thumbnails to the new cache…"));
+            }
+            Message::ThumbnailMigrationFinished { processed } => {
+                ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));
             }
             Message::RetryScheduled { error, delay_seconds, kind } => {
                 loading.retry_scheduled();
