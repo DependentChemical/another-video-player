@@ -15,7 +15,20 @@ export component QueueDialog inherits Rectangle {
     callback remove-entry(int);
     callback dismissed();
 
+    private property <length> row-height: 76px;
+    private property <length> row-spacing: 4px;
+    private property <length> row-step: root.row-height + root.row-spacing;
+    private property <length> button-size: 32px;
+    private property <length> menu-anchor-x: 0px;
+    private property <length> menu-anchor-y: 0px;
+
     background: #00000088;
+
+    changed open => {
+        if !self.open {
+            self.menu-open = false;
+        }
+    }
 
     TouchArea {
         clicked => {
@@ -70,14 +83,18 @@ export component QueueDialog inherits Rectangle {
 
             if root.items.length > 0: scroll-view := ScrollView {
                 vertical-stretch: 1;
-                content-y: root.open && root.current-index >= 0 ? root.current-index * 80px : 0px;
+                // ScrollView offsets are negative; a positive value would try
+                // to scroll above the first row and make the list jump.
+                content-y: root.open && root.current-index >= 0
+                    ? -(root.current-index * root.row-step)
+                    : 0px;
 
                 VerticalLayout {
-                    spacing: 4px;
+                    spacing: root.row-spacing;
                     padding-right: 12px;
 
                     for item in root.items: Rectangle {
-                        height: 76px;
+                        height: root.row-height;
                         border-radius: 8px;
                         background: item.current
                             ? Theme.elevated
@@ -89,24 +106,34 @@ export component QueueDialog inherits Rectangle {
                             padding-left: 8px;
                             padding-right: 12px;
                             spacing: 12px;
-                            alignment: start;
                             cross-axis-alignment: center;
 
-                            Rectangle {
+                            // The whole row except the buttons opens the
+                            // entry. The default `stretch` alignment lets this
+                            // take every pixel the buttons leave over, so the
+                            // buttons stay pinned to the right on every row.
+                            clickable := Rectangle {
                                 horizontal-stretch: 1;
+                                min-width: 0px;
                                 background: transparent;
 
                                 HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 12px;
                                     spacing: 12px;
-                                    alignment: start;
                                     cross-axis-alignment: center;
 
-                                    if item.current: PlayIcon {
+                                    // A fixed slot keeps the thumbnails of all
+                                    // rows aligned while only the current row
+                                    // shows the play marker.
+                                    Rectangle {
                                         width: 16px;
                                         height: 16px;
-                                        ink: Theme.accent;
+                                        background: transparent;
+
+                                        if item.current: PlayIcon {
+                                            width: 16px;
+                                            height: 16px;
+                                            ink: Theme.accent;
+                                        }
                                     }
 
                                     Rectangle {
@@ -125,27 +152,28 @@ export component QueueDialog inherits Rectangle {
                                     }
 
                                     VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
                                         spacing: 2px;
-                                        alignment: start;
+                                        alignment: center;
 
                                         Text {
-                                            height: 34px;
                                             text: item.title;
                                             color: Theme.fg;
                                             font-size: 13px;
                                             wrap: word-wrap;
                                             overflow: elide;
-                                            vertical-alignment: center;
+                                            max-lines: 2;
+                                            min-width: 0px;
                                         }
 
                                         Text {
-                                            height: 16px;
                                             text: item.uploader;
                                             color: Theme.muted;
                                             font-size: 12px;
                                             wrap: word-wrap;
                                             overflow: elide;
-                                            vertical-alignment: center;
+                                            max-lines: 1;
                                         }
                                     }
                                 }
@@ -158,45 +186,56 @@ export component QueueDialog inherits Rectangle {
                                 }
                             }
 
-                            // More options button (three dots)
-                            option-button := Rectangle {
-                                width: 32px;
-                                height: 32px;
-                                border-radius: 6px;
-                                background: option-touch.has-hover ? Theme.elevated : transparent;
+                            // The button set is its own fixed column, so every
+                            // row lines its buttons up on the same right edge.
+                            HorizontalLayout {
+                                horizontal-stretch: 0;
+                                spacing: 4px;
+                                alignment: end;
+                                cross-axis-alignment: center;
 
-                                MoreIcon {
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    ink: option-touch.has-hover ? Theme.fg : Theme.muted;
-                                }
+                                // More options button (three dots)
+                                option-button := Rectangle {
+                                    width: root.button-size;
+                                    height: root.button-size;
+                                    border-radius: 6px;
+                                    background: option-touch.has-hover ? Theme.elevated : transparent;
 
-                                option-touch := TouchArea {
-                                    clicked => {
-                                        root.menu-open = true;
-                                        root.menu-url = item.url;
+                                    MoreIcon {
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        ink: option-touch.has-hover ? Theme.fg : Theme.muted;
+                                    }
+
+                                    option-touch := TouchArea {
+                                        clicked => {
+                                            root.menu-anchor-x = option-button.absolute-position.x
+                                                - panel.absolute-position.x + option-button.width;
+                                            root.menu-anchor-y = option-button.absolute-position.y
+                                                - panel.absolute-position.y + option-button.height + 4px;
+                                            root.menu-open = true;
+                                            root.menu-url = item.url;
+                                        }
                                     }
                                 }
-                            }
 
-                            // Delete button
-                            delete-button := Rectangle {
-                                width: 32px;
-                                height: 32px;
-                                border-radius: 6px;
-                                background: delete-touch.has-hover ? Theme.danger : transparent;
+                                // Delete button
+                                delete-button := Rectangle {
+                                    width: root.button-size;
+                                    height: root.button-size;
+                                    border-radius: 6px;
+                                    background: delete-touch.has-hover ? Theme.danger : transparent;
 
-                                DeleteIcon {
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    ink: delete-touch.has-hover ? Theme.on-accent : Theme.muted;
-                                }
+                                    DeleteIcon {
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        ink: delete-touch.has-hover ? Theme.on-accent : Theme.muted;
+                                    }
 
-                                delete-touch := TouchArea {
-                                    clicked => {
-                                        root.remove-entry(item.position);
-                                        root.open = false;
-                                        root.dismissed();
+                                    delete-touch := TouchArea {
+                                        clicked => {
+                                            root.remove-entry(item.id);
+                                        }
                                     }
                                 }
                             }
@@ -206,10 +245,10 @@ export component QueueDialog inherits Rectangle {
             }
         }
 
-        // Menu overlay, on top of the list but inside the panel.
+        // The menu overlay sits on top of the panel, so a click anywhere else
+        // closes the menu. The menu is positioned from the button that opened
+        // it, like a regular popup, and sized to its contents.
         if root.menu-open: Rectangle {
-            x: 0;
-            y: 0;
             width: panel.width;
             height: panel.height;
             background: transparent;
@@ -221,9 +260,11 @@ export component QueueDialog inherits Rectangle {
             }
 
             menu := Rectangle {
-                x: panel.width - 200px;
-                y: 48px;
-                width: 180px;
+                x: min(max(8px, root.menu-anchor-x - self.width),
+                    panel.width - self.width - 8px);
+                y: min(root.menu-anchor-y, panel.height - self.height - 8px);
+                width: menu-layout.preferred-width;
+                height: menu-layout.preferred-height;
                 background: Theme.panel;
                 border-radius: 6px;
                 border-width: 1px;
@@ -231,7 +272,7 @@ export component QueueDialog inherits Rectangle {
                 drop-shadow-blur: 8px;
                 drop-shadow-color: #00000080;
 
-                VerticalLayout {
+                menu-layout := VerticalLayout {
                     padding: 4px;
                     spacing: 2px;
 
@@ -244,14 +285,13 @@ export component QueueDialog inherits Rectangle {
                             spacing: 8px;
                             padding-left: 8px;
                             padding-right: 8px;
-                            alignment: start;
                             cross-axis-alignment: center;
 
                             ContentCopyIcon {
                                 ink: menu-touch.has-hover ? Theme.accent : Theme.muted;
                             }
                             Text {
-                                text: "Copy Url";
+                                text: "Copy URL";
                                 color: Theme.fg;
                                 font-size: 13px;
                             }

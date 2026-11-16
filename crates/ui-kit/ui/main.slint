@@ -309,7 +309,7 @@ export component MainWindow inherits Window {
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
         copy-url(url) => { root.queue-copy-url(url); }
-        remove-entry(position) => { root.queue-remove-entry(position); }
+        remove-entry(id) => { root.queue-remove-entry(id); }
         dismissed => { root.queue-open = false; }
     }
 
