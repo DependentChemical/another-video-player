@@ -133,6 +133,8 @@ pub struct SourceLists {
 /// One entry of the active queue shown in the queue dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueListEntry {
+    /// The stable database id of the entry, used to remove exactly one row.
+    pub id: i32,
     /// The position of the entry in the active queue.
     pub position: i32,
     /// Human readable title of the media.
@@ -403,6 +405,14 @@ impl PlayerUi {
         self.sweep_toasts();
     }
 
+    /// Puts text on the system clipboard.
+    ///
+    /// Returns whether the platform accepted the text, so the caller can tell
+    /// the user that copying failed instead of pretending it worked.
+    pub fn copy_to_clipboard(&self, text: &str) -> bool {
+        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)).is_ok()
+    }
+
     /// Makes sure the sweep timer runs while any toast is on screen.
     fn sweep_toasts(&self) {
         if self.toast_timer.running() {
@@ -455,6 +465,7 @@ impl PlayerUi {
         let items: Vec<QueueItem> = entries
             .iter()
             .map(|entry| QueueItem {
+                id: entry.id,
                 position: entry.position,
                 title: entry.title.as_str().into(),
                 uploader: entry.uploader.as_str().into(),
@@ -634,7 +645,8 @@ impl PlayerUi {
 
     /// Called when the user asks to remove an entry from the active queue.
     ///
-    /// The argument is the position of the entry in the queue.
+    /// The argument is the stable id of the entry, so exactly one row is
+    /// removed even if positions ever collide.
     pub fn on_queue_remove_entry(&self, handler: impl Fn(i32) + 'static) {
         self.window.on_queue_remove_entry(handler);
     }
@@ -681,6 +693,7 @@ mod tests {
         assert_eq!(ui.window().get_media_uploader(), "Test Channel");
 
         ui.show_queue(&[QueueListEntry {
+            id: 1,
             position: 0,
             title: "First".to_string(),
             uploader: "Uploader".to_string(),
@@ -690,6 +703,7 @@ mod tests {
         }]);
         assert!(ui.window().get_queue_open());
         assert_eq!(ui.window().get_queue_items().row_count(), 1);
+        assert_eq!(ui.window().get_queue_items().row_data(0).expect("the row exists").id, 1);
 
         ui.show_history(&[HistoryListEntry {
             title: "First".to_string(),
