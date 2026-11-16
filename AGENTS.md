@@ -32,6 +32,17 @@ After returning to `dev`, remove generated build output such as `target/`
 and `dist/` so the workspace is clean. Keep `.flatline/`, which holds
 downloaded runtime dependencies and state rather than build output.
 
+### The pre-test on `dev`
+
+The `dev-test` workflow is the pre-test for `main`. It runs the same checks
+as a release — the tests and the Windows and Linux builds — but it never
+creates a release, so it is safe to run on `dev` as often as needed. It is
+triggered by a push to `dev` or by hand with `workflow_dispatch`.
+
+The automated release stays on `main`: the `Build` workflow runs on every push
+to `main` and the `Release` workflow publishes the release when that build
+succeeds.
+
 ## The isolation rule
 
 This is the rule the whole repository is built around. It is not a style
