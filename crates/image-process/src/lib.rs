@@ -54,6 +54,31 @@ pub fn normalize_to_jpeg(source: &Path, destination: &Path) -> Result<(), Error>
     Ok(())
 }
 
+/// Converts an image file to a bounded JPEG, writing the result to
+/// `destination` without deleting the source.
+///
+/// This is what the queue preview uses: the full-size cache stays in place
+/// for screens that want it, while a small copy is cheap to decode every time
+/// a long list is drawn. Images that already fit are left at their size.
+pub fn write_scaled_jpeg(
+    source: &Path,
+    destination: &Path,
+    max_width: u32,
+    max_height: u32,
+) -> Result<(), Error> {
+    if !source.is_file() {
+        return Err(Error::NotFound(source.to_path_buf()));
+    }
+
+    let image = decode(source)?;
+    let scaled = if image.width() > max_width || image.height() > max_height {
+        image.thumbnail(max_width, max_height)
+    } else {
+        image
+    };
+    write_jpeg(&scaled, destination)
+}
+
 /// Returns whether `path` is a JPEG whose header can be decoded.
 ///
 /// The cache uses this to discard a file that was left behind by an older
@@ -209,6 +234,39 @@ mod tests {
         normalize_to_jpeg(&source, &destination).unwrap();
 
         assert!(is_renderable_jpeg(&destination));
+    }
+
+    #[test]
+    fn scales_a_large_image_to_fit_and_keeps_the_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("thumbnail.png");
+        let destination = temp.path().join("preview.jpg");
+        let image = image::ImageBuffer::from_fn(8, 4, |_, _| image::Rgb([255u8, 0, 0]));
+        image.save(&source).unwrap();
+
+        write_scaled_jpeg(&source, &destination, 4, 4).unwrap();
+
+        assert!(source.is_file());
+        let preview = image::open(&destination).unwrap();
+        assert!(preview.width() <= 4);
+        assert!(preview.height() <= 4);
+        assert_eq!(preview.width(), 4);
+        assert_eq!(preview.height(), 2);
+    }
+
+    #[test]
+    fn a_small_image_stays_at_its_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("thumbnail.png");
+        let destination = temp.path().join("preview.jpg");
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        image.save(&source).unwrap();
+
+        write_scaled_jpeg(&source, &destination, 320, 180).unwrap();
+
+        let preview = image::open(&destination).unwrap();
+        assert_eq!(preview.width(), 2);
+        assert_eq!(preview.height(), 2);
     }
 
     #[test]

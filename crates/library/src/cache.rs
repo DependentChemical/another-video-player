@@ -1,20 +1,44 @@
 //! The thumbnail cache.
 //!
-//! Flatline shows a preview of a video before the user decides what to do
-//! with it. The image is downloaded once and kept in a cache directory
-//! beside the program, keyed by the URL it came from, so the same video is
-//! never fetched twice.
+//! Flatline keeps three sized copies of every thumbnail (full, mid and
+//! small) in a `thumbnail_cache` table beside the active queue, so the same
+//! video is never fetched twice and each screen draws the size it actually
+//! needs.
+//!
+//! A thumbnail is addressed by a stable id made of a prefix and the hash of
+//! the cleaned video URL (`thumb_<md5>`), so a video that appears in the
+//! queue twice reuses one thumbnail instead of being downloaded twice. The
+//! prefix is what tells a new-style id apart from an old-style direct file
+//! path.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use database::Database;
+use media_model::video_id_hash;
+use rusqlite::{OptionalExtension, params};
 
 use crate::Error;
-use image_process::{is_renderable_jpeg, normalize_to_jpeg};
+use image_process::{is_renderable_jpeg, normalize_to_jpeg, write_scaled_jpeg};
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
+
+/// Prefix that distinguishes a new-style thumbnail id from an old-style
+/// direct file path.
+pub const THUMBNAIL_ID_PREFIX: &str = "thumb_";
+
+/// The largest preview the queue list needs; the row itself only draws it at
+/// 96 by 54 logical pixels, but a little headroom keeps it sharp on HiDPI.
+const SMALL_MAX_WIDTH: u32 = 320;
+const SMALL_MAX_HEIGHT: u32 = 180;
+
+/// The size used by the "add to queue / play now" dialog.
+const MID_MAX_WIDTH: u32 = 640;
+const MID_MAX_HEIGHT: u32 = 360;
 
 /// A thumbnail is a preview, not the media: it must never keep a resolution
 /// waiting on a stalled server.
@@ -25,15 +49,23 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The directory downloaded thumbnails are kept in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ThumbnailCache {
+    db: Arc<Database>,
     directory: PathBuf,
 }
 
 impl ThumbnailCache {
-    /// Creates a cache that writes into `directory`.
-    pub fn new(directory: impl Into<PathBuf>) -> ThumbnailCache {
-        ThumbnailCache { directory: directory.into() }
+    /// Creates a cache that writes images into `directory` and keeps its
+    /// records in the database `db`.
+    ///
+    /// The `thumbnail_cache` table is created when it is missing.
+    pub fn new(db: Database, directory: impl Into<PathBuf>) -> ThumbnailCache {
+        let directory = directory.into();
+        let _ = fs::create_dir_all(&directory);
+        let cache = ThumbnailCache { db: Arc::new(db), directory };
+        cache.ensure_schema().ok();
+        cache
     }
 
     /// The directory the cached images live in.
@@ -41,39 +73,152 @@ impl ThumbnailCache {
         &self.directory
     }
 
-    /// Returns the cached file for a thumbnail, downloading it when needed.
+    /// Whether `value` is a new-style thumbnail id rather than an old-style
+    /// direct file path.
+    pub fn is_thumbnail_id(value: &str) -> bool {
+        value.starts_with(THUMBNAIL_ID_PREFIX)
+    }
+
+    /// The stable id of the thumbnail for `video_url`.
     ///
-    /// A thumbnail that is already cached is returned as it is, so a repeated
-    /// request never hits the network again. The download lands in a scratch
-    /// file first and is moved into place afterwards, so an interrupted
-    /// download never leaves a broken image behind.
+    /// The id is the prefix plus the hash of the cleaned video URL, so the
+    /// same video always reuses the same thumbnail and is never downloaded
+    /// twice.
+    pub fn thumbnail_id_for(video_url: &str) -> String {
+        format!("{}{}", THUMBNAIL_ID_PREFIX, video_id_hash(video_url))
+    }
+
+    /// Ensures the `thumbnail_cache` table exists.
+    fn ensure_schema(&self) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS thumbnail_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thumbnail_id TEXT NOT NULL UNIQUE,
+                    source_url TEXT,
+                    full_path TEXT NOT NULL,
+                    mid_path TEXT NOT NULL,
+                    small_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS thumbnail_cache_thumbnail_id
+                    ON thumbnail_cache(thumbnail_id);",
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
+    /// Returns whether a row for `id` already exists.
+    fn thumbnail_exists(&self, id: &str) -> Result<bool, Error> {
+        let exists = self
+            .db
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                Ok(count > 0)
+            })
+            .map_err(Error::from)?;
+        Ok(exists)
+    }
+
+    /// The path the full-size copy of `id` is stored at.
+    fn full_file(&self, id: &str) -> PathBuf {
+        self.directory.join(format!("{id}.jpg"))
+    }
+
+    /// The path the mid-size copy of `id` is stored at.
+    fn mid_file(&self, id: &str) -> PathBuf {
+        self.directory.join(format!("{id}.mid.jpg"))
+    }
+
+    /// The path the small copy of `id` is stored at.
+    fn small_file(&self, id: &str) -> PathBuf {
+        self.directory.join(format!("{id}.small.jpg"))
+    }
+
+    /// Returns the full-size thumbnail for `id`, when it is on disk and
+    /// readable.
+    pub fn full_path(&self, id: &str) -> Option<PathBuf> {
+        let path = match self.db.with_connection(|connection| {
+            connection.query_row(
+                "SELECT full_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0).map(PathBuf::from),
+            )
+        }) {
+            Ok(path) => path,
+            _ => return None,
+        };
+        (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
+    }
+
+    /// Returns the mid-size thumbnail for `id`, when it is on disk and
+    /// readable.
+    pub fn mid_path(&self, id: &str) -> Option<PathBuf> {
+        let path = match self.db.with_connection(|connection| {
+            connection.query_row(
+                "SELECT mid_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0).map(PathBuf::from),
+            )
+        }) {
+            Ok(path) => path,
+            _ => return None,
+        };
+        (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
+    }
+
+    /// Returns the small thumbnail for `id`, when it is on disk and readable.
+    pub fn small_path(&self, id: &str) -> Option<PathBuf> {
+        let path = match self.db.with_connection(|connection| {
+            connection.query_row(
+                "SELECT small_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0).map(PathBuf::from),
+            )
+        }) {
+            Ok(path) => path,
+            _ => return None,
+        };
+        (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
+    }
+
+    /// Returns the cached thumbnail for `video_url`, downloading it from
+    /// `thumbnail_url` when needed.
     ///
-    /// The cached thumbnail is always normalized to JPEG so the UI can render
-    /// it. A cached file whose header cannot be read is downloaded again.
-    pub fn fetch(&self, url: &str) -> Result<PathBuf, Error> {
-        let jpeg_path = self.path_for(url);
-        if jpeg_path.is_file() {
-            if is_renderable_jpeg(&jpeg_path) {
-                return Ok(jpeg_path);
-            }
-            match fs::remove_file(&jpeg_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(Error::Io(error)),
-            }
+    /// The same video always yields the same id, so a queue that lists the
+    /// video twice downloads the thumbnail only once. When a thumbnail is
+    /// already cached the network is never touched. Returns the thumbnail id
+    /// the active queue should store.
+    pub fn fetch(&self, video_url: &str, thumbnail_url: Option<&str>) -> Result<String, Error> {
+        let id = ThumbnailCache::thumbnail_id_for(video_url);
+        if self.thumbnail_exists(&id)? {
+            return Ok(id);
         }
+        let Some(thumbnail_url) = thumbnail_url else {
+            return Ok(id);
+        };
+
+        let full_path = self.full_file(&id);
+        let mid_path = self.mid_file(&id);
+        let small_path = self.small_file(&id);
 
         fs::create_dir_all(&self.directory)?;
         self.remove_stale_partials();
 
         // The download is format-agnostic: the scratch name has no meaning,
         // because the normalizer guesses the real format from the bytes.
-        let temp_name = format!("{:016x}.part", fnv1a(url.as_bytes()));
+        let temp_name = format!("{:016x}.part", fnv1a(thumbnail_url.as_bytes()));
         let temporary = self.directory.join(temp_name);
         let _scratch = ScratchFile(&temporary);
 
         {
-            let mut response = ureq::get(url)
+            let mut response = ureq::get(thumbnail_url)
                 .header("User-Agent", USER_AGENT)
                 .config()
                 .timeout_global(Some(DOWNLOAD_TIMEOUT))
@@ -86,57 +231,228 @@ impl ThumbnailCache {
             file.sync_all()?;
         }
 
-        // Normalize to JPEG (converts if needed, cleans up original temp file)
-        normalize_to_jpeg(&temporary, &jpeg_path)?;
+        // Normalize to full-size JPEG, then derive the mid and small copies
+        // by fitting each inside its target dimensions without distorting the
+        // aspect ratio. The source download is removed by the normalizer.
+        normalize_to_jpeg(&temporary, &full_path)?;
+        write_scaled_jpeg(&full_path, &mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT)
+            .map_err(Error::from)?;
+        write_scaled_jpeg(&full_path, &small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT)
+            .map_err(Error::from)?;
 
-        Ok(jpeg_path)
+        let now = unix_time();
+        self.db.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    thumbnail_url,
+                    full_path.to_string_lossy(),
+                    mid_path.to_string_lossy(),
+                    small_path.to_string_lossy(),
+                    now,
+                ],
+            )?;
+            Ok(())
+        }).map_err(Error::from)?;
+
+        Ok(id)
     }
 
-    /// The path a thumbnail is cached at (always .jpg).
-    pub fn path_for(&self, url: &str) -> PathBuf {
-        self.directory.join(file_name_for(url))
-    }
-
-    /// Removes cached thumbnails when the active queue is replaced.
-    pub fn clear(&self) -> Result<(), Error> {
-        match fs::remove_dir_all(&self.directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(Error::Io(error)),
+    /// Imports an old-style direct file path into the new cache.
+    ///
+    /// When the legacy file is already a valid JPEG it is moved straight into
+    /// the full-size slot without a lossy re-encode; otherwise it is decoded
+    /// and re-encoded. The mid and small copies are always derived from the
+    /// full-size file. Returns the thumbnail id the active queue should now
+    /// point at. When an entry for the video already exists nothing is done
+    /// and that id is returned.
+    pub fn register_legacy(&self, video_url: &str, legacy_path: &Path) -> Result<String, Error> {
+        let id = ThumbnailCache::thumbnail_id_for(video_url);
+        if self.thumbnail_exists(&id)? {
+            return Ok(id);
         }
+        if !legacy_path.is_file() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "legacy thumbnail file is missing",
+            )));
+        }
+
+        let full_path = self.full_file(&id);
+        let mid_path = self.mid_file(&id);
+        let small_path = self.small_file(&id);
+
+        fs::create_dir_all(&self.directory)?;
+
+        // A legacy JPEG is already a finished full-size image: move it into
+        // place instead of re-encoding it, so we avoid generational quality
+        // loss. Anything that is not a valid JPEG still goes through the
+        // normalizer.
+        if is_renderable_jpeg(legacy_path) {
+            let _ = fs::remove_file(&full_path);
+            fs::rename(legacy_path, &full_path)?;
+        } else {
+            normalize_to_jpeg(legacy_path, &full_path)?;
+        }
+        write_scaled_jpeg(&full_path, &mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT)
+            .map_err(Error::from)?;
+        write_scaled_jpeg(&full_path, &small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT)
+            .map_err(Error::from)?;
+
+        let now = unix_time();
+        self.db.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    legacy_path.to_string_lossy(),
+                    full_path.to_string_lossy(),
+                    mid_path.to_string_lossy(),
+                    small_path.to_string_lossy(),
+                    now,
+                ],
+            )?;
+            Ok(())
+        }).map_err(Error::from)?;
+
+        Ok(id)
     }
 
-    /// Removes cached thumbnails other than the one being put in the new queue.
-    pub fn retain(&self, thumbnail: Option<&Path>) -> Result<(), Error> {
-        let entries = match fs::read_dir(&self.directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(Error::Io(error)),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if thumbnail != Some(path.as_path()) && entry.file_type()?.is_file() {
-                fs::remove_file(path)?;
+    /// Deletes the thumbnail record `id` and its three image files, but only
+    /// when no entry in the active queue still points at it.
+    pub fn release_thumbnail(&self, id: &str) -> Result<(), Error> {
+        let referenced = self
+            .db
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT COUNT(*) FROM active_queue WHERE thumbnail = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                Ok(count)
+            })
+            .map_err(Error::from)?;
+
+        if referenced == 0 {
+            self.delete_thumbnail(id)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every thumbnail record and image file that no entry in the
+    /// active queue points at.
+    pub fn release_unreferenced_thumbnails(&self) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                // The ids still referenced by the queue.
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT thumbnail FROM active_queue
+                 WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                let referenced: HashSet<String> = rows.filter_map(Result::ok).collect();
+
+                // Every record in the cache.
+                let mut statement = connection.prepare(
+                    "SELECT thumbnail_id, full_path, mid_path, small_path FROM thumbnail_cache",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows.filter_map(Result::ok) {
+                    let (id, full, mid, small) = row;
+                    if !referenced.contains(&id) {
+                        let _ = connection.execute(
+                            "DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                            params![id],
+                        );
+                        for path in [&full, &mid, &small] {
+                            let _ = fs::remove_file(Path::new(path));
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
+    /// Deletes the thumbnail record `id` and its three image files.
+    fn delete_thumbnail(&self, id: &str) -> Result<(), Error> {
+        let paths = self.db.with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT full_path, mid_path, small_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+        }).map_err(Error::from)?;
+
+        let _ = self
+            .db
+            .with_connection(|connection| {
+                connection
+                    .execute("DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1", params![id])
+            })
+            .map_err(Error::from)?;
+
+        if let Some((full, mid, small)) = paths {
+            for path in [&full, &mid, &small] {
+                let _ = fs::remove_file(Path::new(path));
             }
         }
         Ok(())
     }
 
-    /// Removes cached thumbnails that are no longer referenced, plus any
-    /// file that is not a healthy JPEG.
+    /// Removes every image file in the cache directory that does not belong
+    /// to a row in `thumbnail_cache`, plus any scratch file left behind.
     ///
-    /// The caller's job is to pass every thumbnail URL that is still in use,
-    /// most conveniently the ones from the active queue and the history.
-    /// Files that miss from that set, or that a fetch left behind in a bad
-    /// state, are deleted, so the cache does not grow with dead weight.
-    pub fn prune(&self, keep: &[String]) -> Result<(), Error> {
+    /// This is the start-up orphan cleanup and is meant to run in the
+    /// background.
+    pub fn prune_orphans(&self) -> Result<(), Error> {
+        let referenced = self
+            .db
+            .with_connection(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT full_path, mid_path, small_path FROM thumbnail_cache")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                let mut names: HashSet<String> = HashSet::new();
+                for row in rows.filter_map(Result::ok) {
+                    for path in [&row.0, &row.1, &row.2] {
+                        if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+                Ok(names)
+            })
+            .map_err(Error::from)?;
+
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(Error::Io(error)),
         };
-        let keep_names: HashSet<String> = keep.iter().map(|url| file_name_for(url)).collect();
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_file() {
@@ -146,7 +462,7 @@ impl ThumbnailCache {
                 Some(name) => name,
                 None => continue,
             };
-            if !name.ends_with(".jpg") || !keep_names.contains(name) || !is_renderable_jpeg(&path) {
+            if !referenced.contains(name) {
                 let _ = fs::remove_file(&path);
             }
         }
@@ -187,12 +503,15 @@ impl Drop for ScratchFile<'_> {
     }
 }
 
-/// The file name a thumbnail URL is cached under (always .jpg).
-pub fn file_name_for(url: &str) -> String {
-    format!("{:016x}.jpg", fnv1a(url.as_bytes()))
+/// Seconds since the Unix epoch for timestamps.
+fn unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
-/// A 64 bit FNV-1a hash, used only for cache file names.
+/// A 64 bit FNV-1a hash, used only for scratch file names.
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -206,38 +525,95 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_file_name_always_ends_with_jpg() {
-        assert!(file_name_for("https://example.com/image.jpg").ends_with(".jpg"));
-        assert!(file_name_for("https://example.com/image.png").ends_with(".jpg"));
-        assert!(file_name_for("https://example.com/image.webp").ends_with(".jpg"));
-        assert!(file_name_for("https://example.com/image").ends_with(".jpg"));
+    fn write_valid_jpeg(path: &Path) {
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .expect("a valid JPEG encodes");
+        fs::write(path, &bytes).unwrap();
+    }
+
+    fn test_cache() -> (ThumbnailCache, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::in_memory().expect("database opens");
+        let cache = ThumbnailCache::new(db, temp.path());
+        (cache, temp)
     }
 
     #[test]
-    fn different_urls_get_different_names() {
-        let first = file_name_for("https://example.com/a.jpg");
-        let second = file_name_for("https://example.com/b.jpg");
+    fn the_prefix_distinguishes_new_ids_from_legacy_paths() {
+        assert!(ThumbnailCache::is_thumbnail_id("thumb_abcdef"));
+        assert!(!ThumbnailCache::is_thumbnail_id("/tmp/legacy.jpg"));
+        assert!(!ThumbnailCache::is_thumbnail_id("legacy.jpg"));
+        assert!(!ThumbnailCache::is_thumbnail_id(""));
+    }
+
+    #[test]
+    fn thumbnail_id_is_based_on_the_cleaned_video_url() {
+        let first = ThumbnailCache::thumbnail_id_for(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc&t=30s",
+        );
+        let second =
+            ThumbnailCache::thumbnail_id_for("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(first, second);
+        assert!(first.starts_with(THUMBNAIL_ID_PREFIX));
+    }
+
+    #[test]
+    fn different_videos_get_different_ids() {
+        let first = ThumbnailCache::thumbnail_id_for("https://example.com/a");
+        let second = ThumbnailCache::thumbnail_id_for("https://example.com/b");
         assert_ne!(first, second);
     }
 
     #[test]
-    fn the_same_url_gets_the_same_name() {
-        let url = "https://example.com/a.jpg?x=1";
-        assert_eq!(file_name_for(url), file_name_for(url));
+    fn full_mid_and_small_files_have_distinct_names() {
+        let (cache, _temp) = test_cache();
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/a");
+        assert_ne!(cache.full_file(&id), cache.mid_file(&id));
+        assert_ne!(cache.mid_file(&id), cache.small_file(&id));
+        assert_ne!(cache.full_file(&id), cache.small_file(&id));
     }
 
     #[test]
-    fn the_path_lives_in_the_cache_directory() {
-        let cache = ThumbnailCache::new("/tmp/flatline-cache");
-        let path = cache.path_for("https://example.com/a.jpg");
-        assert_eq!(path.parent(), Some(Path::new("/tmp/flatline-cache")));
+    fn prune_orphans_removes_files_not_in_the_cache() {
+        let (cache, temp) = test_cache();
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/a");
+        let full = cache.full_file(&id);
+        let mid = cache.mid_file(&id);
+        let small = cache.small_file(&id);
+        write_valid_jpeg(&full);
+        write_valid_jpeg(&mid);
+        write_valid_jpeg(&small);
+        cache
+            .db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, "https://example.com/a", full.to_string_lossy(), mid.to_string_lossy(), small.to_string_lossy(), 1],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let orphan = temp.path().join("orphan.jpg");
+        write_valid_jpeg(&orphan);
+        let stray = temp.path().join("stray.bin");
+        fs::write(&stray, b"junk").unwrap();
+
+        cache.prune_orphans().unwrap();
+
+        assert!(full.is_file());
+        assert!(mid.is_file());
+        assert!(small.is_file());
+        assert!(!orphan.is_file());
+        assert!(!stray.is_file());
     }
 
     #[test]
     fn stale_scratch_files_are_removed_but_fresh_ones_are_kept() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = ThumbnailCache::new(temp.path());
+        let (cache, temp) = test_cache();
         let stale = temp.path().join("stale.webp.part");
         let fresh = temp.path().join("fresh.jpg.part");
         fs::write(&stale, b"junk").unwrap();
@@ -253,8 +629,8 @@ mod tests {
 
     #[test]
     fn a_scratch_file_is_removed_when_the_fetch_ends() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("thumbnail.part");
+        let (cache, _temp) = test_cache();
+        let path = cache.directory.join("thumbnail.part");
         fs::write(&path, b"partial").unwrap();
 
         {
@@ -266,44 +642,84 @@ mod tests {
     }
 
     #[test]
-    fn prune_removes_orphaned_files_and_keeps_known_urls() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = ThumbnailCache::new(temp.path());
-        let keep = "https://example.com/a.jpg";
-        let remove = "https://example.com/b.jpg";
-        write_valid_jpeg(&cache.path_for(keep));
-        write_valid_jpeg(&cache.path_for(remove));
-
-        cache.prune(&[keep.to_string()]).unwrap();
-
-        assert!(cache.path_for(keep).is_file());
-        assert!(!cache.path_for(remove).is_file());
+    fn the_id_is_the_prefix_plus_the_url_hash() {
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/a");
+        assert!(id.starts_with(THUMBNAIL_ID_PREFIX));
+        // The hash part is the 32 hex characters of an MD5 digest.
+        assert_eq!(id.len(), THUMBNAIL_ID_PREFIX.len() + 32);
+        assert!(id[THUMBNAIL_ID_PREFIX.len()..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn prune_removes_non_jpeg_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache = ThumbnailCache::new(temp.path());
-        let jpg = cache.path_for("https://example.com/a.jpg");
-        write_valid_jpeg(&jpg);
-        let exe = temp.path().join("malware.exe");
-        fs::write(&exe, b"bad").unwrap();
-        let part = temp.path().join("scratch.part");
-        fs::write(&part, b"partial").unwrap();
+    fn register_legacy_renames_a_valid_jpeg_without_reencoding() {
+        let (cache, temp) = test_cache();
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/a");
+        let legacy = temp.path().join("legacy.jpg");
+        write_valid_jpeg(&legacy);
 
-        cache.prune(&["https://example.com/a.jpg".to_string()]).unwrap();
+        let new_id = cache.register_legacy("https://example.com/a", &legacy).unwrap();
 
-        assert!(jpg.is_file());
-        assert!(!exe.is_file());
-        assert!(!part.is_file());
+        assert_eq!(new_id, id);
+        // The legacy file was moved, not copied: it no longer exists at its
+        // old location.
+        assert!(!legacy.exists());
+        // The full-size slot now holds the moved file.
+        assert!(cache.full_file(&id).is_file());
+        // Mid and small were derived from it.
+        assert!(cache.mid_file(&id).is_file());
+        assert!(cache.small_file(&id).is_file());
     }
 
-    fn write_valid_jpeg(path: &Path) {
+    #[test]
+    fn register_legacy_reencodes_a_non_jpeg_legacy_file() {
+        let (cache, temp) = test_cache();
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/b");
+        let legacy = temp.path().join("legacy.png");
+        // Write a PNG; it is not a renderable JPEG, so the normalizer path is
+        // used instead of a plain rename.
         let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
         let mut bytes = Vec::new();
         image
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
-            .expect("a valid JPEG encodes");
-        fs::write(path, &bytes).unwrap();
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("a valid PNG encodes");
+        fs::write(&legacy, &bytes).unwrap();
+
+        let new_id = cache.register_legacy("https://example.com/b", &legacy).unwrap();
+
+        assert_eq!(new_id, id);
+        // The legacy file was consumed by the normalizer.
+        assert!(!legacy.exists());
+        assert!(cache.full_file(&id).is_file());
+        assert!(cache.mid_file(&id).is_file());
+        assert!(cache.small_file(&id).is_file());
+        // The full-size result is a renderable JPEG.
+        assert!(is_renderable_jpeg(&cache.full_file(&id)));
+    }
+
+    #[test]
+    fn register_legacy_does_not_redownload_when_id_already_exists() {
+        let (cache, temp) = test_cache();
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/c");
+        // Manually insert a row so the id already exists.
+        cache
+            .db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![id, "https://example.com/c", "/tmp/full.jpg", "/tmp/mid.jpg", "/tmp/small.jpg", 1],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let legacy = temp.path().join("legacy.jpg");
+        write_valid_jpeg(&legacy);
+
+        let new_id = cache.register_legacy("https://example.com/c", &legacy).unwrap();
+
+        assert_eq!(new_id, id);
+        // The legacy file is left untouched because the id already exists.
+        assert!(legacy.exists());
     }
 }

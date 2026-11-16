@@ -158,6 +158,10 @@ impl Shell {
                     );
                     ui_for_pending.set_has_media(true);
                     ui_for_pending.set_live(loaded.is_live);
+                    ui_for_pending.set_video_thumbnail(loaded.thumbnail.as_deref());
+                    ui_for_pending.set_audio_only(
+                        loaded.video.is_none() && loaded.muxed.is_none() && loaded.audio.is_some(),
+                    );
                     loading.borrow_mut().resolved();
                     if let Some(duration) = loaded.duration {
                         ui_for_pending.set_duration(duration);
@@ -181,18 +185,7 @@ impl Shell {
             let app = Arc::clone(&app);
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_requested(move || {
-                let entries: Vec<QueueListEntry> = app
-                    .queue_entries()
-                    .into_iter()
-                    .map(|entry| QueueListEntry {
-                        position: entry.position as i32,
-                        title: entry.title,
-                        uploader: entry.uploader.unwrap_or_default(),
-                        thumbnail: entry.thumbnail.map(PathBuf::from).filter(|path| path.exists()),
-                        current: entry.current,
-                    })
-                    .collect();
-                ui_for_queue.show_queue(&entries);
+                ui_for_queue.show_queue(&queue_list(&app));
             });
         }
         {
@@ -218,6 +211,31 @@ impl Shell {
                 if app.play_queue_entry(position as i64) {
                     loading.borrow_mut().resolve_started();
                 }
+            });
+        }
+        {
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_copy_url(move |url| {
+                if ui_for_queue.copy_to_clipboard(url.as_str()) {
+                    ui_for_queue.show_toast("URL copied to the clipboard");
+                } else {
+                    ui_for_queue.show_toast("The URL could not be copied");
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_remove_entry(move |id| {
+                let removal = app.remove_queue_entry(id as i64);
+                if !removal.removed {
+                    return;
+                }
+                if removal.advanced {
+                    loading.borrow_mut().resolve_started();
+                }
+                ui_for_queue.show_queue(&queue_list(&app));
             });
         }
         {
@@ -324,6 +342,10 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        if url.trim() == TEST_UPDATE_URL {
+            self.show_test_update_modal();
+            return;
+        }
         let Some(url) = requested_url(url) else {
             return;
         };
@@ -331,6 +353,16 @@ impl Shell {
         self.ui.set_url(url);
         self.loading.borrow_mut().resolve_started();
         self.app.load(url.to_string());
+    }
+
+    /// Opens the update modal with a fake update so it can be tested.
+    fn show_test_update_modal(&self) {
+        let update = updater::Update {
+            version: "99.0.0".to_string(),
+            notes: "## Test Update\n\nThis is a test update notice shown when the `test://update-modal` URL is loaded.\n\n- First item\n- Second item\n- Third item\n- Fourth item\n- Fifth item\n- Sixth item\n- Seventh item\n- Eighth item\n- Ninth item\n- Tenth item".to_string(),
+            download_url: String::new(),
+        };
+        self.ui.show_update(&update.version, &update.notes);
     }
 
     /// Continues the active queue that was filled in an earlier run.
@@ -355,11 +387,29 @@ fn requested_url(url: &str) -> Option<&str> {
     (!url.is_empty()).then_some(url)
 }
 
+/// The internal `test://` URL that forces the update prompt to open.
+///
+/// These URLs never reach the resolver: they are commands that exercise the
+/// interface directly, so `yt-dlp` never sees them.
+const TEST_UPDATE_URL: &str = "test://update-modal";
+
+/// Whether the given URL is one of the internal `test://` commands.
+fn is_test_url(url: &str) -> bool {
+    url.trim().to_ascii_lowercase().starts_with("test://")
+}
+
 /// Starts loading a URL for the user, from the bar or from the history.
+///
+/// A `test://` URL never reaches the resolver: it is an internal command that
+/// exercises the interface directly, so the resolver never sees it.
 fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
     let Some(url) = requested_url(url) else {
         return;
     };
+    if is_test_url(url) {
+        handle_test_url(ui, url);
+        return;
+    }
     if ui.has_media() {
         // Something plays already, so the new URL must not interrupt it. A
         // toast says the background is working and the dialog appears once
@@ -369,6 +419,31 @@ fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
         loading.borrow_mut().resolve_started();
     }
     app.load(url.to_string());
+}
+
+/// Handles the internal `test://` commands that exercise the interface.
+fn handle_test_url(ui: &PlayerUi, url: &str) {
+    match url.trim().to_ascii_lowercase().as_str() {
+        TEST_UPDATE_URL => {
+            let notes = "\
+## Test Update
+
+This is a test update notice shown when the `test://update-modal` URL is loaded.
+
+- First item
+- Second item
+- Third item
+- Fourth item
+- Fifth item
+- Sixth item
+- Seventh item
+- Eighth item
+- Ninth item
+- Tenth item";
+            ui.show_update("99.0.0", notes);
+        }
+        other => ui.show_toast(&format!("unknown test url: {other}")),
+    }
 }
 
 /// Chooses the next volume and remembers a nonzero level for the mute button.
@@ -403,6 +478,25 @@ fn slider_to_player_volume(slider: f64) -> f64 {
 fn player_to_slider_volume(volume: f64) -> f64 {
     let volume = volume.clamp(0.0, 100.0);
     100.0 * (volume / 100.0).powi(3)
+}
+
+/// Turns the stored queue into the rows the dialog draws.
+fn queue_list(app: &App) -> Vec<QueueListEntry> {
+    app.queue_entries()
+        .into_iter()
+        .map(|entry| QueueListEntry {
+            id: entry.id as i32,
+            position: entry.position as i32,
+            title: entry.title,
+            uploader: entry.uploader.unwrap_or_default(),
+            thumbnail: entry
+                .thumbnail
+                .as_deref()
+                .and_then(|thumbnail| app.queue_thumbnail(thumbnail)),
+            current: entry.current,
+            url: entry.url,
+        })
+        .collect()
 }
 
 /// Brings the interface and the player back in sync.
@@ -440,6 +534,10 @@ fn tick(
                 );
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
+                ui.set_video_thumbnail(loaded.thumbnail.as_deref());
+                ui.set_audio_only(
+                    loaded.video.is_none() && loaded.muxed.is_none() && loaded.audio.is_some(),
+                );
                 loading.resolved();
                 if let Some(duration) = loaded.duration {
                     ui.set_duration(duration);
@@ -475,12 +573,23 @@ fn tick(
                 ui.show_update(&update.version, &update.notes);
                 *update_slot.borrow_mut() = Some(update);
             }
+            Message::UpdateDownloadProgress(progress) => {
+                if progress > 0.0 {
+                    ui.set_update_download_progress(progress);
+                }
+            }
             Message::UpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => {
                 if loading.is_busy() {
                     loading.problem(text.clone());
                 }
                 ui.show_toast(&text);
+            }
+            Message::ThumbnailMigrationStarted { count } => {
+                ui.show_toast(&format!("Migrating {count} thumbnails to the new cache…"));
+            }
+            Message::ThumbnailMigrationFinished { processed } => {
+                ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));
             }
             Message::RetryScheduled { error, delay_seconds, kind } => {
                 loading.retry_scheduled();

@@ -133,6 +133,8 @@ pub struct SourceLists {
 /// One entry of the active queue shown in the queue dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueListEntry {
+    /// The stable database id of the entry, used to remove exactly one row.
+    pub id: i32,
     /// The position of the entry in the active queue.
     pub position: i32,
     /// Human readable title of the media.
@@ -143,6 +145,8 @@ pub struct QueueListEntry {
     pub thumbnail: Option<PathBuf>,
     /// Whether this is the entry that plays now.
     pub current: bool,
+    /// The URL of the media, used for copying.
+    pub url: String,
 }
 
 /// One entry of the playback history shown in the history dialog.
@@ -313,6 +317,18 @@ impl PlayerUi {
         self.window.set_has_media(has_media);
     }
 
+    /// Whether the media that is playing has no video track.
+    pub fn set_audio_only(&self, audio_only: bool) {
+        self.window.set_audio_only(audio_only);
+    }
+
+    /// The full-size thumbnail to show when the media is audio only.
+    pub fn set_video_thumbnail(&self, thumbnail: Option<&Path>) {
+        let image =
+            thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
+        self.window.set_video_thumbnail(image);
+    }
+
     /// Whether the window has loaded media.
     pub fn has_media(&self) -> bool {
         self.window.get_has_media()
@@ -401,6 +417,14 @@ impl PlayerUi {
         self.sweep_toasts();
     }
 
+    /// Puts text on the system clipboard.
+    ///
+    /// Returns whether the platform accepted the text, so the caller can tell
+    /// the user that copying failed instead of pretending it worked.
+    pub fn copy_to_clipboard(&self, text: &str) -> bool {
+        arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)).is_ok()
+    }
+
     /// Makes sure the sweep timer runs while any toast is on screen.
     fn sweep_toasts(&self) {
         if self.toast_timer.running() {
@@ -453,6 +477,7 @@ impl PlayerUi {
         let items: Vec<QueueItem> = entries
             .iter()
             .map(|entry| QueueItem {
+                id: entry.id,
                 position: entry.position,
                 title: entry.title.as_str().into(),
                 uploader: entry.uploader.as_str().into(),
@@ -462,9 +487,13 @@ impl PlayerUi {
                     .and_then(|path| slint::Image::load_from_path(path).ok())
                     .unwrap_or_default(),
                 current: entry.current,
+                url: entry.url.as_str().into(),
             })
             .collect();
         self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        let current_index =
+            entries.iter().position(|entry| entry.current).map_or(-1, |index| index as i32);
+        self.window.set_queue_current_index(current_index);
         self.window.set_queue_open(true);
     }
 
@@ -488,6 +517,7 @@ impl PlayerUi {
         self.window.set_update_notes(notes.into());
         self.window.set_update_installing(false);
         self.window.set_update_error("".into());
+        self.window.set_update_download_progress(0.0);
         self.window.set_update_open(true);
     }
 
@@ -500,6 +530,11 @@ impl PlayerUi {
     /// Shows that the package is being downloaded and installed.
     pub fn set_update_installing(&self, installing: bool) {
         self.window.set_update_installing(installing);
+    }
+
+    /// Sets the download progress of the update package, from zero to one.
+    pub fn set_update_download_progress(&self, progress: f64) {
+        self.window.set_update_download_progress(progress as f32);
     }
 
     // ------------------------------------------------------------ events --
@@ -615,6 +650,19 @@ impl PlayerUi {
         self.window.on_queue_item_selected(handler);
     }
 
+    /// Called when the user asks to copy the URL of a queue entry.
+    pub fn on_queue_copy_url(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_queue_copy_url(move |url| handler(url.to_string()));
+    }
+
+    /// Called when the user asks to remove an entry from the active queue.
+    ///
+    /// The argument is the stable id of the entry, so exactly one row is
+    /// removed even if positions ever collide.
+    pub fn on_queue_remove_entry(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_remove_entry(handler);
+    }
+
     /// Called when the user picks a history entry.
     ///
     /// The argument is the URL of the entry, ready to be resolved again.
@@ -657,14 +705,17 @@ mod tests {
         assert_eq!(ui.window().get_media_uploader(), "Test Channel");
 
         ui.show_queue(&[QueueListEntry {
+            id: 1,
             position: 0,
             title: "First".to_string(),
             uploader: "Uploader".to_string(),
             thumbnail: None,
             current: true,
+            url: "https://example.com/video".to_string(),
         }]);
         assert!(ui.window().get_queue_open());
         assert_eq!(ui.window().get_queue_items().row_count(), 1);
+        assert_eq!(ui.window().get_queue_items().row_data(0).expect("the row exists").id, 1);
 
         ui.show_history(&[HistoryListEntry {
             title: "First".to_string(),

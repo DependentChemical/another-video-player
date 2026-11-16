@@ -10,6 +10,7 @@ authors.workspace = true
 # Layer 1: standalone capability. Knows nothing about any other Flatline crate.
 [dependencies]
 slint = { workspace = true }
+arboard = "3"
 
 [build-dependencies]
 slint-build = { workspace = true }

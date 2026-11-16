@@ -16,6 +16,8 @@ export struct BufferedRange {
 
 /// One row of the queue dialog.
 export struct QueueItem {
+    /// The stable database id of the entry, used to remove exactly one row.
+    id: int,
     /// The position of the entry in the active queue.
     position: int,
     title: string,
@@ -23,6 +25,8 @@ export struct QueueItem {
     thumbnail: image,
     /// Whether this is the entry that plays now.
     current: bool,
+    /// The URL of the media, used for copying.
+    url: string,
 }
 
 /// One row of the history dialog.

@@ -1,14 +1,12 @@
 name: dev-test
 
 # The pre-test for `main`: it runs everything a release needs (the tests and
-# both platform builds) but it never creates a release. It is meant to run on
-# `dev` before the changes are merged into `main`, where the automated
-# Build and Release workflows take over.
+# both platform builds) but it never creates a release. It is run manually on
+# `dev` before the changes are merged into `main`, where the automated Build
+# and Release workflows take over. It does not run on every push so that many
+# commits can land between checks.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - dev
 
 concurrency:
   group: dev-test-${{ github.ref }}

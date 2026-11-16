@@ -9,11 +9,13 @@ use crate::Error;
 
 /// The columns every queue query reads, in the order [`entry_from_row`]
 /// expects.
-const COLUMNS: &str = "position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, resolved_source, resolved_at, selected_video, selected_audio, selected_muxed";
+const COLUMNS: &str = "id, position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, resolved_source, resolved_at, selected_video, selected_audio, selected_muxed";
 
 /// One item of the active queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {
+    /// The database id of the entry, which stays stable while the queue moves.
+    pub id: i64,
     /// Position in the queue, starting at zero.
     pub position: i64,
     /// The URL the entry was added from.
@@ -43,6 +45,19 @@ pub struct QueueEntry {
     pub selected_muxed: Option<String>,
 }
 
+impl QueueEntry {
+    /// The new-style thumbnail id this entry points at, when it is one.
+    ///
+    /// A new-style id starts with [`crate::cache::THUMBNAIL_ID_PREFIX`] and
+    /// references a row in `thumbnail_cache`. Anything else is an old-style
+    /// direct file path and is not rendered by the new system.
+    pub fn thumbnail_id(&self) -> Option<&str> {
+        self.thumbnail
+            .as_deref()
+            .filter(|value| value.starts_with(crate::cache::THUMBNAIL_ID_PREFIX))
+    }
+}
+
 /// A history entry tracking playback position for a video.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
@@ -66,11 +81,16 @@ pub struct HistoryEntry {
 ///
 /// The handle is shared, so the queue can be read from the thread that draws
 /// the interface and written from the background work at the same time.
+#[derive(Debug, Clone)]
 pub struct Queue {
     pub(crate) db: Database,
 }
 
 impl Queue {
+    /// The database handle this queue uses, shared with the thumbnail cache.
+    pub fn database(&self) -> Database {
+        self.db.clone()
+    }
     /// Opens a queue, creating the database and its tables when needed.
     pub fn open(path: impl AsRef<Path>) -> Result<Queue, Error> {
         let db = Database::open(path)?;
@@ -109,6 +129,15 @@ impl Queue {
                         selected_audio TEXT,
                         selected_muxed TEXT
                     );
+                    CREATE TABLE IF NOT EXISTS thumbnail_cache (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        thumbnail_id TEXT NOT NULL UNIQUE,
+                        source_url TEXT,
+                        full_path TEXT NOT NULL,
+                        mid_path TEXT NOT NULL,
+                        small_path TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS history (
                         id_hash TEXT PRIMARY KEY,
                         url TEXT NOT NULL,
@@ -134,6 +163,8 @@ impl Queue {
                         ON active_queue(position);
                     CREATE INDEX IF NOT EXISTS active_queue_id_hash
                         ON active_queue(id_hash);
+                    CREATE INDEX IF NOT EXISTS thumbnail_cache_thumbnail_id
+                        ON thumbnail_cache(thumbnail_id);
                     CREATE INDEX IF NOT EXISTS history_updated_at
                         ON history(updated_at);",
                 )?;
@@ -192,7 +223,8 @@ impl Queue {
                     [],
                     |row| row.get(0),
                 )?;
-                let entry = QueueEntry {
+                let mut entry = QueueEntry {
+                    id: 0,
                     position,
                     url: url.clone(),
                     title,
@@ -224,6 +256,7 @@ impl Queue {
                         entry.selected_muxed,
                     ],
                 )?;
+                entry.id = connection.last_insert_rowid();
                 Ok(entry)
             })
             .map_err(Error::from)
@@ -250,7 +283,8 @@ impl Queue {
         self.db
             .with_connection(|connection| {
                 connection.execute("DELETE FROM active_queue", [])?;
-                let entry = QueueEntry {
+                let mut entry = QueueEntry {
+                    id: 0,
                     position: 0,
                     url: url.clone(),
                     title,
@@ -282,6 +316,7 @@ impl Queue {
                         entry.selected_muxed,
                     ],
                 )?;
+                entry.id = connection.last_insert_rowid();
                 Ok(entry)
             })
             .map_err(Error::from)
@@ -460,6 +495,49 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Removes a single entry from the queue by its database id.
+    ///
+    /// The id is the primary key, so exactly one row is removed even when two
+    /// entries ever happen to share a position. The removed entry is returned
+    /// so the caller can decide how the current mark and playback move.
+    pub fn remove_entry(&self, id: i64) -> Result<Option<QueueEntry>, Error> {
+        self.db
+            .with_connection(|connection| {
+                let entry = connection
+                    .query_row(
+                        &format!("SELECT {COLUMNS} FROM active_queue WHERE id = ?1"),
+                        params![id],
+                        entry_from_row,
+                    )
+                    .optional()?;
+                if entry.is_some() {
+                    connection.execute("DELETE FROM active_queue WHERE id = ?1", params![id])?;
+                }
+                Ok(entry)
+            })
+            .map_err(Error::from)
+    }
+
+    /// The entry that plays directly after `position`, if there is one.
+    ///
+    /// The positions never move when an entry is removed, so the caller can
+    /// ask this after deleting the current entry to find its successor.
+    pub fn next_after(&self, position: i64) -> Result<Option<QueueEntry>, Error> {
+        self.db
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT {COLUMNS} FROM active_queue WHERE position > ?1 ORDER BY position LIMIT 1"
+                        ),
+                        params![position],
+                        entry_from_row,
+                    )
+                    .optional()
+            })
+            .map_err(Error::from)
+    }
+
     /// Gets a history entry by its id_hash.
     pub fn history_get(&self, id_hash: &str) -> Result<Option<HistoryEntry>, Error> {
         self.db
@@ -567,19 +645,20 @@ fn ensure_column(
 /// Turns a row of [`COLUMNS`] into an entry.
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
     Ok(QueueEntry {
-        position: row.get(0)?,
-        url: row.get(1)?,
-        title: row.get(2)?,
-        thumbnail: row.get(3)?,
-        thumbnail_url: row.get(4)?,
-        uploader: row.get(5)?,
-        id_hash: row.get(6)?,
-        current: row.get::<_, i64>(7)? != 0,
-        resolved_source: row.get(8)?,
-        resolved_at: row.get(9)?,
-        selected_video: row.get(10)?,
-        selected_audio: row.get(11)?,
-        selected_muxed: row.get(12)?,
+        id: row.get(0)?,
+        position: row.get(1)?,
+        url: row.get(2)?,
+        title: row.get(3)?,
+        thumbnail: row.get(4)?,
+        thumbnail_url: row.get(5)?,
+        uploader: row.get(6)?,
+        id_hash: row.get(7)?,
+        current: row.get::<_, i64>(8)? != 0,
+        resolved_source: row.get(9)?,
+        resolved_at: row.get(10)?,
+        selected_video: row.get(11)?,
+        selected_audio: row.get(12)?,
+        selected_muxed: row.get(13)?,
     })
 }
 
@@ -799,6 +878,47 @@ mod tests {
         queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         queue.clear().expect("clear works");
         assert_eq!(queue.count().expect("count works"), 0);
+    }
+
+    #[test]
+    fn remove_entry_removes_only_the_row_with_the_id() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let second =
+            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        assert_eq!(queue.count().expect("count works"), 3);
+
+        let removed =
+            queue.remove_entry(second.id).expect("remove works").expect("entry was there");
+
+        assert_eq!(removed.url, "https://example.com/b");
+        assert_eq!(queue.count().expect("count works"), 2);
+        assert!(queue.current().expect("current works").expect("entry exists").url.contains("a"));
+    }
+
+    #[test]
+    fn next_after_finds_the_following_entry_without_moving_the_mark() {
+        let queue = queue();
+        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+
+        queue.remove_entry(first.id).expect("remove works");
+
+        let next =
+            queue.next_after(first.position).expect("next works").expect("a following entry");
+        assert_eq!(next.url, "https://example.com/b");
+        assert!(queue.current().expect("current works").is_none());
+    }
+
+    #[test]
+    fn removing_a_missing_id_reports_nothing() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+
+        assert!(queue.remove_entry(999).expect("remove works").is_none());
+        assert_eq!(queue.count().expect("count works"), 1);
     }
 
     #[test]

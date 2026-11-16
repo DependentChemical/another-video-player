@@ -35,10 +35,16 @@ pub enum Message {
     SigningIn(Service),
     /// A newer application release is available.
     UpdateAvailable(updater::Update),
+    /// The accepted update is downloading; carries the fraction, from zero to one.
+    UpdateDownloadProgress(f64),
     /// An accepted application update could not be prepared for installation.
     UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+    /// A legacy thumbnail migration started; carries how many entries await processing.
+    ThumbnailMigrationStarted { count: usize },
+    /// A legacy thumbnail migration finished; carries how many entries were processed.
+    ThumbnailMigrationFinished { processed: usize },
     /// A retry is scheduled.
     RetryScheduled {
         /// The error message.
@@ -84,8 +90,10 @@ pub struct PendingMedia {
     pub url: String,
     /// Human readable title, for the dialog.
     pub title: String,
-    /// The cached thumbnail, when one could be downloaded.
+    /// The cached mid-size thumbnail, for the pending dialog.
     pub thumbnail: Option<PathBuf>,
+    /// The thumbnail cache id the active queue should store.
+    pub thumbnail_id: Option<String>,
     /// The time the stream URLs were resolved.
     pub resolved_at: i64,
     /// The resolved source.
@@ -113,6 +121,17 @@ pub struct Loaded {
     pub thumbnail_url: Option<String>,
     /// The uploader / channel name as reported by the extractor.
     pub uploader: Option<String>,
+    /// The full-size cached thumbnail, shown when the media has no video track.
+    pub thumbnail: Option<PathBuf>,
+}
+
+/// What happened when an entry was removed from the active queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueRemoval {
+    /// Whether the entry was found and deleted.
+    pub removed: bool,
+    /// Whether the entry was playing and the next entry was started.
+    pub advanced: bool,
 }
 
 /// How long a persisted resolver result may be reused before it is refreshed.
@@ -300,11 +319,7 @@ impl App {
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
-        let cache = ThumbnailCache::new(paths.cache().join("thumbnails"));
-        // Drop thumbnails that no longer point at a live queue or history
-        // entry, plus any file that is not a healthy JPEG, so the cache does
-        // not grow with broken or orphaned images.
-        prune_thumbnail_cache(&cache, &queue);
+        let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -312,7 +327,7 @@ impl App {
             .map_err(|error| Error::Runtime(error.to_string()))?;
         let (sender, receiver) = channel();
 
-        Ok(App {
+        let app = App {
             engine,
             resolver: Mutex::new(resolver),
             settings,
@@ -326,7 +341,12 @@ impl App {
             cache,
             stream_buffer,
             pending: Mutex::new(None),
-        })
+        };
+        // Drop orphaned thumbnail files left by older runs, and migrate any
+        // thumbnails that still point at a direct file path, in the
+        // background. Start and end are reported to the user as toasts.
+        app.maintain_thumbnails();
+        Ok(app)
     }
 
     /// The player.
@@ -390,11 +410,7 @@ impl App {
             let result = resolve_with_session(&resolver, &session, &url, &sender)
                 .map_err(|error| error.to_string())
                 .map(|source| {
-                    let thumbnail = source
-                        .thumbnail
-                        .as_deref()
-                        .and_then(|url| cache.fetch(url).ok())
-                        .map(|path| path.to_string_lossy().into_owned());
+                    let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
                 });
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
@@ -415,13 +431,14 @@ impl App {
             let result = resolve_with_session(&resolver, &session, &url, &sender)
                 .map_err(|error| error.to_string())
                 .map(|source| {
-                    let thumbnail =
-                        source.thumbnail.as_deref().and_then(|url| cache.fetch(url).ok());
+                    let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
+                    let thumbnail = thumbnail_id.as_deref().and_then(|id| cache.mid_path(id));
                     PendingMedia {
                         url,
                         title: source.title.clone(),
                         source,
                         thumbnail,
+                        thumbnail_id,
                         resolved_at: unix_time(),
                     }
                 });
@@ -437,22 +454,18 @@ impl App {
     /// Plays the pending media right away, replacing the active queue.
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
-        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
         self.prepare_current(
             &pending.url,
             &pending.title,
-            thumbnail.as_deref(),
+            thumbnail,
             thumbnail_url.as_deref(),
             uploader.as_deref(),
         );
-        let loaded = self.consume_resolved(
-            &pending.url,
-            pending.source,
-            thumbnail.as_deref(),
-            pending.resolved_at,
-        )?;
+        let loaded =
+            self.consume_resolved(&pending.url, pending.source, thumbnail, pending.resolved_at)?;
         Some((pending.url, loaded))
     }
 
@@ -462,13 +475,13 @@ impl App {
         else {
             return false;
         };
-        let thumbnail = pending.thumbnail.as_ref().map(|path| path.to_string_lossy().into_owned());
+        let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
         let entry = match self.queue.push(
             &pending.url,
             &pending.title,
-            thumbnail.as_deref(),
+            thumbnail,
             thumbnail_url.as_deref(),
             uploader.as_deref(),
         ) {
@@ -505,13 +518,13 @@ impl App {
         uploader: Option<&str>,
     ) {
         self.clear_retry();
-        let thumbnail_path = thumbnail.map(PathBuf::from);
-        if let Err(error) = self.cache.retain(thumbnail_path.as_deref()) {
-            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
-        }
         if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
         {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
+        }
+        // Drop thumbnails no longer referenced by the queue, plus their files.
+        if let Err(error) = self.cache.release_unreferenced_thumbnails() {
+            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
         }
     }
 
@@ -564,6 +577,87 @@ impl App {
         }
     }
 
+    /// Returns the small thumbnail of a cached thumbnail for the queue list.
+    ///
+    /// Only a thumbnail that is already on disk is returned; the image work
+    /// happens when the thumbnail is fetched, never on the event loop.
+    pub fn queue_thumbnail(&self, thumbnail: &str) -> Option<PathBuf> {
+        self.cache.small_path(thumbnail)
+    }
+
+    /// Removes orphaned thumbnail files and migrates any thumbnails that still
+    /// point at a direct file path into the new cache.
+    ///
+    /// The work runs in the background. The start and end of the migration are
+    /// reported to the user through [`Message::ThumbnailMigrationStarted`] and
+    /// [`Message::ThumbnailMigrationFinished`].
+    pub fn maintain_thumbnails(&self) {
+        let legacy = match self.queue.entries() {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|entry| {
+                    let thumbnail = entry.thumbnail.as_deref()?;
+                    if ThumbnailCache::is_thumbnail_id(thumbnail) {
+                        return None;
+                    }
+                    Some((entry.position, entry.url, thumbnail.to_string()))
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                return;
+            }
+        };
+
+        let cache = self.cache.clone();
+        let queue = self.queue.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let runtime = self.runtime.handle().clone();
+
+        runtime.spawn_blocking(move || {
+            // Files left behind that no cache row references are deleted first.
+            let _ = cache.prune_orphans();
+
+            if legacy.is_empty() {
+                return;
+            }
+
+            let count = legacy.len();
+            let _ = outbox
+                .lock()
+                .map(|sender| sender.send(Box::new(Message::ThumbnailMigrationStarted { count })));
+
+            let mut processed = 0;
+            for (position, url, path) in legacy {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    match cache.register_legacy(&url, &path) {
+                        Ok(new_id) => {
+                            if let Err(error) = queue.set_thumbnail(position, Some(&new_id)) {
+                                crate::diag::note(&format!(
+                                    "the active queue entry could not be updated: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            crate::diag::note(&format!(
+                                "a legacy thumbnail could not be migrated: {error}"
+                            ));
+                        }
+                    }
+                }
+                processed += 1;
+            }
+
+            // Anything still not referenced by the queue is dropped.
+            let _ = cache.release_unreferenced_thumbnails();
+
+            let _ = outbox.lock().map(|sender| {
+                sender.send(Box::new(Message::ThumbnailMigrationFinished { processed }))
+            });
+        });
+    }
+
     /// Returns every history entry, most recently played first.
     pub fn history_entries(&self) -> Vec<library::HistoryEntry> {
         match self.queue.history_all() {
@@ -586,6 +680,56 @@ impl App {
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be written: {error}"));
                 false
+            }
+        }
+    }
+
+    /// Removes an entry from the active queue.
+    ///
+    /// The entry is identified by its stable database id, so exactly one row
+    /// is removed. When the removed entry was the one playing, playback moves
+    /// to the entry that follows it; when no entry follows it, the player is
+    /// stopped.
+    pub fn remove_queue_entry(&self, id: i64) -> QueueRemoval {
+        let removed = match self.queue.remove_entry(id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return QueueRemoval::default(),
+            Err(error) => {
+                crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
+                return QueueRemoval::default();
+            }
+        };
+
+        // Deleting an entry drops its thumbnail when nothing else references it.
+        if let Some(thumbnail_id) = removed.thumbnail_id()
+            && let Err(error) = self.cache.release_thumbnail(thumbnail_id)
+        {
+            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
+        }
+
+        if !removed.current {
+            return QueueRemoval { removed: true, advanced: false };
+        }
+
+        match self.queue.next_after(removed.position) {
+            Ok(Some(next)) => {
+                if let Err(error) = self.queue.set_current(next.position) {
+                    crate::diag::note(&format!(
+                        "the next queue entry could not be made current: {error}"
+                    ));
+                    return QueueRemoval { removed: true, advanced: false };
+                }
+                self.clear_retry();
+                self.consume_current();
+                QueueRemoval { removed: true, advanced: true }
+            }
+            Ok(None) => {
+                let _ = self.engine.stop();
+                QueueRemoval { removed: true, advanced: false }
+            }
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                QueueRemoval { removed: true, advanced: false }
             }
         }
     }
@@ -651,7 +795,11 @@ impl App {
         {
             crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
         }
-        Some(self.accept_current_source(source, url, &current))
+        let thumbnail_path = current
+            .thumbnail_id()
+            .and_then(|id| self.cache.full_path(id))
+            .and_then(|path| path.to_str().map(|s| s.to_string()));
+        Some(self.accept_current_source(source, url, &current, thumbnail_path.as_deref()))
     }
 
     /// Builds playback state for the source already authorized by the queue.
@@ -660,6 +808,7 @@ impl App {
         source: MediaSource,
         url: &str,
         current: &library::QueueEntry,
+        thumbnail: Option<&str>,
     ) -> Loaded {
         let sources = source_lists(&source);
         let default_plan = self
@@ -709,6 +858,7 @@ impl App {
             is_live: source.is_live,
             thumbnail_url: source.thumbnail.clone(),
             uploader: source.uploader.clone(),
+            thumbnail: thumbnail.map(PathBuf::from),
         };
 
         // Compute id_hash for history tracking
@@ -1092,7 +1242,13 @@ impl App {
     ) {
         let outbox = Arc::clone(&self.outbox);
         self.runtime.handle().spawn_blocking(move || {
-            if let Err(error) = updater::install(&update, &directory, &executable) {
+            let progress_outbox = Arc::clone(&outbox);
+            let result = updater::install(&update, &directory, &executable, move |progress| {
+                let _ = progress_outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateDownloadProgress(progress))));
+            });
+            if let Err(error) = result {
                 let message = error.to_string();
                 crate::diag::note(&format!("the Flatline update failed: {message}"));
                 let _ = outbox
@@ -1241,38 +1397,6 @@ fn clear_stream_buffer(directory: &Path) {
         if let Err(error) = result {
             crate::diag::note(&format!("a stream buffer file could not be removed: {error}"));
         }
-    }
-}
-
-/// Cleans the thumbnail cache at start-up.
-///
-/// Every thumbnail that the active queue or the history still points at is
-/// kept; a leftover from an older run, a file that is not a JPEG and a
-/// broken image are all removed. The URLs are collected from the two lists
-/// the user can still see, so the cleanup only deletes what cannot be shown
-/// again anyway.
-fn prune_thumbnail_cache(cache: &ThumbnailCache, queue: &Queue) {
-    let mut keep: Vec<String> = Vec::new();
-    match queue.entries() {
-        Ok(entries) => {
-            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
-        }
-        Err(error) => {
-            crate::diag::note(&format!("the active queue could not be read: {error}"));
-            return;
-        }
-    }
-    match queue.history_all() {
-        Ok(entries) => {
-            keep.extend(entries.into_iter().filter_map(|entry| entry.thumbnail_url));
-        }
-        Err(error) => {
-            crate::diag::note(&format!("the history could not be read: {error}"));
-            return;
-        }
-    }
-    if let Err(error) = cache.prune(&keep) {
-        crate::diag::note(&format!("the thumbnail cache could not be pruned: {error}"));
     }
 }
 
