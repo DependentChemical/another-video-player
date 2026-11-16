@@ -190,6 +190,7 @@ impl Shell {
                         uploader: entry.uploader.unwrap_or_default(),
                         thumbnail: entry.thumbnail.map(PathBuf::from).filter(|path| path.exists()),
                         current: entry.current,
+                        url: entry.url,
                     })
                     .collect();
                 ui_for_queue.show_queue(&entries);
@@ -217,6 +218,38 @@ impl Shell {
             ui.on_queue_item_selected(move |position| {
                 if app.play_queue_entry(position as i64) {
                     loading.borrow_mut().resolve_started();
+                }
+            });
+        }
+        {
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_copy_url(move |url| {
+                ui_for_queue.show_toast(&format!("URL copied: {}", url));
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_remove_entry(move |position| {
+                if app.remove_queue_entry(position as i64) {
+                    loading.borrow_mut().resolve_started();
+                    let entries: Vec<QueueListEntry> = app
+                        .queue_entries()
+                        .into_iter()
+                        .map(|entry| QueueListEntry {
+                            position: entry.position as i32,
+                            title: entry.title,
+                            uploader: entry.uploader.unwrap_or_default(),
+                            thumbnail: entry
+                                .thumbnail
+                                .map(PathBuf::from)
+                                .filter(|path| path.exists()),
+                            current: entry.current,
+                            url: entry.url,
+                        })
+                        .collect();
+                    ui_for_queue.show_queue(&entries);
                 }
             });
         }

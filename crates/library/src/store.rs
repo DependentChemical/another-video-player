@@ -460,6 +460,21 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Removes a single entry from the queue by its position.
+    ///
+    /// The positions of the following entries keep their relative order; the
+    /// caller decides how the current mark moves, because a deleted current
+    /// entry means the playback has to advance somewhere.
+    pub fn remove_entry(&self, position: i64) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                connection
+                    .execute("DELETE FROM active_queue WHERE position = ?1", params![position])?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
     /// Gets a history entry by its id_hash.
     pub fn history_get(&self, id_hash: &str) -> Result<Option<HistoryEntry>, Error> {
         self.db
@@ -799,6 +814,18 @@ mod tests {
         queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         queue.clear().expect("clear works");
         assert_eq!(queue.count().expect("count works"), 0);
+    }
+
+    #[test]
+    fn remove_entry_removes_row_by_position() {
+        let queue = queue();
+        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        assert_eq!(queue.count().expect("count works"), 3);
+        queue.remove_entry(1).expect("remove works");
+        assert_eq!(queue.count().expect("count works"), 2);
+        assert!(queue.current().expect("current works").expect("entry exists").url.contains("a"));
     }
 
     #[test]

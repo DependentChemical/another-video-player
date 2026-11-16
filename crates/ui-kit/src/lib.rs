@@ -143,6 +143,8 @@ pub struct QueueListEntry {
     pub thumbnail: Option<PathBuf>,
     /// Whether this is the entry that plays now.
     pub current: bool,
+    /// The URL of the media, used for copying.
+    pub url: String,
 }
 
 /// One entry of the playback history shown in the history dialog.
@@ -462,9 +464,13 @@ impl PlayerUi {
                     .and_then(|path| slint::Image::load_from_path(path).ok())
                     .unwrap_or_default(),
                 current: entry.current,
+                url: entry.url.as_str().into(),
             })
             .collect();
         self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        let current_index =
+            entries.iter().position(|entry| entry.current).map_or(-1, |index| index as i32);
+        self.window.set_queue_current_index(current_index);
         self.window.set_queue_open(true);
     }
 
@@ -621,6 +627,18 @@ impl PlayerUi {
         self.window.on_queue_item_selected(handler);
     }
 
+    /// Called when the user asks to copy the URL of a queue entry.
+    pub fn on_queue_copy_url(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_queue_copy_url(move |url| handler(url.to_string()));
+    }
+
+    /// Called when the user asks to remove an entry from the active queue.
+    ///
+    /// The argument is the position of the entry in the queue.
+    pub fn on_queue_remove_entry(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_remove_entry(handler);
+    }
+
     /// Called when the user picks a history entry.
     ///
     /// The argument is the URL of the entry, ready to be resolved again.
@@ -668,6 +686,7 @@ mod tests {
             uploader: "Uploader".to_string(),
             thumbnail: None,
             current: true,
+            url: "https://example.com/video".to_string(),
         }]);
         assert!(ui.window().get_queue_open());
         assert_eq!(ui.window().get_queue_items().row_count(), 1);

@@ -1,13 +1,18 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { CloseButton, PlayIcon } from "../widgets.slint";
+import { CloseButton, PlayIcon, MoreIcon, ContentCopyIcon, DeleteIcon } from "../widgets.slint";
 import { QueueItem } from "types.slint";
 
 // The list of the active queue, shown from the sidebar.
 export component QueueDialog inherits Rectangle {
     in-out property <bool> open: false;
     in property <[QueueItem]> items: [];
+    in property <int> current-index: -1;
+    in-out property <bool> menu-open: false;
+    in-out property <string> menu-url: "";
     callback item-selected(int);
+    callback copy-url(string);
+    callback remove-entry(int);
     callback dismissed();
 
     background: #00000088;
@@ -63,8 +68,9 @@ export component QueueDialog inherits Rectangle {
                 vertical-alignment: center;
             }
 
-            if root.items.length > 0: ScrollView {
+            if root.items.length > 0: scroll-view := ScrollView {
                 vertical-stretch: 1;
+                content-y: root.open && root.current-index >= 0 ? root.current-index * 80px : 0px;
 
                 VerticalLayout {
                     spacing: 4px;
@@ -73,7 +79,11 @@ export component QueueDialog inherits Rectangle {
                     for item in root.items: Rectangle {
                         height: 76px;
                         border-radius: 8px;
-                        background: item.current ? Theme.elevated : (touch.has-hover ? Theme.elevated : transparent);
+                        background: item.current
+                            ? Theme.elevated
+                            : ((row-touch.has-hover || option-touch.has-hover || delete-touch.has-hover)
+                                ? Theme.elevated
+                                : transparent);
 
                         HorizontalLayout {
                             padding-left: 8px;
@@ -82,65 +92,175 @@ export component QueueDialog inherits Rectangle {
                             alignment: start;
                             cross-axis-alignment: center;
 
-                            if item.current: PlayIcon {
-                                width: 16px;
-                                height: 16px;
-                                ink: Theme.accent;
-                            }
-
                             Rectangle {
-                                width: 96px;
-                                height: 54px;
+                                horizontal-stretch: 1;
+                                background: transparent;
+
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 12px;
+                                    spacing: 12px;
+                                    alignment: start;
+                                    cross-axis-alignment: center;
+
+                                    if item.current: PlayIcon {
+                                        width: 16px;
+                                        height: 16px;
+                                        ink: Theme.accent;
+                                    }
+
+                                    Rectangle {
+                                        width: 96px;
+                                        height: 54px;
+                                        border-radius: 6px;
+                                        background: #00000040;
+                                        clip: true;
+
+                                        Image {
+                                            width: 100%;
+                                            height: 100%;
+                                            source: item.thumbnail;
+                                            image-fit: cover;
+                                        }
+                                    }
+
+                                    VerticalLayout {
+                                        spacing: 2px;
+                                        alignment: start;
+
+                                        Text {
+                                            height: 34px;
+                                            text: item.title;
+                                            color: Theme.fg;
+                                            font-size: 13px;
+                                            wrap: word-wrap;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+
+                                        Text {
+                                            height: 16px;
+                                            text: item.uploader;
+                                            color: Theme.muted;
+                                            font-size: 12px;
+                                            wrap: word-wrap;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                row-touch := TouchArea {
+                                    clicked => {
+                                        root.open = false;
+                                        root.item-selected(item.position);
+                                    }
+                                }
+                            }
+
+                            // More options button (three dots)
+                            option-button := Rectangle {
+                                width: 32px;
+                                height: 32px;
                                 border-radius: 6px;
-                                background: #00000040;
-                                clip: true;
+                                background: option-touch.has-hover ? Theme.elevated : transparent;
 
-                                Image {
-                                    width: 100%;
-                                    height: 100%;
-                                    source: item.thumbnail;
-                                    image-fit: cover;
+                                MoreIcon {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    ink: option-touch.has-hover ? Theme.fg : Theme.muted;
+                                }
+
+                                option-touch := TouchArea {
+                                    clicked => {
+                                        root.menu-open = true;
+                                        root.menu-url = item.url;
+                                    }
                                 }
                             }
 
-                            VerticalLayout {
-                                spacing: 2px;
-                                alignment: start;
+                            // Delete button
+                            delete-button := Rectangle {
+                                width: 32px;
+                                height: 32px;
+                                border-radius: 6px;
+                                background: delete-touch.has-hover ? Theme.danger : transparent;
 
-                                Text {
-                                    height: 34px;
-                                    text: item.title;
-                                    color: Theme.fg;
-                                    font-size: 13px;
-                                    wrap: word-wrap;
-                                    overflow: elide;
-                                    vertical-alignment: center;
+                                DeleteIcon {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    ink: delete-touch.has-hover ? Theme.on-accent : Theme.muted;
                                 }
 
-                                Text {
-                                    height: 16px;
-                                    text: item.uploader;
-                                    color: Theme.muted;
-                                    font-size: 12px;
-                                    wrap: word-wrap;
-                                    overflow: elide;
-                                    vertical-alignment: center;
+                                delete-touch := TouchArea {
+                                    clicked => {
+                                        root.remove-entry(item.position);
+                                        root.open = false;
+                                        root.dismissed();
+                                    }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
 
-                            if item.current: Text {
-                                text: "Playing";
-                                color: Theme.accent;
-                                font-size: 11px;
-                                font-weight: 600;
-                                vertical-alignment: center;
+        // Menu overlay, on top of the list but inside the panel.
+        if root.menu-open: Rectangle {
+            x: 0;
+            y: 0;
+            width: panel.width;
+            height: panel.height;
+            background: transparent;
+
+            overlay-touch := TouchArea {
+                clicked => {
+                    root.menu-open = false;
+                }
+            }
+
+            menu := Rectangle {
+                x: panel.width - 200px;
+                y: 48px;
+                width: 180px;
+                background: Theme.panel;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 8px;
+                drop-shadow-color: #00000080;
+
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: menu-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: start;
+                            cross-axis-alignment: center;
+
+                            ContentCopyIcon {
+                                ink: menu-touch.has-hover ? Theme.accent : Theme.muted;
+                            }
+                            Text {
+                                text: "Copy Url";
+                                color: Theme.fg;
+                                font-size: 13px;
                             }
                         }
 
-                        touch := TouchArea {
+                        menu-touch := TouchArea {
                             clicked => {
-                                root.open = false;
-                                root.item-selected(item.position);
+                                root.copy-url(root.menu-url);
+                                root.menu-open = false;
                             }
                         }
                     }

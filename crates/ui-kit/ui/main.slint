@@ -84,6 +84,7 @@ export component MainWindow inherits Window {
     // The queue and history lists shown from the sidebar.
     in-out property <bool> queue-open: false;
     in property <[QueueItem]> queue-items: [];
+    in property <int> queue-current-index: -1;
     in-out property <bool> history-open: false;
     in property <[HistoryItem]> history-items: [];
 
@@ -107,6 +108,8 @@ export component MainWindow inherits Window {
     callback queue-requested();
     callback history-requested();
     callback queue-item-selected(int);
+    callback queue-copy-url(string);
+    callback queue-remove-entry(int);
     callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
@@ -302,8 +305,11 @@ export component MainWindow inherits Window {
         width: parent.width;
         height: parent.height;
         items: root.queue-items;
+        current-index: root.queue-current-index;
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
+        copy-url(url) => { root.queue-copy-url(url); }
+        remove-entry(position) => { root.queue-remove-entry(position); }
         dismissed => { root.queue-open = false; }
     }
 

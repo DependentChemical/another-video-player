@@ -592,6 +592,42 @@ impl App {
         }
     }
 
+    /// Removes an entry from the active queue.
+    ///
+    /// When the removed entry was the one playing, playback moves to the next
+    /// entry of the queue; when no entry follows it, the player is stopped.
+    pub fn remove_queue_entry(&self, position: i64) -> bool {
+        let is_current = matches!(
+            self.queue.current(),
+            Ok(Some(entry)) if entry.position == position
+        );
+
+        if is_current {
+            // Advance first so the mark lands on the entry that follows the
+            // one about to be removed; dropping the mark beforehand would make
+            // the advance jump to the wrong place.
+            match self.queue.advance() {
+                Ok(Some(_)) => {
+                    self.clear_retry();
+                    self.consume_current();
+                }
+                Ok(None) => {
+                    let _ = self.engine.stop();
+                }
+                Err(error) => {
+                    crate::diag::note(&format!("the active queue could not be read: {error}"));
+                    return false;
+                }
+            }
+        }
+
+        if let Err(error) = self.queue.remove_entry(position) {
+            crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
+            return false;
+        }
+        true
+    }
+
     /// Asks the current queue entry to be consumed.
     ///
     /// The URL is read from the queue, so callers cannot supply a player URL.

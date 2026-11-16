@@ -37,6 +37,9 @@ const REQUIRED_GLYPHS: &[(&str, u32)] = &[
     ("forward_10", 0xe056),
     ("arrow_back", 0xe5c4),
     ("arrow_forward", 0xe5c8),
+    ("more_vert", 0xe5d4),
+    ("content_copy", 0xe14d),
+    ("delete", 0xe872),
 ];
 
 fn main() {
