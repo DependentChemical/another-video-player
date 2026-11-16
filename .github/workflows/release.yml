@@ -54,6 +54,30 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
+            // Reads the version out of the `[workspace.package]` table of a
+            // manifest. The table ends at the next table header, so the lines
+            // in between are the only candidates. A regular expression over
+            // the whole file stops at the end of the header line and finds
+            // nothing, because the header is followed by a line break.
+            function workspaceVersion(manifest) {
+              let inside = false;
+              for (const line of manifest.split(/\r?\n/)) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('[')) {
+                  inside = trimmed === '[workspace.package]';
+                  continue;
+                }
+                if (!inside) {
+                  continue;
+                }
+                const match = trimmed.match(/^version\s*=\s*"([^"]*)"/);
+                if (match) {
+                  return match[1].trim();
+                }
+              }
+              return null;
+            }
+
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const headSha = context.payload.workflow_run.head_sha;
@@ -71,15 +95,10 @@ jobs:
             }
             const manifest = Buffer.from(manifestFile.content, manifestFile.encoding)
               .toString('utf8');
-            const workspacePackage = manifest.match(
-              /^\s*\[workspace\.package\]([\s\S]*?)(?=^\s*\[|$)/m,
-            );
-            const versionMatch = workspacePackage
-              && workspacePackage[1].match(/^\s*version\s*=\s*"([^"]+)"/m);
-            if (!versionMatch) {
+            const version = workspaceVersion(manifest);
+            if (!version) {
               throw new Error('Unable to read [workspace.package].version from Cargo.toml.');
             }
-            const version = versionMatch[1].trim();
             if (!/^\d+\.\d+\.\d+$/.test(version)) {
               throw new Error(`"${version}" is not a version number.`);
             }
