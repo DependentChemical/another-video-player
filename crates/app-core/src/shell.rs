@@ -181,19 +181,7 @@ impl Shell {
             let app = Arc::clone(&app);
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_requested(move || {
-                let entries: Vec<QueueListEntry> = app
-                    .queue_entries()
-                    .into_iter()
-                    .map(|entry| QueueListEntry {
-                        position: entry.position as i32,
-                        title: entry.title,
-                        uploader: entry.uploader.unwrap_or_default(),
-                        thumbnail: entry.thumbnail.map(PathBuf::from).filter(|path| path.exists()),
-                        current: entry.current,
-                        url: entry.url,
-                    })
-                    .collect();
-                ui_for_queue.show_queue(&entries);
+                ui_for_queue.show_queue(&queue_list(&app));
             });
         }
         {
@@ -224,33 +212,26 @@ impl Shell {
         {
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_copy_url(move |url| {
-                ui_for_queue.show_toast(&format!("URL copied: {}", url));
+                if ui_for_queue.copy_to_clipboard(url.as_str()) {
+                    ui_for_queue.show_toast("URL copied to the clipboard");
+                } else {
+                    ui_for_queue.show_toast("The URL could not be copied");
+                }
             });
         }
         {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             let ui_for_queue = Rc::clone(&ui);
-            ui.on_queue_remove_entry(move |position| {
-                if app.remove_queue_entry(position as i64) {
-                    loading.borrow_mut().resolve_started();
-                    let entries: Vec<QueueListEntry> = app
-                        .queue_entries()
-                        .into_iter()
-                        .map(|entry| QueueListEntry {
-                            position: entry.position as i32,
-                            title: entry.title,
-                            uploader: entry.uploader.unwrap_or_default(),
-                            thumbnail: entry
-                                .thumbnail
-                                .map(PathBuf::from)
-                                .filter(|path| path.exists()),
-                            current: entry.current,
-                            url: entry.url,
-                        })
-                        .collect();
-                    ui_for_queue.show_queue(&entries);
+            ui.on_queue_remove_entry(move |id| {
+                let removal = app.remove_queue_entry(id as i64);
+                if !removal.removed {
+                    return;
                 }
+                if removal.advanced {
+                    loading.borrow_mut().resolve_started();
+                }
+                ui_for_queue.show_queue(&queue_list(&app));
             });
         }
         {
@@ -495,6 +476,25 @@ fn player_to_slider_volume(volume: f64) -> f64 {
     100.0 * (volume / 100.0).powi(3)
 }
 
+/// Turns the stored queue into the rows the dialog draws.
+fn queue_list(app: &App) -> Vec<QueueListEntry> {
+    app.queue_entries()
+        .into_iter()
+        .map(|entry| QueueListEntry {
+            id: entry.id as i32,
+            position: entry.position as i32,
+            title: entry.title,
+            uploader: entry.uploader.unwrap_or_default(),
+            thumbnail: entry
+                .thumbnail
+                .as_deref()
+                .and_then(|thumbnail| app.queue_thumbnail(thumbnail)),
+            current: entry.current,
+            url: entry.url,
+        })
+        .collect()
+}
+
 /// Brings the interface and the player back in sync.
 fn tick(
     ui: &PlayerUi,
@@ -576,6 +576,11 @@ fn tick(
                     loading.problem(text.clone());
                 }
                 ui.show_toast(&text);
+            }
+            Message::QueuePreviewsReady => {
+                if ui.window().get_queue_open() {
+                    ui.show_queue(&queue_list(app));
+                }
             }
             Message::RetryScheduled { error, delay_seconds, kind } => {
                 loading.retry_scheduled();
