@@ -5,8 +5,8 @@ name: dev-test
 # `dev` before the changes are merged into `main`, where the automated Build
 # and Release workflows take over. It does not run on every push so that many
 # commits can land between checks.
-  on:
-    workflow_dispatch:
+on:
+  workflow_dispatch:
 
 concurrency:
   group: dev-test-${{ github.ref }}
