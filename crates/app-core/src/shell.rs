@@ -591,6 +591,9 @@ fn tick(
             Message::ThumbnailMigrationFinished { processed } => {
                 ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));
             }
+            Message::ThumbnailRefreshStarted { .. } => {
+                ui.show_toast("Downloading thumbnails");
+            }
             Message::RetryScheduled { error, delay_seconds, kind } => {
                 loading.retry_scheduled();
                 let prefix = match kind {

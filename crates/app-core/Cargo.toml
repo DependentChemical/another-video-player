@@ -35,3 +35,7 @@ path = "src/main.rs"
 [lib]
 name = "app_core"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

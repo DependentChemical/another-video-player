@@ -45,6 +45,9 @@ pub enum Message {
     ThumbnailMigrationStarted { count: usize },
     /// A legacy thumbnail migration finished; carries how many entries were processed.
     ThumbnailMigrationFinished { processed: usize },
+    /// A background thumbnail refresh for the active queue started; carries how
+    /// many entries await processing.
+    ThumbnailRefreshStarted { count: usize },
     /// A retry is scheduled.
     RetryScheduled {
         /// The error message.
@@ -140,6 +143,10 @@ const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
+
+/// How long the background thumbnail pass waits between downloads, so it
+/// stays in the background and does not hammer the network.
+const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(1);
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -346,6 +353,9 @@ impl App {
         // thumbnails that still point at a direct file path, in the
         // background. Start and end are reported to the user as toasts.
         app.maintain_thumbnails();
+        // Rebuild the thumbnail cache for the active queue in the background
+        // so queued videos show their thumbnails without waiting for playback.
+        app.refresh_queue_thumbnails();
         Ok(app)
     }
 
@@ -655,6 +665,58 @@ impl App {
             let _ = outbox.lock().map(|sender| {
                 sender.send(Box::new(Message::ThumbnailMigrationFinished { processed }))
             });
+        });
+    }
+
+    /// Kicks off a background pass that (re)builds the thumbnail cache for the
+    /// active queue.
+    ///
+    /// Entries that already hold a valid cached thumbnail are skipped; the rest
+    /// are downloaded one at a time, slowly, so the cache is rebuilt without
+    /// blocking playback or the interface. The start is reported to the user
+    /// through [`Message::ThumbnailRefreshStarted`].
+    pub fn refresh_queue_thumbnails(&self) {
+        let entries = match self.queue.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                return;
+            }
+        };
+        let due = entries_needing_thumbnails(&entries, &self.cache);
+        if due.is_empty() {
+            return;
+        }
+
+        let count = due.len();
+        let cache = self.cache.clone();
+        let queue = self.queue.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let runtime = self.runtime.handle().clone();
+
+        runtime.spawn_blocking(move || {
+            let _ = outbox
+                .lock()
+                .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
+
+            for (position, url, thumbnail_url) in due {
+                let id = match cache.fetch(&url, Some(&thumbnail_url)) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        crate::diag::note(&format!(
+                            "a queue thumbnail could not be refreshed: {error}"
+                        ));
+                        std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        continue;
+                    }
+                };
+                if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                    crate::diag::note(&format!(
+                        "the active queue entry could not be updated: {error}"
+                    ));
+                }
+                std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+            }
         });
     }
 
@@ -1378,6 +1440,28 @@ impl App {
     }
 }
 
+/// The queue entries that lack a valid cached thumbnail but can still be
+/// downloaded, because the extractor reported a remote thumbnail URL.
+///
+/// Returns `(position, url, thumbnail_url)` triples, in queue order.
+fn entries_needing_thumbnails(
+    entries: &[library::QueueEntry],
+    cache: &ThumbnailCache,
+) -> Vec<(i64, String, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let thumbnail_url = entry.thumbnail_url.as_deref()?;
+            let needed = match entry.thumbnail.as_deref() {
+                None => true,
+                Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
+                Some(_) => true,
+            };
+            needed.then_some((entry.position, entry.url.clone(), thumbnail_url.to_string()))
+        })
+        .collect()
+}
+
 /// Removes the media a previous source buffered.
 ///
 /// The player may still have a cache file open while it replaces the old
@@ -1860,5 +1944,94 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn entries_needing_thumbnails_skips_those_that_are_cached() {
+        let temp = tempfile::tempdir().expect("a temp directory can be created");
+        let queue = Queue::in_memory().expect("an in-memory queue opens");
+        let cache = ThumbnailCache::new(queue.database(), temp.path());
+
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .expect("a valid JPEG encodes");
+        let jpeg = temp.path().join("source.jpg");
+        std::fs::write(&jpeg, &bytes).unwrap();
+
+        let cached_id = cache.register_legacy("https://example.com/cached", &jpeg).unwrap();
+
+        let link = |s: &str| s.to_string();
+        let entries = vec![
+            library::QueueEntry {
+                id: 1,
+                position: 0,
+                url: link("https://example.com/cached"),
+                title: "cached".into(),
+                thumbnail: Some(cached_id.clone()),
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 2,
+                position: 1,
+                url: link("https://example.com/missing"),
+                title: "missing".into(),
+                thumbnail: None,
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 3,
+                position: 2,
+                url: link("https://example.com/stale"),
+                title: "stale".into(),
+                thumbnail: Some("thumb_deadbeef".into()),
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 4,
+                position: 3,
+                url: link("https://example.com/nourl"),
+                title: "nourl".into(),
+                thumbnail: None,
+                thumbnail_url: None,
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+        ];
+
+        let due = entries_needing_thumbnails(&entries, &cache);
+        let due_urls: Vec<_> = due.iter().map(|(_, url, _)| url.as_str()).collect();
+        assert_eq!(due_urls, vec!["https://example.com/missing", "https://example.com/stale"]);
     }
 }

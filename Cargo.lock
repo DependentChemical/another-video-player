@@ -263,7 +263,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-core"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "image",
  "library",
@@ -274,6 +274,7 @@ dependencies = [
  "slint",
  "storyboard",
  "stream-resolver",
+ "tempfile",
  "tokio",
  "ui-kit",
  "updater",
@@ -1524,7 +1525,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "database"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "rusqlite",
 ]
@@ -3478,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "image-process"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "image",
  "media-model",
@@ -3956,7 +3957,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "library"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "database",
  "image",
@@ -4182,7 +4183,7 @@ checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "media-model"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "md5",
  "serde",
@@ -5295,7 +5296,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playback-engine"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "rsmpv",
 ]
@@ -6385,7 +6386,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "media-model",
  "regex",
@@ -6800,11 +6801,11 @@ checksum = "ff7589a1859b09232522bb9edf076ca7fcf14ded96685d3fa629db73023ffbb7"
 
 [[package]]
 name = "storyboard"
-version = "0.4.20"
+version = "0.4.21"
 
 [[package]]
 name = "stream-resolver"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "media-model",
  "serde",
@@ -7818,7 +7819,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "arboard",
  "slint",
@@ -7895,7 +7896,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "updater"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "serde",
  "ureq",
@@ -8051,7 +8052,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-surface"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "playback-engine",
  "slint",
@@ -8313,7 +8314,7 @@ dependencies = [
 
 [[package]]
 name = "web-session"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "media-model",
  "url",
@@ -8321,7 +8322,7 @@ dependencies = [
 
 [[package]]
 name = "web-session-view"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "media-model",
  "tauri",
@@ -9295,7 +9296,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "serde",
  "serde_json",
@@ -9353,7 +9354,7 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-tool"
-version = "0.4.20"
+version = "0.4.21"
 dependencies = [
  "serde",
  "serde_json",
