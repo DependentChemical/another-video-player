@@ -77,6 +77,8 @@ export component MainWindow inherits Window {
     in property <string> update-notes: "";
     in-out property <bool> update-installing: false;
     in property <string> update-error: "";
+    // The progress of the download of an update package.
+    in-out property <float> update-download-progress: 0;
     // The drawer that opens under the top bar when the mascot is clicked.
     in-out property <bool> sidebar-open: false;
     // The queue and history lists shown from the sidebar.
@@ -320,17 +322,68 @@ export component MainWindow inherits Window {
         background: #00000099;
         Rectangle {
             x: (parent.width - min(560px, parent.width - 40px)) / 2;
-            y: (parent.height - min(440px, parent.height - 40px)) / 2;
-            width: min(560px, parent.width - 40px); height: min(440px, parent.height - 40px);
+            y: (parent.height - min(460px, parent.height - 40px)) / 2;
+            width: min(560px, parent.width - 40px); height: min(460px, parent.height - 40px);
             background: Theme.panel; border-radius: 12px; border-width: 1px; border-color: Theme.border;
             VerticalLayout {
                 padding: 22px; spacing: 12px;
-                Text { text: root.update-installing ? "Installing update…" : "Flatline update available"; color: Theme.fg; font-size: 20px; }
-                Text { text: "Version " + root.update-version; color: Theme.muted; }
-                ScrollView { height: 260px; Text { text: root.update-notes; color: Theme.fg; wrap: word-wrap; } }
-                if root.update-error != "": Text { text: root.update-error; color: Theme.danger; wrap: word-wrap; }
+                Text {
+                    text: root.update-installing ? "Installing update…" : "Flatline update available";
+                    color: Theme.fg;
+                    font-size: 20px;
+                }
+                Text {
+                    text: "Version " + root.update-version;
+                    color: Theme.muted;
+                }
+                if !root.update-installing: ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding-right: 12px;
+                        Text {
+                            text: root.update-notes;
+                            color: Theme.fg;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                if root.update-installing: VerticalLayout {
+                    vertical-stretch: 1;
+                    alignment: center;
+                    spacing: 10px;
+                    Text {
+                        text: root.update-download-progress >= 1.0 ? "Installing…" : "Downloading update…";
+                        color: Theme.muted;
+                        horizontal-alignment: center;
+                    }
+                    Rectangle {
+                        height: 10px;
+                        border-radius: 5px;
+                        background: Theme.border;
+                        HorizontalLayout {
+                            padding: 2px;
+                            Rectangle {
+                                width: max(0px, (parent.width - 4px) * root.update-download-progress);
+                                height: 6px;
+                                border-radius: 3px;
+                                background: Theme.accent;
+                            }
+                        }
+                    }
+                    Text {
+                        text: Math.round(root.update-download-progress * 100) + "%";
+                        color: Theme.muted;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                    }
+                }                if root.update-error != "": Text {
+                    text: root.update-error;
+                    color: Theme.danger;
+                    wrap: word-wrap;
+                }
                 HorizontalLayout {
-                    alignment: end; spacing: 8px;
+                    alignment: end;
+                    spacing: 8px;
                     if !root.update-installing && root.update-error == "": Rectangle {
                         width: 80px; height: 34px;
                         border-radius: 6px; border-width: 1px; border-color: Theme.border;
@@ -345,7 +398,7 @@ export component MainWindow inherits Window {
                         Text { text: "Yes, download and install"; color: Theme.on-accent; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                         btn2 := TouchArea { clicked => { root.update-installing = true; root.update-accepted(); } }
                     }
-                    if root.update-installing: ProgressIndicator { indeterminate: true; }
+                    if root.update-installing: ProgressIndicator { indeterminate: false; }
                     if root.update-error != "": Rectangle {
                         width: 80px; height: 34px;
                         border-radius: 6px; border-width: 1px; border-color: Theme.border;

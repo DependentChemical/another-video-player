@@ -488,6 +488,7 @@ impl PlayerUi {
         self.window.set_update_notes(notes.into());
         self.window.set_update_installing(false);
         self.window.set_update_error("".into());
+        self.window.set_update_download_progress(0.0);
         self.window.set_update_open(true);
     }
 
@@ -500,6 +501,11 @@ impl PlayerUi {
     /// Shows that the package is being downloaded and installed.
     pub fn set_update_installing(&self, installing: bool) {
         self.window.set_update_installing(installing);
+    }
+
+    /// Sets the download progress of the update package, from zero to one.
+    pub fn set_update_download_progress(&self, progress: f64) {
+        self.window.set_update_download_progress(progress as f32);
     }
 
     // ------------------------------------------------------------ events --

@@ -111,6 +111,20 @@ instance — Flatline falls back to its per-user directory
 `~/.local/share/flatline/tools` on Linux). Diagnostics are appended to
 `flatline.log` in the same root.
 
+### Test URLs
+
+Some interface behaviour is easier to check on demand than to wait for. Passing
+one of these special URLs to the player (in the bar or on the command line)
+exercises it directly:
+
+| URL | What it does |
+| --- | --- |
+| `test://update-modal` | Opens the update dialog with a placeholder release, even when the running version already is the latest. |
+
+```sh
+cargo run -p app-core -- "test://update-modal"
+```
+
 ### Using the player
 
 1. Paste a URL into the bar at the top and press <kbd>Enter</kbd>, or press

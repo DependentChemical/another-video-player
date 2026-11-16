@@ -324,6 +324,10 @@ impl Shell {
 
     /// Loads a URL that was given on the command line.
     pub fn load(&self, url: &str) {
+        if url.trim() == TEST_UPDATE_URL {
+            self.show_test_update_modal();
+            return;
+        }
         let Some(url) = requested_url(url) else {
             return;
         };
@@ -331,6 +335,16 @@ impl Shell {
         self.ui.set_url(url);
         self.loading.borrow_mut().resolve_started();
         self.app.load(url.to_string());
+    }
+
+    /// Opens the update modal with a fake update so it can be tested.
+    fn show_test_update_modal(&self) {
+        let update = updater::Update {
+            version: "99.0.0".to_string(),
+            notes: "## Test Update\n\nThis is a test update notice shown when the `test://update-modal` URL is loaded.\n\n- First item\n- Second item\n- Third item\n- Fourth item\n- Fifth item\n- Sixth item\n- Seventh item\n- Eighth item\n- Ninth item\n- Tenth item".to_string(),
+            download_url: String::new(),
+        };
+        self.ui.show_update(&update.version, &update.notes);
     }
 
     /// Continues the active queue that was filled in an earlier run.
@@ -354,6 +368,10 @@ fn requested_url(url: &str) -> Option<&str> {
     let url = url.trim();
     (!url.is_empty()).then_some(url)
 }
+
+/// The test URL that forces the update prompt to open immediately, even
+/// when the running version already is the latest one.
+const TEST_UPDATE_URL: &str = "test://update-modal";
 
 /// Starts loading a URL for the user, from the bar or from the history.
 fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
@@ -474,6 +492,11 @@ fn tick(
             Message::UpdateAvailable(update) => {
                 ui.show_update(&update.version, &update.notes);
                 *update_slot.borrow_mut() = Some(update);
+            }
+            Message::UpdateDownloadProgress(progress) => {
+                if progress > 0.0 {
+                    ui.set_update_download_progress(progress);
+                }
             }
             Message::UpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => {

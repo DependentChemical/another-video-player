@@ -35,6 +35,8 @@ pub enum Message {
     SigningIn(Service),
     /// A newer application release is available.
     UpdateAvailable(updater::Update),
+    /// The accepted update is downloading; carries the fraction, from zero to one.
+    UpdateDownloadProgress(f64),
     /// An accepted application update could not be prepared for installation.
     UpdateFailed(String),
     /// Something went wrong that the user should know about.
@@ -1092,7 +1094,13 @@ impl App {
     ) {
         let outbox = Arc::clone(&self.outbox);
         self.runtime.handle().spawn_blocking(move || {
-            if let Err(error) = updater::install(&update, &directory, &executable) {
+            let progress_outbox = Arc::clone(&outbox);
+            let result = updater::install(&update, &directory, &executable, move |progress| {
+                let _ = progress_outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::UpdateDownloadProgress(progress))));
+            });
+            if let Err(error) = result {
                 let message = error.to_string();
                 crate::diag::note(&format!("the Flatline update failed: {message}"));
                 let _ = outbox

@@ -65,16 +65,47 @@ pub fn check(current: &str) -> Result<Option<Update>, Error> {
 
 /// Downloads a package and starts a platform helper that replaces the app,
 /// then starts the new executable after this process exits.
-pub fn install(update: &Update, directory: &Path, executable: &Path) -> Result<(), Error> {
+///
+/// `on_progress` is called with a fraction (0.0 to 1.0) as the download
+/// proceeds, or with 1.0 when done.
+pub fn install<F>(
+    update: &Update,
+    directory: &Path,
+    executable: &Path,
+    mut on_progress: F,
+) -> Result<(), Error>
+where
+    F: FnMut(f64) + Send + 'static,
+{
     let response = ureq::get(&update.download_url)
         .header("User-Agent", USER_AGENT)
         .call()
         .map_err(|error| Error::Request(error.to_string()))?;
     let archive = directory.join(".flatline-update.zip");
     let mut output = std::fs::File::create(&archive).map_err(io_error)?;
+    let content_length = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     let mut reader = response.into_body().into_reader();
-    std::io::copy(&mut reader, &mut output).map_err(io_error)?;
+    let mut downloaded: u64 = 0;
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf).map_err(io_error)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut output, &buf[..n]).map_err(io_error)?;
+        downloaded += n as u64;
+        if content_length > 0 {
+            let frac = downloaded as f64 / content_length as f64;
+            on_progress(frac.min(1.0));
+        }
+    }
     output.flush().map_err(io_error)?;
+    on_progress(1.0);
     let staging = directory.join(".flatline-update-staging");
     if staging.exists() {
         std::fs::remove_dir_all(&staging).map_err(io_error)?;
