@@ -41,6 +41,8 @@ pub enum Message {
     UpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+    /// The queue previews have been prepared and the open list can redraw.
+    QueuePreviewsReady,
     /// A retry is scheduled.
     RetryScheduled {
         /// The error message.
@@ -115,6 +117,15 @@ pub struct Loaded {
     pub thumbnail_url: Option<String>,
     /// The uploader / channel name as reported by the extractor.
     pub uploader: Option<String>,
+}
+
+/// What happened when an entry was removed from the active queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueRemoval {
+    /// Whether the entry was found and deleted.
+    pub removed: bool,
+    /// Whether the entry was playing and the next entry was started.
+    pub advanced: bool,
 }
 
 /// How long a persisted resolver result may be reused before it is refreshed.
@@ -314,7 +325,7 @@ impl App {
             .map_err(|error| Error::Runtime(error.to_string()))?;
         let (sender, receiver) = channel();
 
-        Ok(App {
+        let app = App {
             engine,
             resolver: Mutex::new(resolver),
             settings,
@@ -328,7 +339,13 @@ impl App {
             cache,
             stream_buffer,
             pending: Mutex::new(None),
-        })
+        };
+        // The queue dialog shows a small preview of every entry. Building the
+        // previews from the full-size cache is cheaper than decoding the full
+        // images on every open, so the ones that are still missing are
+        // prepared in the background right away.
+        app.warm_queue_previews();
+        Ok(app)
     }
 
     /// The player.
@@ -566,6 +583,39 @@ impl App {
         }
     }
 
+    /// Returns the small preview of a cached thumbnail for the queue list.
+    ///
+    /// Only a preview that is already on disk is returned. The image work
+    /// happens in [`App::warm_queue_previews`], never on the event loop, so
+    /// opening a long queue cannot freeze while the list is being mapped.
+    pub fn queue_thumbnail(&self, thumbnail: &str) -> Option<PathBuf> {
+        self.cache.preview_if_present(Path::new(thumbnail))
+    }
+
+    /// Prepares the queue previews in the background.
+    ///
+    /// The full-size cache stays untouched; each entry gets a small copy that
+    /// the queue list can decode cheaply. When the batch is done the UI is
+    /// told, so a queue that was opened meanwhile can show the new images.
+    fn warm_queue_previews(&self) {
+        let Ok(entries) = self.queue.entries() else {
+            return;
+        };
+        let thumbnails: Vec<String> =
+            entries.into_iter().filter_map(|entry| entry.thumbnail).collect();
+        if thumbnails.is_empty() {
+            return;
+        }
+        let cache = self.cache.clone();
+        let outbox = Arc::clone(&self.outbox);
+        self.runtime.spawn_blocking(move || {
+            for thumbnail in thumbnails {
+                let _ = cache.preview(Path::new(&thumbnail));
+            }
+            let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::QueuePreviewsReady)));
+        });
+    }
+
     /// Returns every history entry, most recently played first.
     pub fn history_entries(&self) -> Vec<library::HistoryEntry> {
         match self.queue.history_all() {
@@ -594,38 +644,45 @@ impl App {
 
     /// Removes an entry from the active queue.
     ///
-    /// When the removed entry was the one playing, playback moves to the next
-    /// entry of the queue; when no entry follows it, the player is stopped.
-    pub fn remove_queue_entry(&self, position: i64) -> bool {
-        let is_current = matches!(
-            self.queue.current(),
-            Ok(Some(entry)) if entry.position == position
-        );
+    /// The entry is identified by its stable database id, so exactly one row
+    /// is removed. When the removed entry was the one playing, playback moves
+    /// to the entry that follows it; when no entry follows it, the player is
+    /// stopped.
+    pub fn remove_queue_entry(&self, id: i64) -> QueueRemoval {
+        let removed = match self.queue.remove_entry(id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return QueueRemoval::default(),
+            Err(error) => {
+                crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
+                return QueueRemoval::default();
+            }
+        };
 
-        if is_current {
-            // Advance first so the mark lands on the entry that follows the
-            // one about to be removed; dropping the mark beforehand would make
-            // the advance jump to the wrong place.
-            match self.queue.advance() {
-                Ok(Some(_)) => {
-                    self.clear_retry();
-                    self.consume_current();
+        if !removed.current {
+            return QueueRemoval { removed: true, advanced: false };
+        }
+
+        match self.queue.next_after(removed.position) {
+            Ok(Some(next)) => {
+                if let Err(error) = self.queue.set_current(next.position) {
+                    crate::diag::note(&format!(
+                        "the next queue entry could not be made current: {error}"
+                    ));
+                    return QueueRemoval { removed: true, advanced: false };
                 }
-                Ok(None) => {
-                    let _ = self.engine.stop();
-                }
-                Err(error) => {
-                    crate::diag::note(&format!("the active queue could not be read: {error}"));
-                    return false;
-                }
+                self.clear_retry();
+                self.consume_current();
+                QueueRemoval { removed: true, advanced: true }
+            }
+            Ok(None) => {
+                let _ = self.engine.stop();
+                QueueRemoval { removed: true, advanced: false }
+            }
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                QueueRemoval { removed: true, advanced: false }
             }
         }
-
-        if let Err(error) = self.queue.remove_entry(position) {
-            crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
-            return false;
-        }
-        true
     }
 
     /// Asks the current queue entry to be consumed.
