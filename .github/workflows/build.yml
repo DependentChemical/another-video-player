@@ -39,7 +39,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            build-essential
+            build-essential \
+            xvfb
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,7 +65,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: xvfb-run -a cargo test --workspace
 
   build-windows:
     name: Build Windows x64
