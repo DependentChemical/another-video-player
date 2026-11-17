@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model as _, Timer, TimerMode};
+use slint::{ComponentHandle, Timer, TimerMode};
 
 slint::include_modules!();
 
@@ -223,49 +223,17 @@ impl PlayerUi {
         // `queue-long-press-index` is set so the queue dialog can drag.
         let drag_scroll_timer = Rc::new(Timer::default());
         // Auto-scroll while dragging: every 16ms, if a row is being dragged
-        // (`queue-long-press-index >= 0`), scroll the queue list when the
-        // pointer is near the top or bottom viewport edge. Speed grows with
-        // how far past the edge the pointer is.
+        // (`queue-long-press-index >= 0`), toggle a tick that makes the queue
+        // dialog scroll the list when the pointer is near a viewport edge.
+        // The dialog owns the geometry and the acceleration; this timer only
+        // provides the clock, so no layout values have to cross the FFI.
         let scroll_window = window_weak.clone();
         drag_scroll_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
             let Some(window) = scroll_window.upgrade() else { return };
             if window.get_queue_long_press_index() < 0 {
                 return;
             }
-            let scroll_height = window.get_queue_scroll_view_height();
-            if scroll_height <= 0.0 {
-                return;
-            }
-
-            // Constants mirror QueueDialog.slint: row-height 76px,
-            // row-spacing 4px => row-step 80px.
-            const ROW_STEP: f32 = 80.0;
-            const THRESHOLD: f32 = 100.0;
-            const MAX_SPEED: f32 = 40.0;
-
-            let content_y = window.get_queue_content_y();
-            let pointer_y = window.get_queue_drag_pointer_y();
-            let content_height = window.get_queue_items().row_count() as f32 * ROW_STEP;
-            let lowest_y = (scroll_height - content_height).min(0.0);
-
-            let mut new_y = content_y;
-
-            // Near the top edge: scroll up, back towards zero.
-            if pointer_y < THRESHOLD && content_y < 0.0 {
-                let t = ((THRESHOLD - pointer_y) / THRESHOLD).clamp(0.0, 1.0);
-                new_y = (new_y + MAX_SPEED * t).min(0.0);
-            }
-
-            // Near the bottom edge: content-y is negative, so scrolling down
-            // means making it smaller.
-            if pointer_y > scroll_height - THRESHOLD && content_y > lowest_y {
-                let t = ((pointer_y - (scroll_height - THRESHOLD)) / THRESHOLD).clamp(0.0, 1.0);
-                new_y = (new_y - MAX_SPEED * t).max(lowest_y);
-            }
-
-            if new_y != content_y {
-                window.set_queue_content_y(new_y);
-            }
+            window.set_queue_drag_scroll_tick(!window.get_queue_drag_scroll_tick());
         });
 
         Ok(PlayerUi {
@@ -746,7 +714,7 @@ impl PlayerUi {
 
     /// Called when a queue row is pressed.
     ///
-    /// PlayerUi uses this to arm a 1.5s long-press timer; the window sets
+    /// PlayerUi uses this to arm a 750ms long-press timer; the window sets
     /// `queue-long-press-index` when it fires so the queue dialog can drag.
     pub fn on_queue_row_pressed(&self, handler: impl Fn(i32) + 'static) {
         let pending = self.long_press_pending.clone();
@@ -759,7 +727,7 @@ impl PlayerUi {
             }
             let pending = pending.clone();
             let window_weak = window_weak.clone();
-            timer.start(TimerMode::SingleShot, Duration::from_millis(1500), move || {
+            timer.start(TimerMode::SingleShot, Duration::from_millis(750), move || {
                 let Some(index) = pending.get() else { return };
                 let Some(window) = window_weak.upgrade() else { return };
                 window.set_queue_long_press_index(index);

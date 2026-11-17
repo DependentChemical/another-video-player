@@ -92,7 +92,7 @@ export component MainWindow inherits Window {
     in property <int> queue-long-press-index: -1;
     in-out property <length> queue-content-y: 0px;
     in-out property <length> queue-drag-pointer-y: 0px;
-    in-out property <length> queue-scroll-view-height: 0px;
+    in-out property <bool> queue-drag-scroll-tick: false;
     in-out property <bool> history-open: false;
     in property <[HistoryItem]> history-items: [];
 
@@ -323,7 +323,7 @@ export component MainWindow inherits Window {
         long-press-index: root.queue-long-press-index;
         queue-content-y <=> root.queue-content-y;
         drag-pointer-y <=> root.queue-drag-pointer-y;
-        scroll-view-resized(h) => { root.queue-scroll-view-height = h * 1px; }
+        drag-scroll-tick: root.queue-drag-scroll-tick;
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
         copy-url(url) => { root.queue-copy-url(url); }

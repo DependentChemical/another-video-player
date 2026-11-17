@@ -11,10 +11,15 @@ export component QueueDialog inherits Rectangle {
     in property <int> current-id: -1;
     in property <int> long-press-index: -1;
     in-out property <length> queue-content-y: 0px;
-    // The pointer position during a drag, measured from the top of the queue
-    // viewport. Kept by the dragged row itself because Slint only updates the
-    // grabbed `TouchArea` while the button is held, never its siblings.
+    // The absolute (window) y of the pointer during a drag. Kept by the
+    // dragged row itself because Slint only updates the grabbed `TouchArea`
+    // while the button is held, never its siblings. Absolute coordinates are
+    // used so the value stays valid no matter how far the list scrolls.
     in-out property <length> drag-pointer-y: 0px;
+    // Toggled by the host every 16ms while a drag is active. The `changed`
+    // handler runs the auto-scroll with direct access to the scroll view's
+    // real geometry, so no height has to be reported to the host.
+    in property <bool> drag-scroll-tick: false;
     in-out property <bool> menu-open: false;
     in-out property <string> menu-url: "";
     callback item-selected(int);
@@ -23,7 +28,6 @@ export component QueueDialog inherits Rectangle {
     callback move-requested(int, int);
     callback queue-row-pressed(int);
     callback queue-row-released(int);
-    callback scroll-view-resized(float);
     callback dismissed();
 
     private property <length> row-height: 76px;
@@ -33,14 +37,21 @@ export component QueueDialog inherits Rectangle {
     private property <length> menu-anchor-x: 0px;
     private property <length> menu-anchor-y: 0px;
 
-    // Drag state: which row is being dragged (tracked by `long-press-index`,
-    // set by the host after a 1.5s press) and where it would land. The target
-    // is derived from the pointer so it follows the cursor and stays correct
-    // while the list auto-scrolls under it.
+    // The row the pointer would drop onto, in the list's content space. The
+    // pointer is stored in window coordinates, so subtract the content
+    // element's window position (scroll view top plus the current scroll) to
+    // get the content-space offset. Re-evaluated as the list scrolls under a
+    // stationary pointer, which keeps the drop indicator correct.
     private property <int> drag-target: root.long-press-index < 0
         ? -1
-        : clamp(floor((root.drag-pointer-y - root.queue-content-y) / root.row-step),
+        : clamp(floor((root.drag-pointer-y
+                - (scroll-view.absolute-position.y + root.queue-content-y))
+                / root.row-step),
             0, root.items.length - 1);
+
+    changed drag-scroll-tick => {
+        root.auto-scroll();
+    }
 
     background: #00000088;
 
@@ -94,23 +105,23 @@ export component QueueDialog inherits Rectangle {
                 }
             }
 
-            if root.items.length == 0: Text {
-                text: "The queue is empty.";
-                color: Theme.muted;
-                font-size: 13px;
-                vertical-alignment: center;
-            }
-
-            if root.items.length > 0: scroll-view := ScrollView {
+            // Always created so its real geometry is available to the
+            // auto-scroll; hidden when the queue is empty.
+            scroll-view := ScrollView {
                 vertical-stretch: 1;
                 content-y <=> queue-content-y;
-                changed height => {
-                    root.scroll-view-resized(scroll-view.height / 1px);
-                }
+                visible: root.items.length > 0;
 
                 VerticalLayout {
                     spacing: root.row-spacing;
                     padding-right: 12px;
+
+                    if root.items.length == 0: Text {
+                        text: "The queue is empty.";
+                        color: Theme.muted;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
 
                     for item in root.items: row := Rectangle {
                         height: root.row-height;
@@ -151,7 +162,7 @@ export component QueueDialog inherits Rectangle {
 
                                     // The whole row except the buttons opens the
                                     // entry. A short press plays it; a long press
-                                    // (1.5s, tracked by `long-press-index`) starts a
+                                    // (750ms, tracked by `long-press-index`) starts a
                                     // drag instead.
                                     clickable := Rectangle {
                                         horizontal-stretch: 1;
@@ -223,48 +234,31 @@ export component QueueDialog inherits Rectangle {
                                             // The grabbed TouchArea is the only
                                             // one Slint keeps updating while the
                                             // button is held, so the drag position
-                                            // has to come from here.
+                                            // has to come from here. Its absolute
+                                            // position plus the local pointer is
+                                            // the pointer in window coordinates.
                                             moved => {
-                                                root.drag-pointer-y = root.pointer-y(
-                                                    item.index,
-                                                    self.mouse-y,
-                                                    row.absolute-position.y,
-                                                    self.absolute-position.y,
-                                                );
+                                                root.drag-pointer-y = self.absolute-position.y
+                                                    + self.mouse-y;
                                             }
                                             changed pressed => {
+                                                root.drag-pointer-y = self.absolute-position.y
+                                                    + self.mouse-y;
                                                 if self.pressed {
-                                                    root.drag-pointer-y = root.pointer-y(
-                                                        item.index,
-                                                        self.mouse-y,
-                                                        row.absolute-position.y,
-                                                        self.absolute-position.y,
-                                                    );
                                                     root.queue-row-pressed(item.index);
                                                 } else {
-                                                    root.drag-pointer-y = root.pointer-y(
-                                                        item.index,
-                                                        self.mouse-y,
-                                                        row.absolute-position.y,
-                                                        self.absolute-position.y,
-                                                    );
-                                                    // `has-hover` is cleared when the
-                                                    // ScrollView takes the press over
-                                                    // to pan, so that never counts as
-                                                    // a click on the row.
-                                                    if self.has-hover {
-                                                        // A short press plays the
-                                                        // entry; a long press (1.5s,
-                                                        // reported by
-                                                        // `long-press-index`) drops it
-                                                        // where the pointer was
-                                                        // released.
-                                                        if root.long-press-index >= 0 {
-                                                            root.commit_move();
-                                                        } else {
-                                                            root.open = false;
-                                                            root.item-selected(item.id);
-                                                        }
+                                                    // A drag commits wherever the
+                                                    // pointer is released, even
+                                                    // outside the grabbed row;
+                                                    // that is the whole point of
+                                                    // the auto-scroll. A short
+                                                    // press only plays when it is
+                                                    // released over the row.
+                                                    if root.long-press-index >= 0 {
+                                                        root.commit_move();
+                                                    } else if self.has-hover {
+                                                        root.open = false;
+                                                        root.item-selected(item.id);
                                                     }
                                                     root.queue-row-released(item.index);
                                                 }
@@ -405,14 +399,34 @@ export component QueueDialog inherits Rectangle {
         }
     }
 
-    // The pointer position in viewport coordinates, derived from the dragged
-    // row's `TouchArea`. `local-y` is relative to the touch area and `row-y` /
-    // `touch-y` are their absolute positions, so the small offset between the
-    // row and its touch area cancels out.
-    pure function pointer-y(index: int, local-y: length, row-y: length,
-        touch-y: length) -> length {
-        return index * root.row-step + (touch-y - row-y) + local-y
-            + root.queue-content-y;
+    // Scroll the list while a row is dragged towards the top or bottom of the
+    // visible area. The step grows with the square of the distance past the
+    // trigger edge, so the farther the pointer is pushed the faster it scrolls.
+    // Everything is read from the scroll view's live geometry, which makes the
+    // direction and clamping exact regardless of layout timing.
+    function auto-scroll() {
+        if root.long-press-index < 0 {
+            return;
+        }
+        let viewport-height = scroll-view.height;
+        if viewport-height <= 0px {
+            return;
+        }
+        let pointer = root.drag-pointer-y - scroll-view.absolute-position.y;
+        // A trigger band on each side, at most a third of the viewport.
+        let threshold = min(viewport-height / 3, 96px);
+        let step = max(8px, viewport-height * 0.06);
+        let lowest = min(viewport-height - scroll-view.content-height, 0px);
+
+        if pointer < threshold && root.queue-content-y < 0px {
+            let t = clamp((threshold - pointer) / threshold, 0.0, 1.0);
+            root.queue-content-y = min(0px, root.queue-content-y + step * t * t);
+        }
+
+        if pointer > viewport-height - threshold && root.queue-content-y > lowest {
+            let t = clamp((pointer - (viewport-height - threshold)) / threshold, 0.0, 1.0);
+            root.queue-content-y = max(lowest, root.queue-content-y - step * t * t);
+        }
     }
 
     // Commit the move: hand the source/target indices to the host, which
