@@ -15,6 +15,9 @@ import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
 import { StreamItem, QueueItem, HistoryItem, BufferedRange } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
+import "../fonts/NotoSansCJKsc-VF.ttf";
+import "../fonts/NotoSansSymbols2.ttf";
+import "../fonts/NotoColorEmoji.ttf";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -28,7 +31,7 @@ export component MainWindow inherits Window {
     min-width: 560px;
     min-height: 340px;
     background: root.has-media ? transparent : Theme.bg;
-    default-font-family: "Inter";
+    default-font-family: "Inter, Noto Sans CJK SC, Noto Sans Symbols 2, Noto Color Emoji";
     default-font-size: 13px;
 
     // ------------------------------------------------------------- state --
