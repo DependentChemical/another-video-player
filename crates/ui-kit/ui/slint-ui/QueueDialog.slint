@@ -8,11 +8,22 @@ export component QueueDialog inherits Rectangle {
     in-out property <bool> open: false;
     in property <[QueueItem]> items: [];
     in property <int> current-index: -1;
+    in property <int> current-id: -1;
+    in property <int> long-press-index: -1;
+    in-out property <length> queue-content-y: 0px;
+    // The pointer position during a drag, measured from the top of the queue
+    // viewport. Kept by the dragged row itself because Slint only updates the
+    // grabbed `TouchArea` while the button is held, never its siblings.
+    in-out property <length> drag-pointer-y: 0px;
     in-out property <bool> menu-open: false;
     in-out property <string> menu-url: "";
     callback item-selected(int);
     callback copy-url(string);
     callback remove-entry(int);
+    callback move-requested(int, int);
+    callback queue-row-pressed(int);
+    callback queue-row-released(int);
+    callback scroll-view-resized(float);
     callback dismissed();
 
     private property <length> row-height: 76px;
@@ -21,6 +32,15 @@ export component QueueDialog inherits Rectangle {
     private property <length> button-size: 32px;
     private property <length> menu-anchor-x: 0px;
     private property <length> menu-anchor-y: 0px;
+
+    // Drag state: which row is being dragged (tracked by `long-press-index`,
+    // set by the host after a 1.5s press) and where it would land. The target
+    // is derived from the pointer so it follows the cursor and stays correct
+    // while the list auto-scrolls under it.
+    private property <int> drag-target: root.long-press-index < 0
+        ? -1
+        : clamp(floor((root.drag-pointer-y - root.queue-content-y) / root.row-step),
+            0, root.items.length - 1);
 
     background: #00000088;
 
@@ -83,161 +103,230 @@ export component QueueDialog inherits Rectangle {
 
             if root.items.length > 0: scroll-view := ScrollView {
                 vertical-stretch: 1;
-                // ScrollView offsets are negative; a positive value would try
-                // to scroll above the first row and make the list jump.
-                content-y: root.open && root.current-index >= 0
-                    ? -(root.current-index * root.row-step)
-                    : 0px;
+                content-y <=> queue-content-y;
+                changed height => {
+                    root.scroll-view-resized(scroll-view.height / 1px);
+                }
 
                 VerticalLayout {
                     spacing: root.row-spacing;
                     padding-right: 12px;
 
-                    for item in root.items: Rectangle {
+                    for item in root.items: row := Rectangle {
                         height: root.row-height;
                         border-radius: 8px;
                         background: item.current
                             ? Theme.elevated
-                            : ((row-touch.has-hover || option-touch.has-hover || delete-touch.has-hover)
-                                ? Theme.elevated
-                                : transparent);
+                            : ((item.index == root.long-press-index)
+                                ? #00000033
+                                : ((row-touch.has-hover || option-touch.has-hover || delete-touch.has-hover)
+                                    ? Theme.elevated
+                                    : transparent));
 
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 12px;
-                            spacing: 12px;
-                            cross-axis-alignment: center;
+                        VerticalLayout {
+                            spacing: 0;
 
-                            // The whole row except the buttons opens the
-                            // entry. The default `stretch` alignment lets this
-                            // take every pixel the buttons leave over, so the
-                            // buttons stay pinned to the right on every row.
-                            clickable := Rectangle {
+                            // Drop indicator: a colored bar between rows. A
+                            // row dragged upwards lands before its target, a
+                            // row dragged downwards lands after it, so the bar
+                            // is drawn on the matching side.
+                            if root.drag-target == item.index
+                                && root.long-press-index > root.drag-target: Rectangle {
+                                height: 3px;
                                 horizontal-stretch: 1;
-                                min-width: 0px;
-                                background: transparent;
+                                background: Theme.accent;
+                            }
 
-                                HorizontalLayout {
-                                    spacing: 12px;
-                                    cross-axis-alignment: center;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                cross-axis-alignment: center;
+                                horizontal-stretch: 1;
 
-                                    // A fixed slot keeps the thumbnails of all
-                                    // rows aligned while only the current row
-                                    // shows the play marker.
-                                    Rectangle {
-                                        width: 16px;
-                                        height: 16px;
-                                        background: transparent;
+                                // The whole row except the buttons opens the
+                                // entry. A short press plays it; a long press
+                                // (1.5s, tracked by `long-press-index`) starts a
+                                // drag instead.
+                                clickable := Rectangle {
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                    background: transparent;
 
-                                        if item.current: PlayIcon {
+                                    HorizontalLayout {
+                                        spacing: 12px;
+                                        cross-axis-alignment: center;
+
+                                        // A fixed slot keeps the thumbnails of all
+                                        // rows aligned while only the current row
+                                        // shows the play marker.
+                                        Rectangle {
                                             width: 16px;
                                             height: 16px;
-                                            ink: Theme.accent;
+                                            background: transparent;
+
+                                            if item.current: PlayIcon {
+                                                width: 16px;
+                                                height: 16px;
+                                                ink: Theme.accent;
+                                            }
                                         }
-                                    }
 
-                                    Rectangle {
-                                        width: 96px;
-                                        height: 54px;
-                                        border-radius: 6px;
-                                        background: #00000040;
-                                        clip: true;
+                                        Rectangle {
+                                            width: 96px;
+                                            height: 54px;
+                                            border-radius: 6px;
+                                            background: #00000040;
+                                            clip: true;
 
-                                        Image {
-                                            width: 100%;
-                                            height: 100%;
-                                            source: item.thumbnail;
-                                            image-fit: cover;
+                                            Image {
+                                                width: 100%;
+                                                height: 100%;
+                                                source: item.thumbnail;
+                                                image-fit: cover;
+                                            }
                                         }
-                                    }
 
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        min-width: 0px;
-                                        spacing: 2px;
-                                        alignment: center;
-
-                                        Text {
-                                            text: item.title;
-                                            color: Theme.fg;
-                                            font-size: 13px;
-                                            wrap: word-wrap;
-                                            overflow: elide;
-                                            max-lines: 2;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
                                             min-width: 0px;
-                                        }
+                                            spacing: 2px;
+                                            alignment: center;
 
-                                        Text {
-                                            text: item.uploader;
-                                            color: Theme.muted;
-                                            font-size: 12px;
-                                            wrap: word-wrap;
-                                            overflow: elide;
-                                            max-lines: 1;
+                                            Text {
+                                                text: item.title;
+                                                color: Theme.fg;
+                                                font-size: 13px;
+                                                wrap: word-wrap;
+                                                overflow: elide;
+                                                max-lines: 2;
+                                                min-width: 0px;
+                                            }
+
+                                            Text {
+                                                text: item.uploader;
+                                                color: Theme.muted;
+                                                font-size: 12px;
+                                                wrap: word-wrap;
+                                                overflow: elide;
+                                                max-lines: 1;
+                                            }
+                                        }
+                                    }
+
+                                    row-touch := TouchArea {
+                                        // The grabbed TouchArea is the only
+                                        // one Slint keeps updating while the
+                                        // button is held, so the drag position
+                                        // has to come from here.
+                                        moved => {
+                                            root.drag-pointer-y = root.pointer-y(
+                                                item.index,
+                                                self.mouse-y,
+                                                row.absolute-position.y,
+                                                self.absolute-position.y,
+                                            );
+                                        }
+                                        changed pressed => {
+                                            if self.pressed {
+                                                root.drag-pointer-y = root.pointer-y(
+                                                    item.index,
+                                                    self.mouse-y,
+                                                    row.absolute-position.y,
+                                                    self.absolute-position.y,
+                                                );
+                                                root.queue-row-pressed(item.index);
+                                            } else {
+                                                root.drag-pointer-y = root.pointer-y(
+                                                    item.index,
+                                                    self.mouse-y,
+                                                    row.absolute-position.y,
+                                                    self.absolute-position.y,
+                                                );
+                                                // `has-hover` is cleared when the
+                                                // ScrollView takes the press over
+                                                // to pan, so that never counts as
+                                                // a click on the row.
+                                                if self.has-hover {
+                                                    // A short press plays the
+                                                    // entry; a long press (1.5s,
+                                                    // reported by
+                                                    // `long-press-index`) drops it
+                                                    // where the pointer was
+                                                    // released.
+                                                    if root.long-press-index >= 0 {
+                                                        root.commit_move();
+                                                    } else {
+                                                        root.open = false;
+                                                        root.item-selected(item.id);
+                                                    }
+                                                }
+                                                root.queue-row-released(item.index);
+                                            }
                                         }
                                     }
                                 }
 
-                                row-touch := TouchArea {
-                                    clicked => {
-                                        root.open = false;
-                                        root.item-selected(item.position);
+                                // The button set is its own fixed column, so every
+                                // row lines its buttons up on the same right edge.
+                                HorizontalLayout {
+                                    horizontal-stretch: 0;
+                                    spacing: 4px;
+                                    alignment: end;
+                                    cross-axis-alignment: center;
+
+                                    // More options button (three dots)
+                                    option-button := Rectangle {
+                                        width: root.button-size;
+                                        height: root.button-size;
+                                        border-radius: 6px;
+                                        background: option-touch.has-hover ? Theme.elevated : transparent;
+
+                                        MoreIcon {
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            ink: option-touch.has-hover ? Theme.fg : Theme.muted;
+                                        }
+
+                                        option-touch := TouchArea {
+                                            clicked => {
+                                                root.menu-anchor-x = option-button.absolute-position.x
+                                                    - panel.absolute-position.x + option-button.width;
+                                                root.menu-anchor-y = option-button.absolute-position.y
+                                                    - panel.absolute-position.y + option-button.height + 4px;
+                                                root.menu-open = true;
+                                                root.menu-url = item.url;
+                                            }
+                                        }
+                                    }
+
+                                    // Delete button
+                                    delete-button := Rectangle {
+                                        width: root.button-size;
+                                        height: root.button-size;
+                                        border-radius: 6px;
+                                        background: delete-touch.has-hover ? Theme.danger : transparent;
+
+                                        DeleteIcon {
+                                            x: (parent.width - self.width) / 2;
+                                            y: (parent.height - self.height) / 2;
+                                            ink: delete-touch.has-hover ? Theme.on-accent : Theme.muted;
+                                        }
+
+                                        delete-touch := TouchArea {
+                                            clicked => {
+                                                root.remove-entry(item.id);
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            // The button set is its own fixed column, so every
-                            // row lines its buttons up on the same right edge.
-                            HorizontalLayout {
-                                horizontal-stretch: 0;
-                                spacing: 4px;
-                                alignment: end;
-                                cross-axis-alignment: center;
-
-                                // More options button (three dots)
-                                option-button := Rectangle {
-                                    width: root.button-size;
-                                    height: root.button-size;
-                                    border-radius: 6px;
-                                    background: option-touch.has-hover ? Theme.elevated : transparent;
-
-                                    MoreIcon {
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2;
-                                        ink: option-touch.has-hover ? Theme.fg : Theme.muted;
-                                    }
-
-                                    option-touch := TouchArea {
-                                        clicked => {
-                                            root.menu-anchor-x = option-button.absolute-position.x
-                                                - panel.absolute-position.x + option-button.width;
-                                            root.menu-anchor-y = option-button.absolute-position.y
-                                                - panel.absolute-position.y + option-button.height + 4px;
-                                            root.menu-open = true;
-                                            root.menu-url = item.url;
-                                        }
-                                    }
-                                }
-
-                                // Delete button
-                                delete-button := Rectangle {
-                                    width: root.button-size;
-                                    height: root.button-size;
-                                    border-radius: 6px;
-                                    background: delete-touch.has-hover ? Theme.danger : transparent;
-
-                                    DeleteIcon {
-                                        x: (parent.width - self.width) / 2;
-                                        y: (parent.height - self.height) / 2;
-                                        ink: delete-touch.has-hover ? Theme.on-accent : Theme.muted;
-                                    }
-
-                                    delete-touch := TouchArea {
-                                        clicked => {
-                                            root.remove-entry(item.id);
-                                        }
-                                    }
-                                }
+                            if root.drag-target == item.index
+                                && root.long-press-index < root.drag-target: Rectangle {
+                                height: 3px;
+                                horizontal-stretch: 1;
+                                background: Theme.accent;
                             }
                         }
                     }
@@ -255,7 +344,7 @@ export component QueueDialog inherits Rectangle {
 
             overlay-touch := TouchArea {
                 clicked => {
-                    root.menu-open = false;
+                    root.open = false;
                 }
             }
 
@@ -307,5 +396,24 @@ export component QueueDialog inherits Rectangle {
                 }
             }
         }
+    }
+
+    // The pointer position in viewport coordinates, derived from the dragged
+    // row's `TouchArea`. `local-y` is relative to the touch area and `row-y` /
+    // `touch-y` are their absolute positions, so the small offset between the
+    // row and its touch area cancels out.
+    pure function pointer-y(index: int, local-y: length, row-y: length,
+        touch-y: length) -> length {
+        return index * root.row-step + (touch-y - row-y) + local-y
+            + root.queue-content-y;
+    }
+
+    // Commit the move: hand the source/target indices to the host, which
+    // rebuilds the id order in active_queue and repaints the queue.
+    function commit_move() {
+        let source = root.long-press-index;
+        let target = root.drag-target;
+        if source < 0 || target < 0 || source == target { return; }
+        root.move-requested(source, target);
     }
 }

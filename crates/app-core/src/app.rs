@@ -731,9 +731,9 @@ impl App {
         }
     }
 
-    /// Starts the entry at `position` and marks it as the current one.
-    pub fn play_queue_entry(&self, position: i64) -> bool {
-        match self.queue.set_current(position) {
+    /// Starts the entry with `id` and marks it as the current one.
+    pub fn play_queue_entry(&self, id: i64) -> bool {
+        match self.queue.set_current(id) {
             Ok(()) => {
                 self.clear_retry();
                 self.consume_current();
@@ -775,7 +775,7 @@ impl App {
 
         match self.queue.next_after(removed.position) {
             Ok(Some(next)) => {
-                if let Err(error) = self.queue.set_current(next.position) {
+                if let Err(error) = self.queue.set_current(next.id) {
                     crate::diag::note(&format!(
                         "the next queue entry could not be made current: {error}"
                     ));
@@ -792,6 +792,21 @@ impl App {
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"));
                 QueueRemoval { removed: true, advanced: false }
+            }
+        }
+    }
+
+    /// Reorders the active queue to the given id order and refreshes the view.
+    ///
+    /// This is what the queue dialog uses after the user drags items around.
+    /// Positions are reassigned 0..n-1 in the new order; the current mark
+    /// follows its entry because it is tracked by id.
+    pub fn reorder_queue(&self, ordered_ids: &[i64]) -> bool {
+        match self.queue.reorder(ordered_ids) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be reordered: {error}"));
+                false
             }
         }
     }

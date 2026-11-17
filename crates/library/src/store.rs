@@ -331,18 +331,18 @@ impl Queue {
     pub fn advance(&self) -> Result<Option<QueueEntry>, Error> {
         self.db
             .with_connection(|connection| {
-                let current_position: Option<i64> = connection
+                let current: Option<(i64, i64)> = connection
                     .query_row(
-                        "SELECT position FROM active_queue WHERE current = 1 ORDER BY position LIMIT 1",
+                        "SELECT id, position FROM active_queue WHERE current = 1 ORDER BY position LIMIT 1",
                         [],
-                        |row| row.get(0),
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                     )
                     .optional()?;
 
-                let Some(position) = current_position else {
+                let Some((_current_id, current_position)) = current else {
                     let first: Option<i64> = connection
                         .query_row(
-                            "SELECT position FROM active_queue ORDER BY position LIMIT 1",
+                            "SELECT id FROM active_queue ORDER BY position LIMIT 1",
                             [],
                             |row| row.get(0),
                         )
@@ -351,7 +351,7 @@ impl Queue {
                         return Ok(None);
                     };
                     connection.execute(
-                        "UPDATE active_queue SET current = 1 WHERE position = ?1",
+                        "UPDATE active_queue SET current = 1 WHERE id = ?1",
                         params![first],
                     )?;
                     return current_in(connection);
@@ -359,8 +359,8 @@ impl Queue {
 
                 let next: Option<i64> = connection
                     .query_row(
-                        "SELECT position FROM active_queue WHERE position > ?1 ORDER BY position LIMIT 1",
-                        params![position],
+                        "SELECT id FROM active_queue WHERE position > ?1 ORDER BY position LIMIT 1",
+                        params![current_position],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -370,7 +370,7 @@ impl Queue {
                     return Ok(None);
                 };
                 connection.execute(
-                    "UPDATE active_queue SET current = 1 WHERE position = ?1",
+                    "UPDATE active_queue SET current = 1 WHERE id = ?1",
                     params![next],
                 )?;
                 current_in(connection)
@@ -378,25 +378,25 @@ impl Queue {
             .map_err(Error::from)
     }
 
-    /// Moves the current mark to the entry at `position`.
+    /// Moves the current mark to the entry with `id`.
     ///
     /// This is what a click in the queue list uses to continue from another
-    /// entry. A position that is not in the queue leaves the mark untouched.
-    pub fn set_current(&self, position: i64) -> Result<(), Error> {
+    /// entry. The entry is identified by its stable database id, so reordering
+    /// the queue never loses track of what plays. An id that is not in the
+    /// queue leaves the mark untouched.
+    pub fn set_current(&self, id: i64) -> Result<(), Error> {
         self.db
             .with_connection(|connection| {
                 let exists: Option<i64> = connection
-                    .query_row(
-                        "SELECT position FROM active_queue WHERE position = ?1",
-                        params![position],
-                        |row| row.get(0),
-                    )
+                    .query_row("SELECT id FROM active_queue WHERE id = ?1", params![id], |row| {
+                        row.get(0)
+                    })
                     .optional()?;
                 if exists.is_some() {
                     connection.execute("UPDATE active_queue SET current = 0", [])?;
                     connection.execute(
-                        "UPDATE active_queue SET current = 1 WHERE position = ?1",
-                        params![position],
+                        "UPDATE active_queue SET current = 1 WHERE id = ?1",
+                        params![id],
                     )?;
                 }
                 Ok(())
@@ -514,6 +514,26 @@ impl Queue {
                     connection.execute("DELETE FROM active_queue WHERE id = ?1", params![id])?;
                 }
                 Ok(entry)
+            })
+            .map_err(Error::from)
+    }
+
+    /// Reorders the queue so the entries play in the given id order.
+    ///
+    /// Positions are reassigned 0..n-1 in that order, so a dragged item ends
+    /// up exactly where it was dropped. The current mark follows its entry
+    /// because it is tracked by id, not by position, so reordering never
+    /// requires moving a current-position reference.
+    pub fn reorder(&self, ordered_ids: &[i64]) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                for (index, id) in ordered_ids.iter().enumerate() {
+                    connection.execute(
+                        "UPDATE active_queue SET position = ?1 WHERE id = ?2",
+                        params![index as i64, id],
+                    )?;
+                }
+                Ok(())
             })
             .map_err(Error::from)
     }
@@ -799,9 +819,10 @@ mod tests {
     fn set_current_moves_the_mark_to_the_chosen_entry() {
         let queue = queue();
         queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        let second =
+            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
 
-        queue.set_current(1).expect("set current works");
+        queue.set_current(second.id).expect("set current works");
         assert_eq!(
             queue.current().expect("current works").expect("one entry").url,
             "https://example.com/b"
@@ -910,6 +931,25 @@ mod tests {
             queue.next_after(first.position).expect("next works").expect("a following entry");
         assert_eq!(next.url, "https://example.com/b");
         assert!(queue.current().expect("current works").is_none());
+    }
+
+    #[test]
+    fn reorder_replays_entries_in_the_given_id_order() {
+        let queue = queue();
+        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let second =
+            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        let third = queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        queue.set_current(second.id).expect("set current works");
+
+        queue.reorder(&[third.id, first.id, second.id]).expect("reorder works");
+
+        let entries = queue.entries().expect("entries work");
+        assert_eq!(entries[0].id, third.id);
+        assert_eq!(entries[1].id, first.id);
+        assert_eq!(entries[2].id, second.id);
+        // The current mark follows its entry (tracked by id), not its position.
+        assert_eq!(queue.current().expect("current works").expect("one entry").id, second.id);
     }
 
     #[test]

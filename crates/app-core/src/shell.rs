@@ -207,8 +207,8 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
-            ui.on_queue_item_selected(move |position| {
-                if app.play_queue_entry(position as i64) {
+            ui.on_queue_item_selected(move |id| {
+                if app.play_queue_entry(id as i64) {
                     loading.borrow_mut().resolve_started();
                 }
             });
@@ -240,11 +240,37 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_move_requested(move |src, tgt| {
+                let mut entries = app.queue_entries();
+                if src < 0
+                    || tgt < 0
+                    || src as usize >= entries.len()
+                    || tgt as usize >= entries.len()
+                {
+                    return;
+                }
+                let entry = entries.remove(src as usize);
+                entries.insert(tgt as usize, entry);
+                let ids: Vec<i64> = entries.into_iter().map(|entry| entry.id).collect();
+                if app.reorder_queue(&ids) {
+                    ui_for_queue.show_queue(&queue_list(&app));
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
             let ui_for_history = Rc::clone(&ui);
             let loading = Rc::clone(&loading);
             ui.on_history_item_selected(move |url| {
                 start_load(&app, &ui_for_history, &loading, url.as_str());
             });
+        }
+        {
+            // Arm the queue row long-press timer; the host does not need to
+            // react to press/release beyond what PlayerUi already does.
+            ui.on_queue_row_pressed(move |_| {});
+            ui.on_queue_row_released(move |_| {});
         }
         {
             let app = Arc::clone(&app);

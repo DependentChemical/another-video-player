@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{ComponentHandle, Model as _, Timer, TimerMode};
 
 slint::include_modules!();
 
@@ -166,11 +166,21 @@ pub struct PlayerUi {
     fullscreen: Cell<bool>,
     toasts: Rc<RefCell<ToastStore>>,
     toast_timer: Rc<Timer>,
+    // While a queue row is pressed this holds its index; when the long-press
+    // timer fires the window's `queue-long-press-index` is set so the queue
+    // dialog knows which row is being dragged.
+    long_press_pending: Cell<Option<i32>>,
+    long_press_timer: Rc<Timer>,
+    // Fires every 16ms while a queue row is being dragged; auto-scrolls the
+    // queue list when the dragged row is near the top or bottom viewport edge.
+    drag_scroll_timer: Rc<Timer>,
 }
 
 impl Drop for PlayerUi {
     fn drop(&mut self) {
         self.toast_timer.stop();
+        self.long_press_timer.stop();
+        self.drag_scroll_timer.stop();
     }
 }
 
@@ -204,11 +214,68 @@ impl Default for PlayerUi {
 impl PlayerUi {
     /// Creates the window.
     pub fn new() -> Result<PlayerUi, slint::PlatformError> {
+        let window = MainWindow::new()?;
+        let window_weak = window.as_weak();
+        let long_press_pending = Cell::new(None::<i32>);
+        let long_press_timer = Rc::new(Timer::default());
+        // The long-press timer is (re)armed on every row press in
+        // [`on_queue_row_pressed`]; when it fires the window's
+        // `queue-long-press-index` is set so the queue dialog can drag.
+        let drag_scroll_timer = Rc::new(Timer::default());
+        // Auto-scroll while dragging: every 16ms, if a row is being dragged
+        // (`queue-long-press-index >= 0`), scroll the queue list when the
+        // pointer is near the top or bottom viewport edge. Speed grows with
+        // how far past the edge the pointer is.
+        let scroll_window = window_weak.clone();
+        drag_scroll_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
+            let Some(window) = scroll_window.upgrade() else { return };
+            if window.get_queue_long_press_index() < 0 {
+                return;
+            }
+            let scroll_height = window.get_queue_scroll_view_height();
+            if scroll_height <= 0.0 {
+                return;
+            }
+
+            // Constants mirror QueueDialog.slint: row-height 76px,
+            // row-spacing 4px => row-step 80px.
+            const ROW_STEP: f32 = 80.0;
+            const THRESHOLD: f32 = 100.0;
+            const MAX_SPEED: f32 = 40.0;
+
+            let content_y = window.get_queue_content_y();
+            let pointer_y = window.get_queue_drag_pointer_y();
+            let content_height = window.get_queue_items().row_count() as f32 * ROW_STEP;
+            let lowest_y = (scroll_height - content_height).min(0.0);
+
+            let mut new_y = content_y;
+
+            // Near the top edge: scroll up, back towards zero.
+            if pointer_y < THRESHOLD && content_y < 0.0 {
+                let t = ((THRESHOLD - pointer_y) / THRESHOLD).clamp(0.0, 1.0);
+                new_y = (new_y + MAX_SPEED * t).min(0.0);
+            }
+
+            // Near the bottom edge: content-y is negative, so scrolling down
+            // means making it smaller.
+            if pointer_y > scroll_height - THRESHOLD && content_y > lowest_y {
+                let t = ((pointer_y - (scroll_height - THRESHOLD)) / THRESHOLD).clamp(0.0, 1.0);
+                new_y = (new_y - MAX_SPEED * t).max(lowest_y);
+            }
+
+            if new_y != content_y {
+                window.set_queue_content_y(new_y);
+            }
+        });
+
         Ok(PlayerUi {
-            window: MainWindow::new()?,
+            window,
             fullscreen: Cell::new(false),
             toasts: Rc::new(RefCell::new(ToastStore::default())),
             toast_timer: Rc::new(Timer::default()),
+            long_press_pending,
+            long_press_timer,
+            drag_scroll_timer,
         })
     }
 
@@ -474,10 +541,13 @@ impl PlayerUi {
     /// Only thumbnails that exist on disk are decoded; a missing file simply
     /// leaves the placeholder in the row.
     pub fn show_queue(&self, entries: &[QueueListEntry]) {
+        let already_open = self.window.get_queue_open();
         let items: Vec<QueueItem> = entries
             .iter()
-            .map(|entry| QueueItem {
+            .enumerate()
+            .map(|(index, entry)| QueueItem {
                 id: entry.id,
+                index: index as i32,
                 position: entry.position,
                 title: entry.title.as_str().into(),
                 uploader: entry.uploader.as_str().into(),
@@ -491,9 +561,20 @@ impl PlayerUi {
             })
             .collect();
         self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        let current_id = entries.iter().find(|entry| entry.current).map_or(-1, |entry| entry.id);
         let current_index =
             entries.iter().position(|entry| entry.current).map_or(-1, |index| index as i32);
+        self.window.set_queue_current_id(current_id);
         self.window.set_queue_current_index(current_index);
+        // Scroll the current entry into view the first time the queue opens,
+        // but keep the scroll position on the refreshes that follow a drag.
+        if !already_open {
+            self.window.set_queue_long_press_index(-1);
+            self.window.set_queue_drag_pointer_y(0.0);
+            if current_index >= 0 {
+                self.window.set_queue_content_y(-(current_index as f32 * 80.0));
+            }
+        }
         self.window.set_queue_open(true);
     }
 
@@ -661,6 +742,59 @@ impl PlayerUi {
     /// removed even if positions ever collide.
     pub fn on_queue_remove_entry(&self, handler: impl Fn(i32) + 'static) {
         self.window.on_queue_remove_entry(handler);
+    }
+
+    /// Called when a queue row is pressed.
+    ///
+    /// PlayerUi uses this to arm a 1.5s long-press timer; the window sets
+    /// `queue-long-press-index` when it fires so the queue dialog can drag.
+    pub fn on_queue_row_pressed(&self, handler: impl Fn(i32) + 'static) {
+        let pending = self.long_press_pending.clone();
+        let timer = Rc::clone(&self.long_press_timer);
+        let window_weak = self.window.as_weak();
+        self.window.on_queue_row_pressed(move |index| {
+            pending.set(Some(index));
+            if let Some(window) = window_weak.upgrade() {
+                window.set_queue_long_press_index(-1);
+            }
+            let pending = pending.clone();
+            let window_weak = window_weak.clone();
+            timer.start(TimerMode::SingleShot, Duration::from_millis(1500), move || {
+                let Some(index) = pending.get() else { return };
+                let Some(window) = window_weak.upgrade() else { return };
+                window.set_queue_long_press_index(index);
+            });
+            handler(index);
+        });
+    }
+
+    /// Called when a queue row is released.
+    ///
+    /// Disarms the long-press timer for the released row.
+    pub fn on_queue_row_released(&self, handler: impl Fn(i32) + 'static) {
+        let pending = self.long_press_pending.clone();
+        let timer = Rc::clone(&self.long_press_timer);
+        let window_weak = self.window.as_weak();
+        self.window.on_queue_row_released(move |index| {
+            if pending.get() == Some(index) {
+                timer.stop();
+                pending.set(None);
+            }
+            // The `.slint` code has already read `queue-long-press-index` to
+            // decide between a drop and a play, so the drag is over by now.
+            if let Some(window) = window_weak.upgrade() {
+                window.set_queue_long_press_index(-1);
+                window.set_queue_drag_pointer_y(0.0);
+            }
+            handler(index);
+        });
+    }
+
+    /// Called when the user reorders the active queue by dragging items.
+    ///
+    /// The arguments are the source index and the target index of the move.
+    pub fn on_queue_move_requested(&self, handler: impl Fn(i32, i32) + 'static) {
+        self.window.on_queue_move_requested(handler);
     }
 
     /// Called when the user picks a history entry.

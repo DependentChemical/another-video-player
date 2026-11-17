@@ -88,6 +88,11 @@ export component MainWindow inherits Window {
     in-out property <bool> queue-open: false;
     in property <[QueueItem]> queue-items: [];
     in property <int> queue-current-index: -1;
+    in property <int> queue-current-id: -1;
+    in property <int> queue-long-press-index: -1;
+    in-out property <length> queue-content-y: 0px;
+    in-out property <length> queue-drag-pointer-y: 0px;
+    in-out property <length> queue-scroll-view-height: 0px;
     in-out property <bool> history-open: false;
     in property <[HistoryItem]> history-items: [];
 
@@ -113,6 +118,9 @@ export component MainWindow inherits Window {
     callback queue-item-selected(int);
     callback queue-copy-url(string);
     callback queue-remove-entry(int);
+    callback queue-move-requested(int, int);
+    callback queue-row-pressed(int);
+    callback queue-row-released(int);
     callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
@@ -311,10 +319,18 @@ export component MainWindow inherits Window {
         height: parent.height;
         items: root.queue-items;
         current-index: root.queue-current-index;
+        current-id: root.queue-current-id;
+        long-press-index: root.queue-long-press-index;
+        queue-content-y <=> root.queue-content-y;
+        drag-pointer-y <=> root.queue-drag-pointer-y;
+        scroll-view-resized(h) => { root.queue-scroll-view-height = h * 1px; }
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
         copy-url(url) => { root.queue-copy-url(url); }
         remove-entry(id) => { root.queue-remove-entry(id); }
+        move-requested(src, tgt) => { root.queue-move-requested(src, tgt); }
+        queue-row-pressed(index) => { root.queue-row-pressed(index); }
+        queue-row-released(index) => { root.queue-row-released(index); }
         dismissed => { root.queue-open = false; }
     }
 
