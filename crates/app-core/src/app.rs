@@ -1403,14 +1403,14 @@ impl App {
         *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
 
-    /// Starts periodic background checks for application and `yt-dlp` updates.
+    /// Starts background checks for application and `yt-dlp` updates at startup and then periodically.
     pub fn start_update_checks(self: &Arc<Self>, paths: AppPaths) {
         let app = Arc::clone(self);
         self.runtime.handle().spawn(async move {
             loop {
-                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
                 app.clone().poll_app_update_background();
                 app.clone().poll_tool_update_background(paths.clone());
+                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
             }
         });
     }
