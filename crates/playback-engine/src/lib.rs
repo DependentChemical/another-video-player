@@ -30,6 +30,13 @@ pub const MAX_VOLUME: f64 = 100.0;
 /// to its end instead of stopping at the usual readahead window.
 const CACHE_SECONDS: &str = "1000000000";
 
+/// How many seconds of content to buffer before starting playback.
+///
+/// This controls `demuxer-readahead-secs` and, together with
+/// `cache-pause-initial`, makes mpv wait until at least this much content
+/// is downloaded before beginning playback.
+const INITIAL_BUFFER_SECONDS: &str = "10";
+
 /// How much packet metadata the demuxer may keep.
 ///
 /// With `cache-on-disk` this counts metadata, not the cached payload, so a
@@ -193,6 +200,13 @@ impl Engine {
             .set_property("cache-secs", CACHE_SECONDS)?
             .set_property("demuxer-max-bytes", DEMUXER_MAX_BYTES)?
             .set_property("demuxer-max-back-bytes", DEMUXER_MAX_BYTES)?
+            // Wait for at least INITIAL_BUFFER_SECONDS of content before starting
+            // playback. `cache-pause-initial` (default yes) pauses initially until
+            // the readahead buffer is filled; `demuxer-readahead-secs` sets the
+            // target fill level in seconds.
+            .set_property("cache-pause-initial", "yes")?
+            .set_property("demuxer-readahead-secs", INITIAL_BUFFER_SECONDS)?
+            .set_property("cache-pause-wait", INITIAL_BUFFER_SECONDS)?
             .build()?;
 
         // mpv does not deliver file lifecycle events until they are requested.
