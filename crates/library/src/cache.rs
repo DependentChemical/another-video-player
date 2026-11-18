@@ -455,27 +455,26 @@ impl ThumbnailCache {
                 }
 
                 let mut protected = HashSet::new();
-                let _ = connection.prepare(
-                    "SELECT DISTINCT thumbnail FROM active_queue
+                let _ = connection
+                    .prepare(
+                        "SELECT DISTINCT thumbnail FROM active_queue
                      WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
-                ).and_then(|mut statement| {
-                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                    for id in rows.flatten() {
-                        if id.starts_with(THUMBNAIL_ID_PREFIX) {
-                            protected.insert(id);
+                    )
+                    .and_then(|mut statement| {
+                        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                        for id in rows.flatten() {
+                            if id.starts_with(THUMBNAIL_ID_PREFIX) {
+                                protected.insert(id);
+                            }
                         }
-                    }
-                    Ok(())
-                }).or_else(|error| {
-                    // If the active_queue table does not exist (e.g. in isolated tests),
-                    // treat as no protected ids.
-                    let msg = error.to_string();
-                    if msg.contains("no such table") {
                         Ok(())
-                    } else {
-                        Err(error)
-                    }
-                });
+                    })
+                    .or_else(|error| {
+                        // If the active_queue table does not exist (e.g. in isolated tests),
+                        // treat as no protected ids.
+                        let msg = error.to_string();
+                        if msg.contains("no such table") { Ok(()) } else { Err(error) }
+                    });
                 Ok((names, protected))
             })
             .map_err(Error::from)?;
