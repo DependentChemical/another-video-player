@@ -25,8 +25,7 @@ const INTER_FONT_URL: &str =
 const INTER_FONT_FAMILY: &str = "Inter";
 
 /// Where the Noto Sans CJK SC variable font is published.
-const NOTO_CJK_SC_FONT_URL: &str =
-    "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/Variable/TTF/NotoSansCJKsc-VF.ttf";
+const NOTO_CJK_SC_FONT_URL: &str = "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/Variable/TTF/NotoSansCJKsc-VF.ttf";
 
 /// The family name for the Noto Sans CJK SC font.
 const NOTO_CJK_SC_FONT_FAMILY: &str = "Noto Sans CJK SC";
@@ -322,8 +321,9 @@ fn check_inter_font(path: &Path) {
 fn check_noto_cjk_sc_font(path: &Path) {
     let data = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the Noto Sans CJK SC font could not be read: {error}"));
-    let face = ttf_parser::Face::parse(&data, 0)
-        .unwrap_or_else(|error| panic!("the Noto Sans CJK SC font could not be understood: {error}"));
+    let face = ttf_parser::Face::parse(&data, 0).unwrap_or_else(|error| {
+        panic!("the Noto Sans CJK SC font could not be understood: {error}")
+    });
 
     let family = extract_family(&face);
     if family != NOTO_CJK_SC_FONT_FAMILY {
@@ -343,8 +343,9 @@ fn check_noto_cjk_sc_font(path: &Path) {
 fn check_noto_symbols2_font(path: &Path) {
     let data = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the Noto Sans Symbols 2 font could not be read: {error}"));
-    let face = ttf_parser::Face::parse(&data, 0)
-        .unwrap_or_else(|error| panic!("the Noto Sans Symbols 2 font could not be understood: {error}"));
+    let face = ttf_parser::Face::parse(&data, 0).unwrap_or_else(|error| {
+        panic!("the Noto Sans Symbols 2 font could not be understood: {error}")
+    });
 
     let family = extract_family(&face);
     if family != NOTO_SYMBOLS2_FONT_FAMILY {
@@ -356,8 +357,9 @@ fn check_noto_symbols2_font(path: &Path) {
 fn check_noto_emoji_font(path: &Path) {
     let data = std::fs::read(path)
         .unwrap_or_else(|error| panic!("the Noto Color Emoji font could not be read: {error}"));
-    let face = ttf_parser::Face::parse(&data, 0)
-        .unwrap_or_else(|error| panic!("the Noto Color Emoji font could not be understood: {error}"));
+    let face = ttf_parser::Face::parse(&data, 0).unwrap_or_else(|error| {
+        panic!("the Noto Color Emoji font could not be understood: {error}")
+    });
 
     let family = extract_family(&face);
     if family != NOTO_EMOJI_FONT_FAMILY {
