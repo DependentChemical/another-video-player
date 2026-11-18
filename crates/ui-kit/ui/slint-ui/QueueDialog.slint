@@ -31,14 +31,14 @@ export component QueueDialog inherits Rectangle {
     callback dismissed();
 
     private property <length> row-spacing: 4px;
-    private property <length> row-padding: 8px;
+    private property <length> row-step: root.row-height + root.row-spacing;
     private property <length> button-size: 32px;
     private property <length> menu-anchor-x: 0px;
     private property <length> menu-anchor-y: 0px;
 
     // The fixed height of a queue row. It accommodates up to two wrapped
     // title lines and one uploader line, with overflow truncated.
-    private property <length> row-height: 80px;
+    private property <length> row-height: 76px;
 
     // The row the pointer would drop onto, in the list's content space. The
     // pointer is stored in window coordinates, so subtract the content
@@ -49,7 +49,7 @@ export component QueueDialog inherits Rectangle {
         ? -1
         : clamp(floor((root.drag-pointer-y
                 - (scroll-view.absolute-position.y + root.queue-content-y))
-                / root.row-height),
+                / root.row-step),
             0, root.items.length - 1);
 
     changed drag-scroll-tick => {
@@ -147,7 +147,6 @@ export component QueueDialog inherits Rectangle {
                         // appears.
                         VerticalLayout {
                             spacing: 0;
-                            padding: root.row-padding;
 
                             // A row dragged upwards lands before its target, so
                             // the bar is drawn above the content.
@@ -159,12 +158,13 @@ export component QueueDialog inherits Rectangle {
 
                             VerticalLayout {
                                 vertical-stretch: 1;
+                                alignment: center;
 
                                 HorizontalLayout {
                                     padding-left: 8px;
                                     padding-right: 12px;
                                     spacing: 12px;
-                                    cross-axis-alignment: start;
+                                    cross-axis-alignment: center;
 
                                     // The whole row except the buttons opens the
                                     // entry. A short press plays it; a long press
@@ -177,7 +177,7 @@ export component QueueDialog inherits Rectangle {
 
                                         HorizontalLayout {
                                             spacing: 12px;
-                                            cross-axis-alignment: start;
+                                            cross-axis-alignment: center;
 
                                             // A fixed slot keeps the thumbnails of all
                                             // rows aligned while only the current row
@@ -213,6 +213,7 @@ export component QueueDialog inherits Rectangle {
                                                 horizontal-stretch: 1;
                                                 min-width: 0px;
                                                 spacing: 2px;
+                                                alignment: center;
 
                                                 Text {
                                                     text: item.title;

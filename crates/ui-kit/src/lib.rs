@@ -29,6 +29,13 @@ const TOAST_LIMIT: usize = 5;
 /// How often expired toasts are swept away.
 const TOAST_SWEEP: Duration = Duration::from_millis(500);
 
+/// The vertical distance between the tops of two queue rows.
+///
+/// It mirrors `row-step` in `QueueDialog.slint` (a 76px row plus the 4px
+/// spacing between rows) and is used to scroll the current entry to the top
+/// when the queue opens.
+const QUEUE_ROW_STEP: f32 = 80.0;
+
 /// Every script fontique knows, so a fallback can be reached from any run.
 ///
 /// Parley labels a run of characters whose script is Common with the run's
@@ -599,7 +606,7 @@ impl PlayerUi {
             self.window.set_queue_long_press_index(-1);
             self.window.set_queue_drag_pointer_y(0.0);
             if current_index >= 0 {
-                self.window.set_queue_content_y(-(current_index as f32 * 80.0));
+                self.window.set_queue_content_y(-(current_index as f32 * QUEUE_ROW_STEP));
             }
         }
         self.window.set_queue_open(true);
