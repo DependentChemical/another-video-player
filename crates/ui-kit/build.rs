@@ -1,12 +1,12 @@
 //! Downloads the Material Icons, Inter, Noto Sans CJK SC, Noto Sans Symbols 2,
-/// and Noto Color Emoji fonts and compiles the user interface.
-///
-/// The icons are drawn with the font that Google publishes for Material
-/// Design, and the UI typography uses Inter, a variable font.
-/// CJK text uses Noto Sans CJK SC (variable), mathematical symbols use
-/// Noto Sans Symbols 2 (static), and emoji use Noto Color Emoji.
-/// The fonts are fetched, checked and then imported by the interface,
-/// which embeds them into the binary.
+//! and Noto Color Emoji fonts and compiles the user interface.
+//!
+//! The icons are drawn with the font that Google publishes for Material
+//! Design, and the UI typography uses Inter, a variable font.
+//! CJK text uses Noto Sans CJK SC (variable), mathematical symbols use
+//! Noto Sans Symbols 2 (static), and emoji use Noto Color Emoji.
+//! The fonts are fetched, checked and then imported by the interface,
+//! which embeds them into the binary.
 
 use std::path::{Path, PathBuf};
 
