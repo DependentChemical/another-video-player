@@ -38,17 +38,16 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
     paths.ensure().map_err(|error| Error::Tools(error.to_string()))?;
 
     let tools = paths.tool_paths();
-    let ytdlp = match ytdlp_tool::locate::discover(&tools) {
-        Some(ytdlp) => ytdlp,
-        None => install_ytdlp(&tools)?,
-    };
+    let managed = ytdlp_tool::locate::managed(&tools);
+    let ytdlp = managed.clone().unwrap_or_else(|| ytdlp_tool::locate::at(tools.managed_binary()));
 
     let app = Arc::new(App::new(&ytdlp, &paths)?);
+    app.start_update_checks(paths.clone());
     let shell = Shell::new(Arc::clone(&app), paths.program().to_path_buf())?;
 
-    // Look for a newer yt-dlp while the player is already running.
-    app.check_tool_update(&ytdlp, &paths);
-    app.check_app_update();
+    if managed.is_none() {
+        app.prompt_missing_tool_install();
+    }
 
     match url {
         Some(url) => shell.load(url),
@@ -57,14 +56,6 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
 
     shell.run();
     Ok(())
-}
-
-/// Downloads `yt-dlp` when it is not installed yet.
-fn install_ytdlp(tools: &ytdlp_tool::ToolPaths) -> Result<ytdlp_tool::YtDlp, Error> {
-    diag::note("yt-dlp is not installed, downloading it");
-    let path = ytdlp_tool::update::install_latest(tools)
-        .map_err(|error| Error::Tools(format!("yt-dlp could not be installed: {error}")))?;
-    Ok(ytdlp_tool::locate::at(path))
 }
 
 /// Everything that can go wrong while starting the player.

@@ -148,11 +148,11 @@ impl Loading {
     /// The message is ignored while the dots are running, so it can never
     /// make the indicator disappear; the caller can log it instead.
     /// Returns whether the message was shown.
-    pub fn tool_updated(&mut self, path: &str) -> bool {
+    pub fn tool_updated(&mut self, text: &str) -> bool {
         if self.is_busy() {
             return false;
         }
-        self.status = Status::Info(format!("yt-dlp was updated ({path})"));
+        self.status = Status::Info(text.to_string());
         true
     }
 
@@ -384,16 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_updates_wait_for_a_free_moment() {
+    fn tool_update_notes_wait_for_a_free_moment() {
         let mut loading = Loading::new();
         loading.resolve_started();
 
-        assert!(!loading.tool_updated("/tmp/yt-dlp"));
+        assert!(!loading.tool_updated("yt-dlp updated"));
         assert_eq!(loading.status(), &Status::Busy(RESOLVING));
 
         loading.resolve_failed("nope".to_string());
-        assert!(loading.tool_updated("/tmp/yt-dlp"));
-        assert_eq!(loading.status(), &Status::Info("yt-dlp was updated (/tmp/yt-dlp)".to_string()));
+        assert!(loading.tool_updated("yt-dlp updated"));
+        assert_eq!(loading.status(), &Status::Info("yt-dlp updated".to_string()));
     }
 
     #[test]

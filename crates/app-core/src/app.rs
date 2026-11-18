@@ -22,6 +22,9 @@ use crate::paths::AppPaths;
 use crate::session::Session;
 use crate::timeline::{LiveAxis, Timeline};
 
+/// How often Flatline checks GitHub for application and tool updates.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Something the background work wants to tell the user interface.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -29,18 +32,26 @@ pub enum Message {
     Resolved(Result<ResolvedMedia, (String, String)>),
     /// A URL was resolved while something else plays, so the user decides.
     Pending(Result<PendingMedia, String>),
-    /// A newer `yt-dlp` was downloaded and is now in use.
-    ToolUpdated(String),
     /// A service asks the user to sign in.
     SigningIn(Service),
     /// The cookie file for a service is being regenerated.
     RegeneratingCookies(Service),
     /// A newer application release is available.
-    UpdateAvailable(updater::Update),
-    /// The accepted update is downloading; carries the fraction, from zero to one.
-    UpdateDownloadProgress(f64),
-    /// An accepted application update could not be prepared for installation.
-    UpdateFailed(String),
+    AppUpdateAvailable(updater::Update),
+    /// The accepted application update is downloading.
+    AppUpdateProgress(f64),
+    /// An accepted application update could not be prepared.
+    AppUpdateFailed(String),
+    /// A newer `yt-dlp` release is available.
+    ToolUpdateAvailable(ytdlp_tool::ToolUpdate),
+    /// The accepted `yt-dlp` update is downloading.
+    ToolUpdateProgress(f64),
+    /// The accepted `yt-dlp` update is being applied.
+    ToolUpdateStatus(String),
+    /// The `yt-dlp` update has been applied.
+    ToolUpdateApplied(String),
+    /// The `yt-dlp` update could not be downloaded or applied.
+    ToolUpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
     /// A legacy thumbnail migration started; carries how many entries await processing.
@@ -308,10 +319,16 @@ pub struct App {
     queue: Queue,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
+    /// The directories Flatline uses at runtime.
+    paths: AppPaths,
     /// The directory the player buffers downloaded media in.
     stream_buffer: PathBuf,
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
+    /// The last application release version shown to the user.
+    notified_app_update: Mutex<Option<String>>,
+    /// The last yt-dlp release version shown to the user.
+    notified_tool_update: Mutex<Option<String>>,
 }
 
 impl App {
@@ -350,8 +367,11 @@ impl App {
             live: Mutex::new(LiveAxis::new()),
             queue,
             cache,
+            paths: paths.clone(),
             stream_buffer,
             pending: Mutex::new(None),
+            notified_app_update: Mutex::new(None),
+            notified_tool_update: Mutex::new(None),
         };
         // Drop orphaned thumbnail files left by older runs, and migrate any
         // thumbnails that still point at a direct file path, in the
@@ -1383,43 +1403,95 @@ impl App {
         *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
 
-    /// Looks for a newer `yt-dlp` in the background.
-    pub fn check_tool_update(&self, ytdlp: &YtDlp, paths: &AppPaths) {
-        let ytdlp = ytdlp.clone();
-        let paths = paths.clone();
-        let outbox = Arc::clone(&self.outbox);
-        let runtime = self.runtime.handle().clone();
+    /// Starts periodic background checks for application and `yt-dlp` updates.
+    pub fn start_update_checks(self: &Arc<Self>, paths: AppPaths) {
+        let app = Arc::clone(self);
+        self.runtime.handle().spawn(async move {
+            loop {
+                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+                app.clone().poll_app_update_background();
+                app.clone().poll_tool_update_background(paths.clone());
+            }
+        });
+    }
 
-        runtime.spawn_blocking(move || {
-            match ytdlp_tool::update::check_and_update(&ytdlp, &paths.tool_paths()) {
-                Ok(outcome) if outcome.updated => {
-                    let _ = outbox.lock().map(|sender| {
-                        sender.send(Box::new(Message::ToolUpdated(
-                            outcome.path.to_string_lossy().into_owned(),
-                        )))
-                    });
+    fn poll_app_update_background(self: Arc<Self>) {
+        let outbox = Arc::clone(&self.outbox);
+        let app = Arc::clone(&self);
+        let handle = self.runtime.handle().clone();
+        handle.spawn_blocking(move || match updater::check(crate::VERSION) {
+            Ok(Some(update)) => {
+                let should_notify = {
+                    let mut guard = app.notified_app_update.lock().expect("poisoned");
+                    if guard.as_deref() == Some(update.version.as_str()) {
+                        false
+                    } else {
+                        *guard = Some(update.version.clone());
+                        true
+                    }
+                };
+                if should_notify {
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::AppUpdateAvailable(update))));
                 }
-                Ok(outcome) => {
-                    crate::diag::note(&format!("yt-dlp {} is up to date", outcome.current));
+            }
+            Ok(None) => crate::diag::note("Flatline is up to date"),
+            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
+        });
+    }
+
+    fn poll_tool_update_background(self: Arc<Self>, paths: AppPaths) {
+        let outbox = Arc::clone(&self.outbox);
+        let app = Arc::clone(&self);
+        let handle = self.runtime.handle().clone();
+        handle.spawn_blocking(move || {
+            let tools = paths.tool_paths();
+            let current = ytdlp_tool::locate::managed(&tools)
+                .and_then(|tool| tool.version().ok())
+                .unwrap_or_default();
+            if current.is_empty() {
+                return;
+            }
+            match ytdlp_tool::update::check(&current) {
+                Ok(Some(update)) => {
+                    let should_notify = {
+                        let mut guard = app.notified_tool_update.lock().expect("poisoned");
+                        if guard.as_deref() == Some(update.latest.as_str()) {
+                            false
+                        } else {
+                            *guard = Some(update.latest.clone());
+                            true
+                        }
+                    };
+                    if should_notify {
+                        let _ = outbox.lock().map(|sender| {
+                            sender.send(Box::new(Message::ToolUpdateAvailable(update)))
+                        });
+                    }
                 }
+                Ok(None) => crate::diag::note(&format!("yt-dlp {current} is up to date")),
                 Err(error) => {
-                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"));
+                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"))
                 }
             }
         });
     }
 
-    /// Checks GitHub for a newer Flatline release in the background.
-    pub fn check_app_update(&self) {
+    /// Prompts the user to download `yt-dlp` when it is missing.
+    pub fn prompt_missing_tool_install(&self) {
         let outbox = Arc::clone(&self.outbox);
-        self.runtime.handle().spawn_blocking(move || match updater::check(crate::VERSION) {
-            Ok(Some(update)) => {
-                let _ = outbox
-                    .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateAvailable(update))));
+        self.runtime.handle().spawn_blocking(move || {
+            match ytdlp_tool::update::latest_available() {
+                Ok(update) => {
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateAvailable(update))));
+                }
+                Err(error) => {
+                    crate::diag::note(&format!("the yt-dlp release could not be fetched: {error}"));
+                }
             }
-            Ok(None) => crate::diag::note("Flatline is up to date"),
-            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
         });
     }
 
@@ -1436,15 +1508,87 @@ impl App {
             let result = updater::install(&update, &directory, &executable, move |progress| {
                 let _ = progress_outbox
                     .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateDownloadProgress(progress))));
+                    .map(|sender| sender.send(Box::new(Message::AppUpdateProgress(progress))));
             });
             if let Err(error) = result {
                 let message = error.to_string();
                 crate::diag::note(&format!("the Flatline update failed: {message}"));
                 let _ = outbox
                     .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateFailed(message))));
+                    .map(|sender| sender.send(Box::new(Message::AppUpdateFailed(message))));
             }
+        });
+    }
+
+    /// Downloads and applies an accepted `yt-dlp` update in the background.
+    pub fn install_tool_update(&self, update: ytdlp_tool::ToolUpdate) {
+        let outbox = Arc::clone(&self.outbox);
+        let gate = Arc::clone(&self.ytdlp_gate);
+        let resolver = Arc::clone(&self.resolver);
+        let cookies = self.session.cookies_dir().to_path_buf();
+        let paths = self.paths.clone();
+        self.runtime.handle().spawn_blocking(move || {
+            let tools = paths.tool_paths();
+            let staged = tools.staged_binary();
+            let managed = tools.managed_binary();
+
+            let progress_outbox = Arc::clone(&outbox);
+            let status_outbox = Arc::clone(&outbox);
+            let download = ytdlp_tool::update::download_with_progress(
+                &update.download_url,
+                &staged,
+                move |progress| {
+                    let _ = progress_outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateProgress(progress))));
+                },
+            );
+            if let Err(error) = download {
+                let _ = std::fs::remove_file(&staged);
+                let message = error.to_string();
+                crate::diag::note(&format!("the yt-dlp update failed: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
+                return;
+            }
+
+            let _ = status_outbox.lock().map(|sender| {
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
+            });
+
+            let _guard = match gate.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&staged);
+                    let _ = outbox.lock().map(|sender| {
+                        sender.send(Box::new(Message::ToolUpdateFailed(
+                            "the yt-dlp update could not be applied".to_string(),
+                        )))
+                    });
+                    return;
+                }
+            };
+
+            if let Err(error) = ytdlp_tool::update::replace(&staged, &managed) {
+                let _ = std::fs::remove_file(&staged);
+                let message = error.to_string();
+                crate::diag::note(&format!("the yt-dlp update could not be applied: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
+                return;
+            }
+
+            let tool = ytdlp_tool::locate::at(&managed);
+            if let Ok(mut resolver) = resolver.lock() {
+                *resolver = Resolver::new(command_spec(&tool, &cookies));
+            }
+            drop(_guard);
+
+            let _ = outbox
+                .lock()
+                .map(|sender| sender.send(Box::new(Message::ToolUpdateApplied(update.latest))));
         });
     }
 

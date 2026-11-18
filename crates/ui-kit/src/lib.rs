@@ -631,11 +631,24 @@ impl PlayerUi {
         self.window.set_history_open(true);
     }
 
-    /// Shows the release notes and available version.
-    pub fn show_update(&self, version: &str, notes: &str) {
+    /// Shows the release notes and available application version.
+    pub fn show_app_update(&self, version: &str, notes: &str) {
+        self.show_update("Flatline update available", version, notes, "Yes, download and install");
+    }
+
+    /// Shows the release notes and available yt-dlp version.
+    pub fn show_tool_update(&self, version: &str, notes: &str) {
+        self.show_update("yt-dlp update available", version, notes, "Yes, download update");
+    }
+
+    /// Shows an update dialog with a custom title and action label.
+    pub fn show_update(&self, title: &str, version: &str, notes: &str, action_label: &str) {
+        self.window.set_update_title(title.into());
         self.window.set_update_version(version.into());
         self.window.set_update_notes(notes.into());
+        self.window.set_update_action_label(action_label.into());
         self.window.set_update_installing(false);
+        self.window.set_update_status_text("Downloading update…".into());
         self.window.set_update_error("".into());
         self.window.set_update_download_progress(0.0);
         self.window.set_update_open(true);
@@ -652,9 +665,22 @@ impl PlayerUi {
         self.window.set_update_installing(installing);
     }
 
+    /// Sets the status text shown while an update is being applied.
+    pub fn set_update_status_text(&self, text: &str) {
+        self.window.set_update_status_text(text.into());
+    }
+
     /// Sets the download progress of the update package, from zero to one.
     pub fn set_update_download_progress(&self, progress: f64) {
         self.window.set_update_download_progress(progress as f32);
+    }
+
+    /// Closes the update dialog.
+    pub fn close_update(&self) {
+        self.window.set_update_open(false);
+        self.window.set_update_installing(false);
+        self.window.set_update_error("".into());
+        self.window.set_update_download_progress(0.0);
     }
 
     // ------------------------------------------------------------ events --
