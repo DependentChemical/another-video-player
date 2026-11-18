@@ -5,7 +5,8 @@
 //! scoped to one service and the small amount of knowledge needed to tell
 //! whether a browser profile is signed in.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use media_model::Service;
@@ -178,6 +179,66 @@ pub fn write_file(path: &Path, cookies: &[Cookie]) -> io::Result<()> {
     std::fs::rename(&temporary, path)
 }
 
+/// Reads cookies from a Netscape cookie file.
+///
+/// Malformed lines are ignored so a partially written or foreign file does
+/// not break the check that depends on it.
+pub fn read_file(path: &Path) -> io::Result<Vec<Cookie>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(read_reader(BufReader::new(file)))
+}
+
+/// Parses cookies from Netscape cookie file content.
+pub fn parse_netscape(text: &str) -> Vec<Cookie> {
+    read_reader(text.as_bytes())
+}
+
+/// Whether the cookie file holds a signed-in session for the service.
+pub fn signed_in_file(service: Service, path: &Path) -> bool {
+    read_file(path).is_ok_and(|cookies| signed_in(service, &cookies))
+}
+
+fn read_reader(reader: impl BufRead) -> Vec<Cookie> {
+    let mut cookies = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let http_only = trimmed.starts_with("#HttpOnly_");
+        if trimmed.starts_with('#') && !http_only {
+            continue;
+        }
+        let line = if http_only { &trimmed["#HttpOnly_".len()..] } else { trimmed };
+        let mut fields = line.splitn(7, '\t');
+        let Some(domain) = fields.next() else { continue };
+        let Some(_include_subdomains) = fields.next() else { continue };
+        let Some(path) = fields.next() else { continue };
+        let Some(secure) = fields.next() else { continue };
+        let Some(expires) = fields.next() else { continue };
+        let Some(name) = fields.next() else { continue };
+        let Some(value) = fields.next() else { continue };
+        if domain.is_empty() || name.is_empty() {
+            continue;
+        }
+        let expires = expires.parse::<i64>().ok().filter(|value| *value > 0);
+        cookies.push(Cookie {
+            domain: domain.to_string(),
+            path: if path.is_empty() { "/".to_string() } else { path.to_string() },
+            secure: secure.eq_ignore_ascii_case("TRUE"),
+            http_only,
+            expires,
+            name: name.to_string(),
+            value: value.to_string(),
+        });
+    }
+    cookies
+}
+
 /// One tab separated line in the Netscape format.
 fn netscape_line(cookie: &Cookie) -> String {
     let domain = clean_field(&cookie.domain);
@@ -230,7 +291,8 @@ fn restrict_permissions(_path: &Path) -> io::Result<()> {
 mod tests {
     use super::{
         Cookie, HEADER, cookie_file, cookie_file_name, domain_belongs_to, for_service,
-        netscape_domain, netscape_text, signed_in, write_file,
+        netscape_domain, netscape_text, parse_netscape, read_file, signed_in, signed_in_file,
+        write_file,
     };
     use media_model::Service;
 
@@ -401,5 +463,54 @@ mod tests {
             .expect("the cookie file can be written");
         assert!(path.is_file());
         let _ = std::fs::remove_dir_all(directory.parent().and_then(|p| p.parent()).unwrap());
+    }
+
+    #[test]
+    fn a_netscape_cookie_file_can_be_read_back() {
+        let directory =
+            std::env::temp_dir().join(format!("flatline-cookie-read-{}", std::process::id()));
+        let path = cookie_file(&directory, Service::YouTube);
+        write_file(&path, &[cookie(".youtube.com", "SAPISID", "one")])
+            .expect("the cookie file can be written");
+        let cookies = read_file(&path).expect("the cookie file can be read");
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "SAPISID");
+        assert_eq!(cookies[0].value, "one");
+        assert!(cookies[0].domain.starts_with('.'));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn signed_in_file_checks_authentication_cookies() {
+        let directory =
+            std::env::temp_dir().join(format!("flatline-cookie-signed-{}", std::process::id()));
+        let path = cookie_file(&directory, Service::Twitch);
+        write_file(&path, &[cookie(".twitch.tv", "theme", "dark")])
+            .expect("the cookie file can be written");
+        assert!(!signed_in_file(Service::Twitch, &path));
+        write_file(&path, &[cookie(".twitch.tv", "auth-token", "token")])
+            .expect("the cookie file can be replaced");
+        assert!(signed_in_file(Service::Twitch, &path));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_missing_cookie_file_is_not_signed_in() {
+        let directory =
+            std::env::temp_dir().join(format!("flatline-cookie-missing-{}", std::process::id()));
+        let path = cookie_file(&directory, Service::YouTube);
+        assert!(!signed_in_file(Service::YouTube, &path));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn parse_netscape_ignores_comments_and_broken_lines() {
+        let text = format!(
+            "{HEADER}\n# comment\n#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\tabc\nbroken\n"
+        );
+        let cookies = parse_netscape(&text);
+        assert_eq!(cookies.len(), 1);
+        assert!(cookies[0].http_only);
+        assert_eq!(cookies[0].name, "SAPISID");
     }
 }

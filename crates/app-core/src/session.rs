@@ -50,6 +50,15 @@ impl Session {
         web_session::cookie_file(&self.cookies, service)
     }
 
+    /// Whether the stored cookie file currently looks like a signed-in session.
+    ///
+    /// This is a local check over the Netscape cookie file. The interactive
+    /// sign-in helper performs the authoritative background check against the
+    /// service's sign-in page before it decides that a session is still valid.
+    pub fn has_signed_in_cookies(&self, service: Service) -> bool {
+        web_session::cookie::signed_in_file(service, &self.cookie_file(service))
+    }
+
     /// The directory the cookie files live in.
     pub fn cookies_dir(&self) -> &std::path::Path {
         &self.cookies

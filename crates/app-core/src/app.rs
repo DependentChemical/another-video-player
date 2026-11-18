@@ -1687,23 +1687,35 @@ fn format_bitrate(kilobits: u64) -> String {
 /// Describes how `yt-dlp` has to be invoked.
 ///
 /// Every service gets its own cookie file, and a file is only passed when it
-/// is really there: `yt-dlp` refuses to work with an empty cookie file.
+/// contains authentication cookies for that service.
 fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
     let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    spec.with_cookies(Service::YouTube, web_session::cookie_file(cookies, Service::YouTube))
-        .with_cookies(Service::Twitch, web_session::cookie_file(cookies, Service::Twitch))
+    let youtube = web_session::cookie_file(cookies, Service::YouTube);
+    let twitch = web_session::cookie_file(cookies, Service::Twitch);
+    let spec = if web_session::cookie::signed_in_file(Service::YouTube, &youtube) {
+        spec.with_cookies(Service::YouTube, youtube)
+    } else {
+        spec
+    };
+    if web_session::cookie::signed_in_file(Service::Twitch, &twitch) {
+        spec.with_cookies(Service::Twitch, twitch)
+    } else {
+        spec
+    }
 }
 
 /// Resolves a URL and asks the user to sign in when the service demands it.
 ///
 /// A sign-in challenge pauses this resolve: the helper runs before the retry
 /// loop is told about the failure, so the user can finish or close the
-/// window first. A successful sign-in is followed by one fresh resolve; if the
-/// user closes the window or the helper cannot run, the original challenge is
-/// returned so the normal retry flow can continue and a later challenge can
+/// window first. The helper performs a background page-level session check and
+/// only shows the sign-in window when the service no longer accepts the
+/// session. A successful sign-in is followed by one fresh resolve; if the
+/// service still reports the same challenge the error is returned instead of a
+/// new prompt. URLs that do not belong to either service are never offered to
 /// ask again. If the user declines to sign in, cookie regeneration is skipped
 /// and the resolve continues with the same retry flow without new cookies.
 fn resolve_with_session(
@@ -1720,7 +1732,10 @@ fn resolve_with_session(
         return Err(error);
     };
     match session.sign_in(service, url, notice) {
-        Ok(()) => resolver.resolve(url).map_err(|error| error.to_string()),
+        Ok(()) => {
+            // Retry once with the freshly exported, verified session cookies.
+            resolver.resolve(url).map_err(|error| error.to_string())
+        }
         Err(crate::session::Error::Declined) => {
             let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
             Err(error)
