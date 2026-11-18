@@ -19,6 +19,10 @@ pub struct Settings {
     document: Value,
 }
 
+/// The pre-buffer duration in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreBufferSeconds(pub u32);
+
 /// A configuration or selection error.
 #[derive(Debug)]
 pub enum Error {
@@ -59,6 +63,16 @@ impl Settings {
             return Err(Error::Invalid("missing Video-Settings object".into()));
         }
         Ok(Self { document })
+    }
+
+    /// Returns the pre-buffer duration in seconds, or 10 as default.
+    pub fn pre_buffer_seconds(&self) -> PreBufferSeconds {
+        let seconds = self
+            .document
+            .pointer("/Player-Settings/Pre-Buffer/default")
+            .and_then(Value::as_u64)
+            .unwrap_or(10) as u32;
+        PreBufferSeconds(seconds)
     }
 
     /// Chooses a playable stream using the matching site defaults or globals.
