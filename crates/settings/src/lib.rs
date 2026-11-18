@@ -80,9 +80,7 @@ impl Settings {
             })
             .or_else(|| {
                 // Fallback to default
-                self.document
-                    .pointer("/Player-Settings/Pre-Buffer/default")
-                    .and_then(Value::as_u64)
+                self.document.pointer("/Player-Settings/Pre-Buffer/default").and_then(Value::as_u64)
             })
             .unwrap_or(10) as u32;
         PreBufferSeconds(seconds)

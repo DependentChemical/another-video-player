@@ -343,8 +343,8 @@ impl App {
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let pre_buffer_seconds = settings.pre_buffer_seconds().0;
-        let engine =
-            Engine::new(&stream_buffer, pre_buffer_seconds).map_err(|error| Error::Engine(error.to_string()))?;
+        let engine = Engine::new(&stream_buffer, pre_buffer_seconds)
+            .map_err(|error| Error::Engine(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
