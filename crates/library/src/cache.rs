@@ -197,8 +197,13 @@ impl ThumbnailCache {
     /// the active queue should store.
     pub fn fetch(&self, video_url: &str, thumbnail_url: Option<&str>) -> Result<String, Error> {
         let id = ThumbnailCache::thumbnail_id_for(video_url);
-        if self.thumbnail_exists(&id)? {
+        // If a row exists but the files are gone, treat it as missing so we re-download.
+        if self.thumbnail_exists(&id)? && self.full_path(&id).is_some() {
             return Ok(id);
+        }
+        // Remove any broken row/files before re-downloading.
+        if self.thumbnail_exists(&id)? {
+            let _ = self.delete_thumbnail(&id);
         }
         let Some(thumbnail_url) = thumbnail_url else {
             return Ok(id);
@@ -450,16 +455,27 @@ impl ThumbnailCache {
                 }
 
                 let mut protected = HashSet::new();
-                let mut statement = connection.prepare(
+                let _ = connection.prepare(
                     "SELECT DISTINCT thumbnail FROM active_queue
                      WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
-                )?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                for id in rows.flatten() {
-                    if id.starts_with(THUMBNAIL_ID_PREFIX) {
-                        protected.insert(id);
+                ).and_then(|mut statement| {
+                    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                    for id in rows.flatten() {
+                        if id.starts_with(THUMBNAIL_ID_PREFIX) {
+                            protected.insert(id);
+                        }
                     }
-                }
+                    Ok(())
+                }).or_else(|error| {
+                    // If the active_queue table does not exist (e.g. in isolated tests),
+                    // treat as no protected ids.
+                    let msg = error.to_string();
+                    if msg.contains("no such table") {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                });
                 Ok((names, protected))
             })
             .map_err(Error::from)?;

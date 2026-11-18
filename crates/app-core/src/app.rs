@@ -294,7 +294,8 @@ impl RetryState {
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
-    resolver: Mutex<Resolver>,
+    resolver: Arc<Mutex<Resolver>>,
+    ytdlp_gate: Arc<Mutex<()>>,
     settings: Settings,
     session: Session,
     runtime: tokio::runtime::Runtime,
@@ -338,7 +339,8 @@ impl App {
 
         let app = App {
             engine,
-            resolver: Mutex::new(resolver),
+            resolver: Arc::new(Mutex::new(resolver)),
+            ytdlp_gate: Arc::new(Mutex::new(())),
             settings,
             session,
             runtime,
@@ -411,13 +413,16 @@ impl App {
         // Track the URL being resolved for retry purposes
         self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
 
-        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
+            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(&resolver, &session, &url, &sender)
                 .map_err(|error| error.to_string())
@@ -425,6 +430,7 @@ impl App {
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
                 });
+            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
@@ -432,13 +438,16 @@ impl App {
     /// Resolves a URL in the background, caches its thumbnail and waits for
     /// the user to decide.
     fn resolve_pending(&self, url: String) {
-        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
+            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(&resolver, &session, &url, &sender)
                 .map_err(|error| error.to_string())
@@ -454,6 +463,7 @@ impl App {
                         resolved_at: unix_time(),
                     }
                 });
+            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
     }
@@ -706,6 +716,9 @@ impl App {
         let cache = self.cache.clone();
         let queue = self.queue.clone();
         let outbox = Arc::clone(&self.outbox);
+        let resolver = Arc::clone(&self.resolver);
+        let session = self.session.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
@@ -714,20 +727,59 @@ impl App {
                 .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
 
             for (position, url, thumbnail_url) in due {
-                let id = match cache.fetch(&url, Some(&thumbnail_url)) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        crate::diag::note(&format!(
-                            "a queue thumbnail could not be refreshed: {error}"
-                        ));
+                // Try direct fetch first
+                match cache.fetch(&url, Some(&thumbnail_url)) {
+                    Ok(id) => {
+                        if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                            crate::diag::note(&format!(
+                                "the active queue entry could not be updated: {error}"
+                            ));
+                        }
                         std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                         continue;
                     }
-                };
-                if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                    crate::diag::note(&format!(
-                        "the active queue entry could not be updated: {error}"
-                    ));
+                    Err(error) => {
+                        crate::diag::note(&format!(
+                            "a queue thumbnail direct download failed for {url}: {error}; trying yt-dlp refresh"
+                        ));
+                    }
+                }
+                // Fallback: re-resolve via yt-dlp to get a fresh thumbnail_url, then fetch
+                let sender = outbox.lock().expect("outbox poisoned").clone();
+                let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+                let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
+                match resolve_with_session(&resolver, &session, &url, &sender) {
+                    Ok(source) => {
+                        drop(_guard);
+                        if let Some(new_thumb) = source.thumbnail.as_deref() {
+                            // Update stored thumbnail_url if changed
+                            let _ = queue.update_details(position, &source.title, None, Some(new_thumb), source.uploader.as_deref());
+                            match cache.fetch(&url, Some(new_thumb)) {
+                                Ok(id) => {
+                                    if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                                        crate::diag::note(&format!(
+                                            "the active queue entry could not be updated: {error}"
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    crate::diag::note(&format!(
+                                        "a queue thumbnail could not be refreshed after yt-dlp: {error}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            crate::diag::note(&format!(
+                                "yt-dlp did not provide a thumbnail for {url}"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        drop(_guard);
+                        crate::diag::note(&format!(
+                            "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
+                        ));
+                    }
                 }
                 std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
             }
