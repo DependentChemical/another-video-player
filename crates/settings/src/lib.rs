@@ -66,11 +66,24 @@ impl Settings {
     }
 
     /// Returns the pre-buffer duration in seconds, or 10 as default.
+    /// Reads from "value" field first, falls back to "default" if invalid.
     pub fn pre_buffer_seconds(&self) -> PreBufferSeconds {
         let seconds = self
             .document
-            .pointer("/Player-Settings/Pre-Buffer/default")
-            .and_then(Value::as_u64)
+            .pointer("/Player-Settings/Pre-Buffer/value")
+            .and_then(|v| {
+                // Try to read as u64 (handles positive integers)
+                v.as_u64().or_else(|| {
+                    // Try to read as i64 and check if positive
+                    v.as_i64().and_then(|i| (i >= 0).then_some(i as u64))
+                })
+            })
+            .or_else(|| {
+                // Fallback to default
+                self.document
+                    .pointer("/Player-Settings/Pre-Buffer/default")
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(10) as u32;
         PreBufferSeconds(seconds)
     }
