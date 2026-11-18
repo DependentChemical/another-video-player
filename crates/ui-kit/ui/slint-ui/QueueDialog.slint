@@ -36,6 +36,10 @@ export component QueueDialog inherits Rectangle {
     private property <length> menu-anchor-x: 0px;
     private property <length> menu-anchor-y: 0px;
 
+    // The fixed height of a queue row. It accommodates up to two wrapped
+    // title lines and one uploader line, with overflow truncated.
+    private property <length> row-height: 80px;
+
     // The row the pointer would drop onto, in the list's content space. The
     // pointer is stored in window coordinates, so subtract the content
     // element's window position (scroll view top plus the current scroll) to
@@ -45,7 +49,7 @@ export component QueueDialog inherits Rectangle {
         ? -1
         : clamp(floor((root.drag-pointer-y
                 - (scroll-view.absolute-position.y + root.queue-content-y))
-                / 80px),
+                / root.row-height),
             0, root.items.length - 1);
 
     changed drag-scroll-tick => {
@@ -123,6 +127,10 @@ export component QueueDialog inherits Rectangle {
                     }
 
                     for item in root.items: row := Rectangle {
+                        // The row has a fixed height so drag targeting and
+                        // scrolling can use the same constant again; the text
+                        // truncates beyond the generous content allowance.
+                        height: root.row-height;
                         border-radius: 8px;
                         background: item.current
                             ? Theme.elevated
@@ -211,6 +219,8 @@ export component QueueDialog inherits Rectangle {
                                                     color: Theme.fg;
                                                     font-size: 13px;
                                                     wrap: word-wrap;
+                                                    max-lines: 2;
+                                                    overflow: elide;
                                                     min-width: 0px;
                                                 }
 
@@ -219,6 +229,8 @@ export component QueueDialog inherits Rectangle {
                                                     color: Theme.muted;
                                                     font-size: 12px;
                                                     wrap: word-wrap;
+                                                    max-lines: 1;
+                                                    overflow: elide;
                                                 }
                                             }
                                         }
