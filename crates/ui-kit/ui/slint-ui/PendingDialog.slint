@@ -67,7 +67,8 @@ export component PendingDialog inherits Rectangle {
                 font-size: 15px;
                 font-weight: 600;
                 wrap: word-wrap;
-                overflow: elide;
+                max-lines: 4;
+                overflow: clip;
                 vertical-alignment: center;
             }
 

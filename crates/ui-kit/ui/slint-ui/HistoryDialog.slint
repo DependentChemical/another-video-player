@@ -82,6 +82,8 @@ export component HistoryDialog inherits Rectangle {
                             cross-axis-alignment: start;
 
                             VerticalLayout {
+                                horizontal-stretch: 1;
+                                min-width: 0px;
                                 spacing: 2px;
                                 alignment: start;
 
@@ -90,6 +92,7 @@ export component HistoryDialog inherits Rectangle {
                                     color: Theme.fg;
                                     font-size: 13px;
                                     wrap: word-wrap;
+                                    min-width: 0px;
                                     vertical-alignment: center;
                                 }
 
@@ -98,6 +101,8 @@ export component HistoryDialog inherits Rectangle {
                                     color: Theme.muted;
                                     font-size: 12px;
                                     wrap: word-wrap;
+                                    max-lines: 1;
+                                    overflow: clip;
                                     vertical-alignment: center;
                                 }
                             }

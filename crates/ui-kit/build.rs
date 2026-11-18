@@ -1,10 +1,11 @@
 //! Downloads the Material Icons, Inter, Noto Sans CJK SC, Noto Sans Symbols 2,
-//! and Noto Color Emoji fonts and compiles the user interface.
+//! Noto Color Emoji, and STIX Two Math fonts and compiles the user interface.
 //!
 //! The icons are drawn with the font that Google publishes for Material
 //! Design, and the UI typography uses Inter, a variable font.
 //! CJK text uses Noto Sans CJK SC (variable), mathematical symbols use
-//! Noto Sans Symbols 2 (static), and emoji use Noto Color Emoji.
+//! Noto Sans Symbols 2 (static), mathematical alphanumerics use STIX Two Math,
+//! and emoji use Noto Color Emoji.
 //! The fonts are fetched, checked and then imported by the interface,
 //! which embeds them into the binary.
 
@@ -43,6 +44,13 @@ const NOTO_EMOJI_FONT_URL: &str =
 
 /// The family name for the Noto Color Emoji font.
 const NOTO_EMOJI_FONT_FAMILY: &str = "Noto Color Emoji";
+
+/// Where STIX Two Math is published.
+const STIX_TWO_MATH_FONT_URL: &str =
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/stixtwomath/STIXTwoMath-Regular.ttf";
+
+/// The family name for STIX Two Math.
+const STIX_TWO_MATH_FONT_FAMILY: &str = "STIX Two Math";
 
 /// The glyphs the interface uses.
 const REQUIRED_GLYPHS: &[(&str, u32)] = &[
@@ -89,6 +97,20 @@ const REQUIRED_EMOJI_GLYPHS: &[(&str, u32)] = &[
     ("SPARKLES (U+2728)", 0x2728),
 ];
 
+/// Key mathematical alphanumeric codepoints to verify STIX Two Math coverage.
+///
+/// These are the characters titles copied from video sites tend to use for
+/// styled Latin text. The block also contains holes that Unicode leaves
+/// unassigned; those are intentionally not listed.
+const REQUIRED_MATH_GLYPHS: &[(&str, u32)] = &[
+    ("MATHEMATICAL BOLD CAPITAL A (U+1D400)", 0x1d400),
+    ("MATHEMATICAL BOLD ITALIC CAPITAL A (U+1D468)", 0x1d468),
+    ("MATHEMATICAL BOLD ITALIC SMALL G (U+1D488)", 0x1d488),
+    ("MATHEMATICAL BOLD ITALIC SMALL H (U+1D489)", 0x1d489),
+    ("MATHEMATICAL BOLD ITALIC SMALL S (U+1D494)", 0x1d494),
+    ("PLANCK CONSTANT (U+210E)", 0x210e),
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FLATLINE_MATERIAL_ICONS");
@@ -96,6 +118,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FLATLINE_NOTO_CJK_SC_FONT");
     println!("cargo:rerun-if-env-changed=FLATLINE_NOTO_SYMBOLS2_FONT");
     println!("cargo:rerun-if-env-changed=FLATLINE_NOTO_EMOJI_FONT");
+    println!("cargo:rerun-if-env-changed=FLATLINE_STIX_TWO_MATH_FONT");
 
     let icons_font = prepare_icons_font();
     println!("cargo:rerun-if-changed={}", icons_font.display());
@@ -111,6 +134,9 @@ fn main() {
 
     let noto_emoji_font = prepare_noto_emoji_font();
     println!("cargo:rerun-if-changed={}", noto_emoji_font.display());
+
+    let stix_two_math_font = prepare_stix_two_math_font();
+    println!("cargo:rerun-if-changed={}", stix_two_math_font.display());
 
     let config = slint_build::CompilerConfiguration::new()
         .embed_resources(slint_build::EmbedResourcesKind::EmbedFiles);
@@ -214,6 +240,26 @@ fn prepare_noto_emoji_font() -> PathBuf {
                 download(NOTO_EMOJI_FONT_URL, &font, "Noto Color Emoji");
             }
             check_noto_emoji_font(&font);
+            font
+        }
+    }
+}
+
+/// Makes sure the STIX Two Math font is present and returns its path.
+fn prepare_stix_two_math_font() -> PathBuf {
+    let font = Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts").join("STIXTwoMath.ttf");
+
+    match std::env::var_os("FLATLINE_STIX_TWO_MATH_FONT") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            check_stix_two_math_font(&path);
+            path
+        }
+        None => {
+            if !font.is_file() {
+                download(STIX_TWO_MATH_FONT_URL, &font, "STIX Two Math");
+            }
+            check_stix_two_math_font(&font);
             font
         }
     }
@@ -323,6 +369,27 @@ fn check_noto_emoji_font(path: &Path) {
             char::from_u32(*codepoint).unwrap_or_else(|| panic!("{name} has an invalid codepoint"));
         if face.glyph_index(character).is_none() {
             panic!("the Noto Color Emoji font does not have the glyph {name}");
+        }
+    }
+}
+
+/// Checks that the font has the STIX Two Math family name and key glyphs.
+fn check_stix_two_math_font(path: &Path) {
+    let data = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("the STIX Two Math font could not be read: {error}"));
+    let face = ttf_parser::Face::parse(&data, 0)
+        .unwrap_or_else(|error| panic!("the STIX Two Math font could not be understood: {error}"));
+
+    let family = extract_family(&face);
+    if family != STIX_TWO_MATH_FONT_FAMILY {
+        panic!("the downloaded font is {family:?} instead of {STIX_TWO_MATH_FONT_FAMILY:?}");
+    }
+
+    for (name, codepoint) in REQUIRED_MATH_GLYPHS {
+        let character =
+            char::from_u32(*codepoint).unwrap_or_else(|| panic!("{name} has an invalid codepoint"));
+        if face.glyph_index(character).is_none() {
+            panic!("the STIX Two Math font does not have the glyph {name}");
         }
     }
 }

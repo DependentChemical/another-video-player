@@ -10,6 +10,7 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -27,6 +28,61 @@ const TOAST_LIMIT: usize = 5;
 
 /// How often expired toasts are swept away.
 const TOAST_SWEEP: Duration = Duration::from_millis(500);
+
+/// Every script fontique knows, so a fallback can be reached from any run.
+///
+/// Parley labels a run of characters whose script is Common with the run's
+/// dominant script. A title made only of mathematical letters and digits has
+/// no dominant script, so it is shaped as Latin; a math run inside a title is
+/// shaped as whatever script surrounds it. Registering the math font for every
+/// script covers both cases.
+fn fallback_scripts() -> Vec<slint::fontique_011::fontique::Script> {
+    use slint::fontique_011::fontique::ScriptExt;
+
+    slint::fontique_011::fontique::Script::all_samples().iter().map(|(script, _)| *script).collect()
+}
+
+/// Makes the embedded math and CJK fonts reachable from the fallback chain.
+///
+/// Slint shapes a character with the first family that covers it. The font
+/// embedded for mathematical alphanumerics is not the requested UI family,
+/// and DirectWrite's fallback for the Common script does not cover the
+/// Mathematical Alphanumeric Symbols block, so STIX has to be appended for
+/// every script explicitly. Noto Sans CJK SC is appended for the CJK scripts
+/// for the same reason, and so that the shipped font is used instead of
+/// whatever the system happens to have.
+fn configure_font_fallbacks() {
+    use slint::fontique_011::fontique;
+
+    let mut collection = slint::fontique_011::shared_collection();
+
+    if let Some(cjk) = collection.family_id("Noto Sans CJK SC") {
+        for script in [b"Hani", b"Hira", b"Kana"] {
+            let key = fontique::FallbackKey::new(fontique::Script::from_bytes(*script), None);
+            collection.append_fallbacks(key, std::iter::once(cjk));
+        }
+    }
+
+    if let Some(stix) = collection.family_id("STIX Two Math") {
+        for script in fallback_scripts() {
+            let key = fontique::FallbackKey::new(script, None);
+            collection.append_fallbacks(key, std::iter::once(stix));
+        }
+    }
+}
+
+/// Replaces the unassigned code point that some sources use for an italic h.
+///
+/// U+1D455 is a hole in the Mathematical Alphanumeric Symbols block; the
+/// character meant by it is the Planck constant, U+210E. Without this the
+/// title shows a blank where the h should be.
+fn display_title(title: &str) -> Cow<'_, str> {
+    if title.contains('\u{1D455}') {
+        Cow::Owned(title.replace('\u{1D455}', "\u{210E}"))
+    } else {
+        Cow::Borrowed(title)
+    }
+}
 
 /// One toast that is currently on screen and the moment it was shown.
 struct ActiveToast {
@@ -215,6 +271,9 @@ impl PlayerUi {
     /// Creates the window.
     pub fn new() -> Result<PlayerUi, slint::PlatformError> {
         let window = MainWindow::new()?;
+        // The component's fonts are registered by now, so the fallback
+        // chain can be extended before the first layout runs.
+        configure_font_fallbacks();
         let window_weak = window.as_weak();
         let long_press_pending = Cell::new(None::<i32>);
         let long_press_timer = Rc::new(Timer::default());
@@ -301,7 +360,7 @@ impl PlayerUi {
 
     /// The title of the media that is playing.
     pub fn set_media_title(&self, title: &str) {
-        self.window.set_media_title(title.into());
+        self.window.set_media_title(display_title(title).as_ref().into());
     }
 
     /// The application version to show in the window title.
@@ -492,7 +551,7 @@ impl PlayerUi {
     /// The thumbnail is read from disk; when it is missing or cannot be
     /// decoded the dialog simply shows no picture.
     pub fn show_pending(&self, title: &str, thumbnail: Option<&Path>) {
-        self.window.set_pending_title(title.into());
+        self.window.set_pending_title(display_title(title).as_ref().into());
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
         self.window.set_pending_thumbnail(image);
@@ -517,7 +576,7 @@ impl PlayerUi {
                 id: entry.id,
                 index: index as i32,
                 position: entry.position,
-                title: entry.title.as_str().into(),
+                title: display_title(&entry.title).as_ref().into(),
                 uploader: entry.uploader.as_str().into(),
                 thumbnail: entry
                     .thumbnail
@@ -551,7 +610,7 @@ impl PlayerUi {
         let items: Vec<HistoryItem> = entries
             .iter()
             .map(|entry| HistoryItem {
-                title: entry.title.as_str().into(),
+                title: display_title(&entry.title).as_ref().into(),
                 uploader: entry.uploader.as_str().into(),
                 url: entry.url.as_str().into(),
             })
@@ -862,5 +921,20 @@ mod tests {
         assert_eq!(store.toasts.len(), TOAST_LIMIT);
         assert_eq!(store.toasts[0].item.text, "toast 2");
         assert_eq!(store.toasts[TOAST_LIMIT - 1].item.text, format!("toast {}", TOAST_LIMIT + 1));
+    }
+
+    #[test]
+    fn the_unassigned_italic_h_is_shown_as_a_planck_constant() {
+        assert_eq!(display_title("a\u{1D455}b"), "a\u{210E}b");
+        assert_eq!(display_title("plain"), "plain");
+    }
+
+    #[test]
+    fn the_math_font_can_be_reached_from_latin_and_cjk_runs() {
+        let scripts = fallback_scripts();
+        for tag in [b"Latn", b"Hani", b"Hira", b"Kana"] {
+            let script = slint::fontique_011::fontique::Script::from_bytes(*tag);
+            assert!(scripts.contains(&script), "script {tag:?} has no math fallback");
+        }
     }
 }
