@@ -22,7 +22,7 @@ members = [
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.4.21"
+version = "0.4.33"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -51,6 +51,7 @@ slint = { version = "1.18", default-features = false, features = [
     "backend-winit",
     "renderer-femtovg",
     "unstable-winit-030",
+    "unstable-fontique-011",
     "accessibility",
 ] }
 slint-build = "1.18"

@@ -22,29 +22,45 @@ use crate::paths::AppPaths;
 use crate::session::Session;
 use crate::timeline::{LiveAxis, Timeline};
 
+/// How often Flatline checks GitHub for application and tool updates.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Something the background work wants to tell the user interface.
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A URL was resolved and can start playing.
-    Resolved(Result<ResolvedMedia, String>),
+    Resolved(Result<ResolvedMedia, (String, String)>),
     /// A URL was resolved while something else plays, so the user decides.
     Pending(Result<PendingMedia, String>),
-    /// A newer `yt-dlp` was downloaded and is now in use.
-    ToolUpdated(String),
     /// A service asks the user to sign in.
     SigningIn(Service),
+    /// The cookie file for a service is being regenerated.
+    RegeneratingCookies(Service),
     /// A newer application release is available.
-    UpdateAvailable(updater::Update),
-    /// The accepted update is downloading; carries the fraction, from zero to one.
-    UpdateDownloadProgress(f64),
-    /// An accepted application update could not be prepared for installation.
-    UpdateFailed(String),
+    AppUpdateAvailable(updater::Update),
+    /// The accepted application update is downloading.
+    AppUpdateProgress(f64),
+    /// An accepted application update could not be prepared.
+    AppUpdateFailed(String),
+    /// A newer `yt-dlp` release is available.
+    ToolUpdateAvailable(ytdlp_tool::ToolUpdate),
+    /// The accepted `yt-dlp` update is downloading.
+    ToolUpdateProgress(f64),
+    /// The accepted `yt-dlp` update is being applied.
+    ToolUpdateStatus(String),
+    /// The `yt-dlp` update has been applied.
+    ToolUpdateApplied(String),
+    /// The `yt-dlp` update could not be downloaded or applied.
+    ToolUpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
     /// A legacy thumbnail migration started; carries how many entries await processing.
     ThumbnailMigrationStarted { count: usize },
     /// A legacy thumbnail migration finished; carries how many entries were processed.
     ThumbnailMigrationFinished { processed: usize },
+    /// A background thumbnail refresh for the active queue started; carries how
+    /// many entries await processing.
+    ThumbnailRefreshStarted { count: usize },
     /// A retry is scheduled.
     RetryScheduled {
         /// The error message.
@@ -140,6 +156,10 @@ const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
+
+/// How long the background thumbnail pass waits between downloads, so it
+/// stays in the background and does not hammer the network.
+const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(1);
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -285,7 +305,8 @@ impl RetryState {
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
-    resolver: Mutex<Resolver>,
+    resolver: Arc<Mutex<Resolver>>,
+    ytdlp_gate: Arc<Mutex<()>>,
     settings: Settings,
     session: Session,
     runtime: tokio::runtime::Runtime,
@@ -298,10 +319,16 @@ pub struct App {
     queue: Queue,
     /// The thumbnails shown before a media is accepted.
     cache: ThumbnailCache,
+    /// The directories Flatline uses at runtime.
+    paths: AppPaths,
     /// The directory the player buffers downloaded media in.
     stream_buffer: PathBuf,
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
+    /// The last application release version shown to the user.
+    notified_app_update: Mutex<Option<String>>,
+    /// The last yt-dlp release version shown to the user.
+    notified_tool_update: Mutex<Option<String>>,
 }
 
 impl App {
@@ -329,7 +356,8 @@ impl App {
 
         let app = App {
             engine,
-            resolver: Mutex::new(resolver),
+            resolver: Arc::new(Mutex::new(resolver)),
+            ytdlp_gate: Arc::new(Mutex::new(())),
             settings,
             session,
             runtime,
@@ -339,13 +367,19 @@ impl App {
             live: Mutex::new(LiveAxis::new()),
             queue,
             cache,
+            paths: paths.clone(),
             stream_buffer,
             pending: Mutex::new(None),
+            notified_app_update: Mutex::new(None),
+            notified_tool_update: Mutex::new(None),
         };
         // Drop orphaned thumbnail files left by older runs, and migrate any
         // thumbnails that still point at a direct file path, in the
         // background. Start and end are reported to the user as toasts.
         app.maintain_thumbnails();
+        // Rebuild the thumbnail cache for the active queue in the background
+        // so queued videos show their thumbnails without waiting for playback.
+        app.refresh_queue_thumbnails();
         Ok(app)
     }
 
@@ -394,25 +428,43 @@ impl App {
         self.state.lock().expect("the state is not poisoned").current_url.clone()
     }
 
+    /// Whether a resolved result for `url` still belongs to the active playback.
+    ///
+    /// A result is relevant while it matches the in-flight resolve or the URL of
+    /// the queue entry that is current now.
+    pub fn expects_resolved_url(&self, url: &str) -> bool {
+        if self.resolving_url().as_deref() == Some(url) {
+            return true;
+        }
+        match self.queue.current() {
+            Ok(Some(entry)) => entry.url == url,
+            Ok(None) | Err(_) => false,
+        }
+    }
+
     /// Resolves the URL read from the active queue in the background.
     fn resolve_play(&self, url: String) {
         // Track the URL being resolved for retry purposes
         self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
 
-        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
+            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(&resolver, &session, &url, &sender)
-                .map_err(|error| error.to_string())
+                .map_err(|error| (url.clone(), error.to_string()))
                 .map(|source| {
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
                 });
+            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
@@ -420,13 +472,16 @@ impl App {
     /// Resolves a URL in the background, caches its thumbnail and waits for
     /// the user to decide.
     fn resolve_pending(&self, url: String) {
-        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
+            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(&resolver, &session, &url, &sender)
                 .map_err(|error| error.to_string())
@@ -442,6 +497,7 @@ impl App {
                         resolved_at: unix_time(),
                     }
                 });
+            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
     }
@@ -454,6 +510,7 @@ impl App {
     /// Plays the pending media right away, replacing the active queue.
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
+        self.interrupt_playback();
         let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
@@ -517,7 +574,7 @@ impl App {
         thumbnail_url: Option<&str>,
         uploader: Option<&str>,
     ) {
-        self.clear_retry();
+        self.interrupt_playback();
         if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
         {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
@@ -618,7 +675,19 @@ impl App {
             // Files left behind that no cache row references are deleted first.
             let _ = cache.prune_orphans();
 
+            // A crash can leave the image files on disk without their cache row.
+            // Recreate any missing row the active queue still points at so the
+            // thumbnails are not downloaded again on the next start.
+            if let Ok(entries) = queue.entries() {
+                for entry in &entries {
+                    if let Some(id) = entry.thumbnail_id() {
+                        let _ = cache.repair_row(id);
+                    }
+                }
+            }
+
             if legacy.is_empty() {
+                let _ = cache.release_unreferenced_thumbnails();
                 return;
             }
 
@@ -658,6 +727,100 @@ impl App {
         });
     }
 
+    /// Kicks off a background pass that (re)builds the thumbnail cache for the
+    /// active queue.
+    ///
+    /// Entries that already hold a valid cached thumbnail are skipped; the rest
+    /// are downloaded one at a time, slowly, so the cache is rebuilt without
+    /// blocking playback or the interface. The start is reported to the user
+    /// through [`Message::ThumbnailRefreshStarted`].
+    pub fn refresh_queue_thumbnails(&self) {
+        let entries = match self.queue.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                return;
+            }
+        };
+        let due = entries_needing_thumbnails(&entries, &self.cache);
+        if due.is_empty() {
+            return;
+        }
+
+        let count = due.len();
+        let cache = self.cache.clone();
+        let queue = self.queue.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let resolver = Arc::clone(&self.resolver);
+        let session = self.session.clone();
+        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
+        let runtime = self.runtime.handle().clone();
+
+        runtime.spawn_blocking(move || {
+            let _ = outbox
+                .lock()
+                .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
+
+            for (position, url, thumbnail_url) in due {
+                // Try direct fetch first
+                match cache.fetch(&url, Some(&thumbnail_url)) {
+                    Ok(id) => {
+                        if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                            crate::diag::note(&format!(
+                                "the active queue entry could not be updated: {error}"
+                            ));
+                        }
+                        std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        continue;
+                    }
+                    Err(error) => {
+                        crate::diag::note(&format!(
+                            "a queue thumbnail direct download failed for {url}: {error}; trying yt-dlp refresh"
+                        ));
+                    }
+                }
+                // Fallback: re-resolve via yt-dlp to get a fresh thumbnail_url, then fetch
+                let sender = outbox.lock().expect("outbox poisoned").clone();
+                let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
+                let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
+                match resolve_with_session(&resolver, &session, &url, &sender) {
+                    Ok(source) => {
+                        drop(_guard);
+                        if let Some(new_thumb) = source.thumbnail.as_deref() {
+                            // Update stored thumbnail_url if changed
+                            let _ = queue.update_details(position, &source.title, None, Some(new_thumb), source.uploader.as_deref());
+                            match cache.fetch(&url, Some(new_thumb)) {
+                                Ok(id) => {
+                                    if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                                        crate::diag::note(&format!(
+                                            "the active queue entry could not be updated: {error}"
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    crate::diag::note(&format!(
+                                        "a queue thumbnail could not be refreshed after yt-dlp: {error}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            crate::diag::note(&format!(
+                                "yt-dlp did not provide a thumbnail for {url}"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        drop(_guard);
+                        crate::diag::note(&format!(
+                            "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
+                        ));
+                    }
+                }
+                std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+            }
+        });
+    }
+
     /// Returns every history entry, most recently played first.
     pub fn history_entries(&self) -> Vec<library::HistoryEntry> {
         match self.queue.history_all() {
@@ -669,11 +832,15 @@ impl App {
         }
     }
 
-    /// Starts the entry at `position` and marks it as the current one.
-    pub fn play_queue_entry(&self, position: i64) -> bool {
-        match self.queue.set_current(position) {
+    /// Starts the entry with `id` and marks it as the current one.
+    ///
+    /// Any playback, resolve, or retry tied to the previously active media is
+    /// abandoned first so the selected entry plays immediately and a stale end
+    /// of the previous media cannot advance the queue past it.
+    pub fn play_queue_entry(&self, id: i64) -> bool {
+        match self.queue.set_current(id) {
             Ok(()) => {
-                self.clear_retry();
+                self.interrupt_playback();
                 self.consume_current();
                 true
             }
@@ -682,6 +849,21 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Stops the current playback and clears transient state tied to it.
+    fn interrupt_playback(&self) {
+        let _ = self.engine.stop();
+        self.clear_retry();
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.pending_restore = PendingRestore::default();
+        state.resolving_url = None;
+        state.current_id_hash = None;
+        state.current_url = None;
+        state.current_title = None;
+        state.current_thumbnail_url = None;
+        state.current_uploader = None;
+        state.last_history_save = None;
     }
 
     /// Removes an entry from the active queue.
@@ -713,7 +895,7 @@ impl App {
 
         match self.queue.next_after(removed.position) {
             Ok(Some(next)) => {
-                if let Err(error) = self.queue.set_current(next.position) {
+                if let Err(error) = self.queue.set_current(next.id) {
                     crate::diag::note(&format!(
                         "the next queue entry could not be made current: {error}"
                     ));
@@ -730,6 +912,21 @@ impl App {
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be read: {error}"));
                 QueueRemoval { removed: true, advanced: false }
+            }
+        }
+    }
+
+    /// Reorders the active queue to the given id order and refreshes the view.
+    ///
+    /// This is what the queue dialog uses after the user drags items around.
+    /// Positions are reassigned 0..n-1 in the new order; the current mark
+    /// follows its entry because it is tracked by id.
+    pub fn reorder_queue(&self, ordered_ids: &[i64]) -> bool {
+        match self.queue.reorder(ordered_ids) {
+            Ok(()) => true,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be reordered: {error}"));
+                false
             }
         }
     }
@@ -864,12 +1061,25 @@ impl App {
         // Compute id_hash for history tracking
         let id_hash = media_model::video_id_hash(url);
 
-        // Check history for saved playback position (only for non-live videos)
-        let history_position = if !source.is_live {
+        // Check history for saved playback position (only for non-live videos).
+        // A saved position that would land within 5 seconds of the end is treated
+        // as fully watched and reset so playback starts from the beginning.
+        let mut history_position = if !source.is_live {
             self.queue.history_get(&id_hash).ok().flatten().map(|entry| entry.position_seconds)
         } else {
             None
         };
+        if let (Some(position), Some(duration)) = (history_position, source.duration)
+            && duration.is_finite()
+            && duration > 0.0
+            && position.is_finite()
+            && position >= (duration - 5.0).max(0.0)
+        {
+            history_position = None;
+            if let Err(error) = self.queue.history_reset_position(&id_hash) {
+                crate::diag::note(&format!("failed to reset history position: {error}"));
+            }
+        }
 
         {
             let mut state = self.state.lock().expect("the state is not poisoned");
@@ -1193,43 +1403,95 @@ impl App {
         *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
 
-    /// Looks for a newer `yt-dlp` in the background.
-    pub fn check_tool_update(&self, ytdlp: &YtDlp, paths: &AppPaths) {
-        let ytdlp = ytdlp.clone();
-        let paths = paths.clone();
-        let outbox = Arc::clone(&self.outbox);
-        let runtime = self.runtime.handle().clone();
+    /// Starts background checks for application and `yt-dlp` updates at startup and then periodically.
+    pub fn start_update_checks(self: &Arc<Self>, paths: AppPaths) {
+        let app = Arc::clone(self);
+        self.runtime.handle().spawn(async move {
+            loop {
+                app.clone().poll_app_update_background();
+                app.clone().poll_tool_update_background(paths.clone());
+                tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+            }
+        });
+    }
 
-        runtime.spawn_blocking(move || {
-            match ytdlp_tool::update::check_and_update(&ytdlp, &paths.tool_paths()) {
-                Ok(outcome) if outcome.updated => {
-                    let _ = outbox.lock().map(|sender| {
-                        sender.send(Box::new(Message::ToolUpdated(
-                            outcome.path.to_string_lossy().into_owned(),
-                        )))
-                    });
+    fn poll_app_update_background(self: Arc<Self>) {
+        let outbox = Arc::clone(&self.outbox);
+        let app = Arc::clone(&self);
+        let handle = self.runtime.handle().clone();
+        handle.spawn_blocking(move || match updater::check(crate::VERSION) {
+            Ok(Some(update)) => {
+                let should_notify = {
+                    let mut guard = app.notified_app_update.lock().expect("poisoned");
+                    if guard.as_deref() == Some(update.version.as_str()) {
+                        false
+                    } else {
+                        *guard = Some(update.version.clone());
+                        true
+                    }
+                };
+                if should_notify {
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::AppUpdateAvailable(update))));
                 }
-                Ok(outcome) => {
-                    crate::diag::note(&format!("yt-dlp {} is up to date", outcome.current));
+            }
+            Ok(None) => crate::diag::note("Flatline is up to date"),
+            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
+        });
+    }
+
+    fn poll_tool_update_background(self: Arc<Self>, paths: AppPaths) {
+        let outbox = Arc::clone(&self.outbox);
+        let app = Arc::clone(&self);
+        let handle = self.runtime.handle().clone();
+        handle.spawn_blocking(move || {
+            let tools = paths.tool_paths();
+            let current = ytdlp_tool::locate::managed(&tools)
+                .and_then(|tool| tool.version().ok())
+                .unwrap_or_default();
+            if current.is_empty() {
+                return;
+            }
+            match ytdlp_tool::update::check(&current) {
+                Ok(Some(update)) => {
+                    let should_notify = {
+                        let mut guard = app.notified_tool_update.lock().expect("poisoned");
+                        if guard.as_deref() == Some(update.latest.as_str()) {
+                            false
+                        } else {
+                            *guard = Some(update.latest.clone());
+                            true
+                        }
+                    };
+                    if should_notify {
+                        let _ = outbox.lock().map(|sender| {
+                            sender.send(Box::new(Message::ToolUpdateAvailable(update)))
+                        });
+                    }
                 }
+                Ok(None) => crate::diag::note(&format!("yt-dlp {current} is up to date")),
                 Err(error) => {
-                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"));
+                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"))
                 }
             }
         });
     }
 
-    /// Checks GitHub for a newer Flatline release in the background.
-    pub fn check_app_update(&self) {
+    /// Prompts the user to download `yt-dlp` when it is missing.
+    pub fn prompt_missing_tool_install(&self) {
         let outbox = Arc::clone(&self.outbox);
-        self.runtime.handle().spawn_blocking(move || match updater::check(crate::VERSION) {
-            Ok(Some(update)) => {
-                let _ = outbox
-                    .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateAvailable(update))));
+        self.runtime.handle().spawn_blocking(move || {
+            match ytdlp_tool::update::latest_available() {
+                Ok(update) => {
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateAvailable(update))));
+                }
+                Err(error) => {
+                    crate::diag::note(&format!("the yt-dlp release could not be fetched: {error}"));
+                }
             }
-            Ok(None) => crate::diag::note("Flatline is up to date"),
-            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
         });
     }
 
@@ -1246,15 +1508,87 @@ impl App {
             let result = updater::install(&update, &directory, &executable, move |progress| {
                 let _ = progress_outbox
                     .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateDownloadProgress(progress))));
+                    .map(|sender| sender.send(Box::new(Message::AppUpdateProgress(progress))));
             });
             if let Err(error) = result {
                 let message = error.to_string();
                 crate::diag::note(&format!("the Flatline update failed: {message}"));
                 let _ = outbox
                     .lock()
-                    .map(|sender| sender.send(Box::new(Message::UpdateFailed(message))));
+                    .map(|sender| sender.send(Box::new(Message::AppUpdateFailed(message))));
             }
+        });
+    }
+
+    /// Downloads and applies an accepted `yt-dlp` update in the background.
+    pub fn install_tool_update(&self, update: ytdlp_tool::ToolUpdate) {
+        let outbox = Arc::clone(&self.outbox);
+        let gate = Arc::clone(&self.ytdlp_gate);
+        let resolver = Arc::clone(&self.resolver);
+        let cookies = self.session.cookies_dir().to_path_buf();
+        let paths = self.paths.clone();
+        self.runtime.handle().spawn_blocking(move || {
+            let tools = paths.tool_paths();
+            let staged = tools.staged_binary();
+            let managed = tools.managed_binary();
+
+            let progress_outbox = Arc::clone(&outbox);
+            let status_outbox = Arc::clone(&outbox);
+            let download = ytdlp_tool::update::download_with_progress(
+                &update.download_url,
+                &staged,
+                move |progress| {
+                    let _ = progress_outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateProgress(progress))));
+                },
+            );
+            if let Err(error) = download {
+                let _ = std::fs::remove_file(&staged);
+                let message = error.to_string();
+                crate::diag::note(&format!("the yt-dlp update failed: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
+                return;
+            }
+
+            let _ = status_outbox.lock().map(|sender| {
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
+            });
+
+            let _guard = match gate.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&staged);
+                    let _ = outbox.lock().map(|sender| {
+                        sender.send(Box::new(Message::ToolUpdateFailed(
+                            "the yt-dlp update could not be applied".to_string(),
+                        )))
+                    });
+                    return;
+                }
+            };
+
+            if let Err(error) = ytdlp_tool::update::replace(&staged, &managed) {
+                let _ = std::fs::remove_file(&staged);
+                let message = error.to_string();
+                crate::diag::note(&format!("the yt-dlp update could not be applied: {message}"));
+                let _ = outbox
+                    .lock()
+                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
+                return;
+            }
+
+            let tool = ytdlp_tool::locate::at(&managed);
+            if let Ok(mut resolver) = resolver.lock() {
+                *resolver = Resolver::new(command_spec(&tool, &cookies));
+            }
+            drop(_guard);
+
+            let _ = outbox
+                .lock()
+                .map(|sender| sender.send(Box::new(Message::ToolUpdateApplied(update.latest))));
         });
     }
 
@@ -1376,6 +1710,28 @@ impl App {
     fn report(&self, text: String) {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
     }
+}
+
+/// The queue entries that lack a valid cached thumbnail but can still be
+/// downloaded, because the extractor reported a remote thumbnail URL.
+///
+/// Returns `(position, url, thumbnail_url)` triples, in queue order.
+fn entries_needing_thumbnails(
+    entries: &[library::QueueEntry],
+    cache: &ThumbnailCache,
+) -> Vec<(i64, String, String)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let thumbnail_url = entry.thumbnail_url.as_deref()?;
+            let needed = match entry.thumbnail.as_deref() {
+                None => true,
+                Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
+                Some(_) => true,
+            };
+            needed.then_some((entry.position, entry.url.clone(), thumbnail_url.to_string()))
+        })
+        .collect()
 }
 
 /// Removes the media a previous source buffered.
@@ -1574,24 +1930,37 @@ fn format_bitrate(kilobits: u64) -> String {
 /// Describes how `yt-dlp` has to be invoked.
 ///
 /// Every service gets its own cookie file, and a file is only passed when it
-/// is really there: `yt-dlp` refuses to work with an empty cookie file.
+/// contains authentication cookies for that service.
 fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
     let spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    spec.with_cookies(Service::YouTube, web_session::cookie_file(cookies, Service::YouTube))
-        .with_cookies(Service::Twitch, web_session::cookie_file(cookies, Service::Twitch))
+    let youtube = web_session::cookie_file(cookies, Service::YouTube);
+    let twitch = web_session::cookie_file(cookies, Service::Twitch);
+    let spec = if web_session::cookie::signed_in_file(Service::YouTube, &youtube) {
+        spec.with_cookies(Service::YouTube, youtube)
+    } else {
+        spec
+    };
+    if web_session::cookie::signed_in_file(Service::Twitch, &twitch) {
+        spec.with_cookies(Service::Twitch, twitch)
+    } else {
+        spec
+    }
 }
 
 /// Resolves a URL and asks the user to sign in when the service demands it.
 ///
 /// A sign-in challenge pauses this resolve: the helper runs before the retry
 /// loop is told about the failure, so the user can finish or close the
-/// window first. A successful sign-in is followed by one fresh resolve; if the
-/// user closes the window or the helper cannot run, the original challenge is
-/// returned so the normal retry flow can continue and a later challenge can
-/// ask again.
+/// window first. The helper performs a background page-level session check and
+/// only shows the sign-in window when the service no longer accepts the
+/// session. A successful sign-in is followed by one fresh resolve; if the
+/// service still reports the same challenge the error is returned instead of a
+/// new prompt. URLs that do not belong to either service are never offered to
+/// ask again. If the user declines to sign in, cookie regeneration is skipped
+/// and the resolve continues with the same retry flow without new cookies.
 fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
@@ -1605,16 +1974,17 @@ fn resolve_with_session(
     let Some(service) = web_session::challenge_service(url, &error) else {
         return Err(error);
     };
-    // The helper opens a window of its own; the player says why it is there.
-    let _ = notice.send(Box::new(Message::SigningIn(service)));
-    if let Err(problem) = session.sign_in(service, url) {
-        // The helper's failure is the reason the challenge could not be
-        // answered, so it is reported alongside the resolver error instead of
-        // being swallowed: an invisible sign-in would otherwise look like the
-        // player simply ignoring the challenge.
-        return Err(format!("{error} ({problem})"));
+    match session.sign_in(service, url, notice) {
+        Ok(()) => {
+            // Retry once with the freshly exported, verified session cookies.
+            resolver.resolve(url).map_err(|error| error.to_string())
+        }
+        Err(crate::session::Error::Declined) => {
+            let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
+            Err(error)
+        }
+        Err(problem) => Err(format!("{error} ({problem})")),
     }
-    resolver.resolve(url).map_err(|error| error.to_string())
 }
 
 /// Everything that can go wrong while running the application.
@@ -1860,5 +2230,94 @@ mod tests {
                 .is_none()
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn entries_needing_thumbnails_skips_those_that_are_cached() {
+        let temp = tempfile::tempdir().expect("a temp directory can be created");
+        let queue = Queue::in_memory().expect("an in-memory queue opens");
+        let cache = ThumbnailCache::new(queue.database(), temp.path());
+
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .expect("a valid JPEG encodes");
+        let jpeg = temp.path().join("source.jpg");
+        std::fs::write(&jpeg, &bytes).unwrap();
+
+        let cached_id = cache.register_legacy("https://example.com/cached", &jpeg).unwrap();
+
+        let link = |s: &str| s.to_string();
+        let entries = vec![
+            library::QueueEntry {
+                id: 1,
+                position: 0,
+                url: link("https://example.com/cached"),
+                title: "cached".into(),
+                thumbnail: Some(cached_id.clone()),
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 2,
+                position: 1,
+                url: link("https://example.com/missing"),
+                title: "missing".into(),
+                thumbnail: None,
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 3,
+                position: 2,
+                url: link("https://example.com/stale"),
+                title: "stale".into(),
+                thumbnail: Some("thumb_deadbeef".into()),
+                thumbnail_url: Some(link("https://example.com/thumb.jpg")),
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+            library::QueueEntry {
+                id: 4,
+                position: 3,
+                url: link("https://example.com/nourl"),
+                title: "nourl".into(),
+                thumbnail: None,
+                thumbnail_url: None,
+                uploader: None,
+                id_hash: "h".into(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            },
+        ];
+
+        let due = entries_needing_thumbnails(&entries, &cache);
+        let due_urls: Vec<_> = due.iter().map(|(_, url, _)| url.as_str()).collect();
+        assert_eq!(due_urls, vec!["https://example.com/missing", "https://example.com/stale"]);
     }
 }

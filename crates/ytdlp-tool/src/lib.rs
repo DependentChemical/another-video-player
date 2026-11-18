@@ -20,7 +20,7 @@ use std::fmt;
 
 pub use locate::{ToolPaths, YtDlp};
 pub use platform::Platform;
-pub use update::UpdateOutcome;
+pub use update::ToolUpdate;
 
 /// Everything that can go wrong while managing the `yt-dlp` executable.
 #[derive(Debug)]

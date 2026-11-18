@@ -82,6 +82,7 @@ impl Loading {
         self.phase = Phase::Resolving;
         self.status = Status::Busy(RESOLVING);
         self.current_file = false;
+        self.suppress_eof();
     }
 
     /// The URL resolved and the player was given a plan to play.
@@ -89,6 +90,7 @@ impl Loading {
         self.phase = Phase::Starting;
         self.status = Status::Busy(BUFFERING);
         self.current_file = false;
+        self.suppress_eof();
     }
 
     /// Shows progress while the next item in the active queue is prepared.
@@ -96,6 +98,15 @@ impl Loading {
         self.phase = Phase::Resolving;
         self.status = Status::Busy(PARSING_NEXT);
         self.current_file = false;
+        self.suppress_eof();
+    }
+
+    /// Ignores a stale end-of-file from media that is no longer the active one.
+    ///
+    /// The suppression stays in effect while mpv keeps reporting EOF and is
+    /// cleared automatically once that EOF state goes away.
+    pub fn suppress_eof(&mut self) {
+        self.eof_consumed = true;
     }
 
     /// Resolving the URL failed.
@@ -137,11 +148,11 @@ impl Loading {
     /// The message is ignored while the dots are running, so it can never
     /// make the indicator disappear; the caller can log it instead.
     /// Returns whether the message was shown.
-    pub fn tool_updated(&mut self, path: &str) -> bool {
+    pub fn tool_updated(&mut self, text: &str) -> bool {
         if self.is_busy() {
             return false;
         }
-        self.status = Status::Info(format!("yt-dlp was updated ({path})"));
+        self.status = Status::Info(text.to_string());
         true
     }
 
@@ -373,16 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_updates_wait_for_a_free_moment() {
+    fn tool_update_notes_wait_for_a_free_moment() {
         let mut loading = Loading::new();
         loading.resolve_started();
 
-        assert!(!loading.tool_updated("/tmp/yt-dlp"));
+        assert!(!loading.tool_updated("yt-dlp updated"));
         assert_eq!(loading.status(), &Status::Busy(RESOLVING));
 
         loading.resolve_failed("nope".to_string());
-        assert!(loading.tool_updated("/tmp/yt-dlp"));
-        assert_eq!(loading.status(), &Status::Info("yt-dlp was updated (/tmp/yt-dlp)".to_string()));
+        assert!(loading.tool_updated("yt-dlp updated"));
+        assert_eq!(loading.status(), &Status::Info("yt-dlp updated".to_string()));
     }
 
     #[test]

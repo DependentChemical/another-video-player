@@ -10,6 +10,7 @@
 //! installs, and everything the host wants to show is a setter. That keeps
 //! the crate free of any dependency on the other capabilities of Flatline.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -27,6 +28,68 @@ const TOAST_LIMIT: usize = 5;
 
 /// How often expired toasts are swept away.
 const TOAST_SWEEP: Duration = Duration::from_millis(500);
+
+/// The vertical distance between the tops of two queue rows.
+///
+/// It mirrors `row-step` in `QueueDialog.slint` (a 76px row plus the 4px
+/// spacing between rows) and is used to scroll the current entry to the top
+/// when the queue opens.
+const QUEUE_ROW_STEP: f32 = 80.0;
+
+/// Every script fontique knows, so a fallback can be reached from any run.
+///
+/// Parley labels a run of characters whose script is Common with the run's
+/// dominant script. A title made only of mathematical letters and digits has
+/// no dominant script, so it is shaped as Latin; a math run inside a title is
+/// shaped as whatever script surrounds it. Registering the math font for every
+/// script covers both cases.
+fn fallback_scripts() -> Vec<slint::fontique_011::fontique::Script> {
+    use slint::fontique_011::fontique::ScriptExt;
+
+    slint::fontique_011::fontique::Script::all_samples().iter().map(|(script, _)| *script).collect()
+}
+
+/// Makes the embedded math and CJK fonts reachable from the fallback chain.
+///
+/// Slint shapes a character with the first family that covers it. The font
+/// embedded for mathematical alphanumerics is not the requested UI family,
+/// and DirectWrite's fallback for the Common script does not cover the
+/// Mathematical Alphanumeric Symbols block, so STIX has to be appended for
+/// every script explicitly. Noto Sans CJK SC is appended for the CJK scripts
+/// for the same reason, and so that the shipped font is used instead of
+/// whatever the system happens to have.
+fn configure_font_fallbacks() {
+    use slint::fontique_011::fontique;
+
+    let mut collection = slint::fontique_011::shared_collection();
+
+    if let Some(cjk) = collection.family_id("Noto Sans CJK SC") {
+        for script in [b"Hani", b"Hira", b"Kana"] {
+            let key = fontique::FallbackKey::new(fontique::Script::from_bytes(*script), None);
+            collection.append_fallbacks(key, std::iter::once(cjk));
+        }
+    }
+
+    if let Some(stix) = collection.family_id("STIX Two Math") {
+        for script in fallback_scripts() {
+            let key = fontique::FallbackKey::new(script, None);
+            collection.append_fallbacks(key, std::iter::once(stix));
+        }
+    }
+}
+
+/// Replaces the unassigned code point that some sources use for an italic h.
+///
+/// U+1D455 is a hole in the Mathematical Alphanumeric Symbols block; the
+/// character meant by it is the Planck constant, U+210E. Without this the
+/// title shows a blank where the h should be.
+fn display_title(title: &str) -> Cow<'_, str> {
+    if title.contains('\u{1D455}') {
+        Cow::Owned(title.replace('\u{1D455}', "\u{210E}"))
+    } else {
+        Cow::Borrowed(title)
+    }
+}
 
 /// One toast that is currently on screen and the moment it was shown.
 struct ActiveToast {
@@ -166,11 +229,21 @@ pub struct PlayerUi {
     fullscreen: Cell<bool>,
     toasts: Rc<RefCell<ToastStore>>,
     toast_timer: Rc<Timer>,
+    // While a queue row is pressed this holds its index; when the long-press
+    // timer fires the window's `queue-long-press-index` is set so the queue
+    // dialog knows which row is being dragged.
+    long_press_pending: Cell<Option<i32>>,
+    long_press_timer: Rc<Timer>,
+    // Fires every 16ms while a queue row is being dragged; auto-scrolls the
+    // queue list when the dragged row is near the top or bottom viewport edge.
+    drag_scroll_timer: Rc<Timer>,
 }
 
 impl Drop for PlayerUi {
     fn drop(&mut self) {
         self.toast_timer.stop();
+        self.long_press_timer.stop();
+        self.drag_scroll_timer.stop();
     }
 }
 
@@ -204,11 +277,39 @@ impl Default for PlayerUi {
 impl PlayerUi {
     /// Creates the window.
     pub fn new() -> Result<PlayerUi, slint::PlatformError> {
+        let window = MainWindow::new()?;
+        // The component's fonts are registered by now, so the fallback
+        // chain can be extended before the first layout runs.
+        configure_font_fallbacks();
+        let window_weak = window.as_weak();
+        let long_press_pending = Cell::new(None::<i32>);
+        let long_press_timer = Rc::new(Timer::default());
+        // The long-press timer is (re)armed on every row press in
+        // [`on_queue_row_pressed`]; when it fires the window's
+        // `queue-long-press-index` is set so the queue dialog can drag.
+        let drag_scroll_timer = Rc::new(Timer::default());
+        // Auto-scroll while dragging: every 16ms, if a row is being dragged
+        // (`queue-long-press-index >= 0`), toggle a tick that makes the queue
+        // dialog scroll the list when the pointer is near a viewport edge.
+        // The dialog owns the geometry and the acceleration; this timer only
+        // provides the clock, so no layout values have to cross the FFI.
+        let scroll_window = window_weak.clone();
+        drag_scroll_timer.start(TimerMode::Repeated, Duration::from_millis(16), move || {
+            let Some(window) = scroll_window.upgrade() else { return };
+            if window.get_queue_long_press_index() < 0 {
+                return;
+            }
+            window.set_queue_drag_scroll_tick(!window.get_queue_drag_scroll_tick());
+        });
+
         Ok(PlayerUi {
-            window: MainWindow::new()?,
+            window,
             fullscreen: Cell::new(false),
             toasts: Rc::new(RefCell::new(ToastStore::default())),
             toast_timer: Rc::new(Timer::default()),
+            long_press_pending,
+            long_press_timer,
+            drag_scroll_timer,
         })
     }
 
@@ -264,9 +365,14 @@ impl PlayerUi {
         self.window.set_url(url.into());
     }
 
+    /// Removes focus from the URL bar so it shows its placeholder when empty.
+    pub fn blur_url(&self) {
+        self.window.invoke_blur_url();
+    }
+
     /// The title of the media that is playing.
     pub fn set_media_title(&self, title: &str) {
-        self.window.set_media_title(title.into());
+        self.window.set_media_title(display_title(title).as_ref().into());
     }
 
     /// The application version to show in the window title.
@@ -457,7 +563,7 @@ impl PlayerUi {
     /// The thumbnail is read from disk; when it is missing or cannot be
     /// decoded the dialog simply shows no picture.
     pub fn show_pending(&self, title: &str, thumbnail: Option<&Path>) {
-        self.window.set_pending_title(title.into());
+        self.window.set_pending_title(display_title(title).as_ref().into());
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
         self.window.set_pending_thumbnail(image);
@@ -474,12 +580,15 @@ impl PlayerUi {
     /// Only thumbnails that exist on disk are decoded; a missing file simply
     /// leaves the placeholder in the row.
     pub fn show_queue(&self, entries: &[QueueListEntry]) {
+        let already_open = self.window.get_queue_open();
         let items: Vec<QueueItem> = entries
             .iter()
-            .map(|entry| QueueItem {
+            .enumerate()
+            .map(|(index, entry)| QueueItem {
                 id: entry.id,
+                index: index as i32,
                 position: entry.position,
-                title: entry.title.as_str().into(),
+                title: display_title(&entry.title).as_ref().into(),
                 uploader: entry.uploader.as_str().into(),
                 thumbnail: entry
                     .thumbnail
@@ -491,9 +600,20 @@ impl PlayerUi {
             })
             .collect();
         self.window.set_queue_items(slint::ModelRc::new(slint::VecModel::from(items)));
+        let current_id = entries.iter().find(|entry| entry.current).map_or(-1, |entry| entry.id);
         let current_index =
             entries.iter().position(|entry| entry.current).map_or(-1, |index| index as i32);
+        self.window.set_queue_current_id(current_id);
         self.window.set_queue_current_index(current_index);
+        // Scroll the current entry into view the first time the queue opens,
+        // but keep the scroll position on the refreshes that follow a drag.
+        if !already_open {
+            self.window.set_queue_long_press_index(-1);
+            self.window.set_queue_drag_pointer_y(0.0);
+            if current_index >= 0 {
+                self.window.set_queue_content_y(-(current_index as f32 * QUEUE_ROW_STEP));
+            }
+        }
         self.window.set_queue_open(true);
     }
 
@@ -502,7 +622,7 @@ impl PlayerUi {
         let items: Vec<HistoryItem> = entries
             .iter()
             .map(|entry| HistoryItem {
-                title: entry.title.as_str().into(),
+                title: display_title(&entry.title).as_ref().into(),
                 uploader: entry.uploader.as_str().into(),
                 url: entry.url.as_str().into(),
             })
@@ -511,11 +631,24 @@ impl PlayerUi {
         self.window.set_history_open(true);
     }
 
-    /// Shows the release notes and available version.
-    pub fn show_update(&self, version: &str, notes: &str) {
+    /// Shows the release notes and available application version.
+    pub fn show_app_update(&self, version: &str, notes: &str) {
+        self.show_update("Flatline update available", version, notes, "Yes, download and install");
+    }
+
+    /// Shows the release notes and available yt-dlp version.
+    pub fn show_tool_update(&self, version: &str, notes: &str) {
+        self.show_update("yt-dlp update available", version, notes, "Yes, download update");
+    }
+
+    /// Shows an update dialog with a custom title and action label.
+    pub fn show_update(&self, title: &str, version: &str, notes: &str, action_label: &str) {
+        self.window.set_update_title(title.into());
         self.window.set_update_version(version.into());
         self.window.set_update_notes(notes.into());
+        self.window.set_update_action_label(action_label.into());
         self.window.set_update_installing(false);
+        self.window.set_update_status_text("Downloading update…".into());
         self.window.set_update_error("".into());
         self.window.set_update_download_progress(0.0);
         self.window.set_update_open(true);
@@ -532,9 +665,22 @@ impl PlayerUi {
         self.window.set_update_installing(installing);
     }
 
+    /// Sets the status text shown while an update is being applied.
+    pub fn set_update_status_text(&self, text: &str) {
+        self.window.set_update_status_text(text.into());
+    }
+
     /// Sets the download progress of the update package, from zero to one.
     pub fn set_update_download_progress(&self, progress: f64) {
         self.window.set_update_download_progress(progress as f32);
+    }
+
+    /// Closes the update dialog.
+    pub fn close_update(&self) {
+        self.window.set_update_open(false);
+        self.window.set_update_installing(false);
+        self.window.set_update_error("".into());
+        self.window.set_update_download_progress(0.0);
     }
 
     // ------------------------------------------------------------ events --
@@ -663,6 +809,59 @@ impl PlayerUi {
         self.window.on_queue_remove_entry(handler);
     }
 
+    /// Called when a queue row is pressed.
+    ///
+    /// PlayerUi uses this to arm a 750ms long-press timer; the window sets
+    /// `queue-long-press-index` when it fires so the queue dialog can drag.
+    pub fn on_queue_row_pressed(&self, handler: impl Fn(i32) + 'static) {
+        let pending = self.long_press_pending.clone();
+        let timer = Rc::clone(&self.long_press_timer);
+        let window_weak = self.window.as_weak();
+        self.window.on_queue_row_pressed(move |index| {
+            pending.set(Some(index));
+            if let Some(window) = window_weak.upgrade() {
+                window.set_queue_long_press_index(-1);
+            }
+            let pending = pending.clone();
+            let window_weak = window_weak.clone();
+            timer.start(TimerMode::SingleShot, Duration::from_millis(750), move || {
+                let Some(index) = pending.get() else { return };
+                let Some(window) = window_weak.upgrade() else { return };
+                window.set_queue_long_press_index(index);
+            });
+            handler(index);
+        });
+    }
+
+    /// Called when a queue row is released.
+    ///
+    /// Disarms the long-press timer for the released row.
+    pub fn on_queue_row_released(&self, handler: impl Fn(i32) + 'static) {
+        let pending = self.long_press_pending.clone();
+        let timer = Rc::clone(&self.long_press_timer);
+        let window_weak = self.window.as_weak();
+        self.window.on_queue_row_released(move |index| {
+            if pending.get() == Some(index) {
+                timer.stop();
+                pending.set(None);
+            }
+            // The `.slint` code has already read `queue-long-press-index` to
+            // decide between a drop and a play, so the drag is over by now.
+            if let Some(window) = window_weak.upgrade() {
+                window.set_queue_long_press_index(-1);
+                window.set_queue_drag_pointer_y(0.0);
+            }
+            handler(index);
+        });
+    }
+
+    /// Called when the user reorders the active queue by dragging items.
+    ///
+    /// The arguments are the source index and the target index of the move.
+    pub fn on_queue_move_requested(&self, handler: impl Fn(i32, i32) + 'static) {
+        self.window.on_queue_move_requested(handler);
+    }
+
     /// Called when the user picks a history entry.
     ///
     /// The argument is the URL of the entry, ready to be resolved again.
@@ -760,5 +959,20 @@ mod tests {
         assert_eq!(store.toasts.len(), TOAST_LIMIT);
         assert_eq!(store.toasts[0].item.text, "toast 2");
         assert_eq!(store.toasts[TOAST_LIMIT - 1].item.text, format!("toast {}", TOAST_LIMIT + 1));
+    }
+
+    #[test]
+    fn the_unassigned_italic_h_is_shown_as_a_planck_constant() {
+        assert_eq!(display_title("a\u{1D455}b"), "a\u{210E}b");
+        assert_eq!(display_title("plain"), "plain");
+    }
+
+    #[test]
+    fn the_math_font_can_be_reached_from_latin_and_cjk_runs() {
+        let scripts = fallback_scripts();
+        for tag in [b"Latn", b"Hani", b"Hira", b"Kana"] {
+            let script = slint::fontique_011::fontique::Script::from_bytes(*tag);
+            assert!(scripts.contains(&script), "script {tag:?} has no math fallback");
+        }
     }
 }

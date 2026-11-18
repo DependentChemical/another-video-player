@@ -21,6 +21,12 @@ use ui_kit::{HistoryListEntry, PlayerUi, QueueListEntry, StatusKind};
 use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
 
+#[derive(Debug, Clone)]
+enum PendingUpdate {
+    App(updater::Update),
+    Tool(ytdlp_tool::ToolUpdate),
+}
+
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -72,18 +78,25 @@ impl Shell {
         .map_err(|error| Error::Ui(error.to_string()))?;
 
         let loading = Rc::new(RefCell::new(Loading::new()));
-        let update = Rc::new(RefCell::new(None));
+        let update = Rc::new(RefCell::new(None::<PendingUpdate>));
         {
             let update = Rc::clone(&update);
             let app = Arc::clone(&app);
             let install_dir = program_dir.clone();
             ui.on_update_accepted(move || {
-                if let Some(update) = update.borrow().clone() {
-                    let directory = install_dir.clone();
-                    let executable = std::env::current_exe().unwrap_or_else(|_| {
-                        directory.join(if cfg!(windows) { "flatline.exe" } else { "flatline" })
-                    });
-                    app.install_app_update(update, directory, executable);
+                let pending = update.borrow().clone();
+                match pending {
+                    Some(PendingUpdate::App(update)) => {
+                        let directory = install_dir.clone();
+                        let executable = std::env::current_exe().unwrap_or_else(|_| {
+                            directory.join(if cfg!(windows) { "flatline.exe" } else { "flatline" })
+                        });
+                        app.install_app_update(update, directory, executable);
+                    }
+                    Some(PendingUpdate::Tool(update)) => {
+                        app.install_tool_update(update);
+                    }
+                    None => {}
                 }
             });
         }
@@ -147,6 +160,7 @@ impl Shell {
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
                     ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
                     ui_for_pending.set_media_title(&loaded.title);
                     ui_for_pending
                         .set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
@@ -175,6 +189,7 @@ impl Shell {
             ui.on_pending_queue(move || {
                 let _ = app.queue_pending();
                 ui_for_pending.set_url("");
+                ui_for_pending.blur_url();
             });
         }
         {
@@ -207,8 +222,8 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
-            ui.on_queue_item_selected(move |position| {
-                if app.play_queue_entry(position as i64) {
+            ui.on_queue_item_selected(move |id| {
+                if app.play_queue_entry(id as i64) {
                     loading.borrow_mut().resolve_started();
                 }
             });
@@ -240,6 +255,26 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_queue = Rc::clone(&ui);
+            ui.on_queue_move_requested(move |src, tgt| {
+                let mut entries = app.queue_entries();
+                if src < 0
+                    || tgt < 0
+                    || src as usize >= entries.len()
+                    || tgt as usize >= entries.len()
+                {
+                    return;
+                }
+                let entry = entries.remove(src as usize);
+                entries.insert(tgt as usize, entry);
+                let ids: Vec<i64> = entries.into_iter().map(|entry| entry.id).collect();
+                if app.reorder_queue(&ids) {
+                    ui_for_queue.show_queue(&queue_list(&app));
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
             let ui_for_history = Rc::clone(&ui);
             let loading = Rc::clone(&loading);
             ui.on_history_item_selected(move |url| {
@@ -247,11 +282,20 @@ impl Shell {
             });
         }
         {
+            // Arm the queue row long-press timer; the host does not need to
+            // react to press/release beyond what PlayerUi already does.
+            ui.on_queue_row_pressed(move |_| {});
+            ui.on_queue_row_released(move |_| {});
+        }
+        {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
+            let ui_for_sources = Rc::clone(&ui);
             ui.on_sources_applied(move |video, audio, muxed| {
                 drain_engine_events(&app, &mut loading.borrow_mut());
                 loading.borrow_mut().sources_switching();
+                ui_for_sources
+                    .set_audio_only(video.is_none() && muxed.is_none() && audio.is_some());
                 app.select_sources(video, audio, muxed);
             });
         }
@@ -357,12 +401,8 @@ impl Shell {
 
     /// Opens the update modal with a fake update so it can be tested.
     fn show_test_update_modal(&self) {
-        let update = updater::Update {
-            version: "99.0.0".to_string(),
-            notes: "## Test Update\n\nThis is a test update notice shown when the `test://update-modal` URL is loaded.\n\n- First item\n- Second item\n- Third item\n- Fourth item\n- Fifth item\n- Sixth item\n- Seventh item\n- Eighth item\n- Ninth item\n- Tenth item".to_string(),
-            download_url: String::new(),
-        };
-        self.ui.show_update(&update.version, &update.notes);
+        let notes = "## Test Update\n\nThis is a test update notice shown when the `test://update-modal` URL is loaded.\n\n- First item\n- Second item\n- Third item\n- Fourth item\n- Fifth item\n- Sixth item\n- Seventh item\n- Eighth item\n- Ninth item\n- Tenth item";
+        self.ui.show_app_update("99.0.0", notes);
     }
 
     /// Continues the active queue that was filled in an earlier run.
@@ -440,7 +480,7 @@ This is a test update notice shown when the `test://update-modal` URL is loaded.
 - Eighth item
 - Ninth item
 - Tenth item";
-            ui.show_update("99.0.0", notes);
+            ui.show_app_update("99.0.0", notes);
         }
         other => ui.show_toast(&format!("unknown test url: {other}")),
     }
@@ -504,7 +544,7 @@ fn tick(
     ui: &PlayerUi,
     app: &App,
     loading: &mut Loading,
-    update_slot: &Rc<RefCell<Option<updater::Update>>>,
+    update_slot: &Rc<RefCell<Option<PendingUpdate>>>,
 ) {
     for message in app.poll() {
         match message {
@@ -513,6 +553,12 @@ fn tick(
                 let Some(loaded) =
                     app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at)
                 else {
+                    if !app.expects_resolved_url(&url) {
+                        crate::diag::note(
+                            "discarded a resolved video that is no longer relevant to playback",
+                        );
+                        continue;
+                    }
                     crate::diag::note(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
@@ -543,10 +589,16 @@ fn tick(
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => {
+            Message::Resolved(Err((url, error))) => {
+                if !app.expects_resolved_url(&url) {
+                    crate::diag::note(
+                        "ignored a resolver error that is no longer relevant to playback",
+                    );
+                    continue;
+                }
                 loading.resolve_failed(error.clone());
                 // Schedule a retry for resolver errors
-                if let Some(url) = app.resolving_url() {
+                if app.resolving_url().as_deref() == Some(url.as_str()) {
                     app.handle_resolver_error(url, error);
                 } else {
                     ui.show_toast(&error);
@@ -559,26 +611,50 @@ fn tick(
             Message::Pending(Err(error)) => {
                 ui.show_toast(&error);
             }
-            Message::ToolUpdated(path) => {
-                if !loading.tool_updated(&path) {
-                    crate::diag::note(&format!("yt-dlp was updated ({path})"));
-                }
-            }
             Message::SigningIn(service) => {
-                // The sign-in happens in a window of its own; the player only
-                // says why that window is there.
-                ui.show_toast(&format!("Sign in to {service} to continue"));
+                ui.show_toast(&format!("Sign in to {} to continue", service.label()));
             }
-            Message::UpdateAvailable(update) => {
-                ui.show_update(&update.version, &update.notes);
-                *update_slot.borrow_mut() = Some(update);
+            Message::RegeneratingCookies(service) => {
+                ui.show_toast(&format!("Regenerating cookies.txt for {}", service.name()));
             }
-            Message::UpdateDownloadProgress(progress) => {
-                if progress > 0.0 {
-                    ui.set_update_download_progress(progress);
+            Message::AppUpdateAvailable(update) => {
+                ui.show_app_update(&update.version, &update.notes);
+                *update_slot.borrow_mut() = Some(PendingUpdate::App(update));
+            }
+            Message::AppUpdateProgress(progress) => {
+                ui.set_update_installing(true);
+                if progress >= 1.0 {
+                    ui.set_update_status_text("Installing update…");
+                    ui.set_update_download_progress(1.0);
+                } else {
+                    ui.set_update_status_text("Downloading update…");
+                    ui.set_update_download_progress(progress.max(0.0));
                 }
             }
-            Message::UpdateFailed(error) => ui.show_update_error(&error),
+            Message::AppUpdateFailed(error) => ui.show_update_error(&error),
+            Message::ToolUpdateAvailable(update) => {
+                ui.show_tool_update(&update.latest, &update.notes);
+                *update_slot.borrow_mut() = Some(PendingUpdate::Tool(update));
+            }
+            Message::ToolUpdateProgress(progress) => {
+                ui.set_update_installing(true);
+                ui.set_update_status_text("Downloading update…");
+                ui.set_update_download_progress(progress.max(0.0));
+            }
+            Message::ToolUpdateStatus(status) => {
+                ui.set_update_installing(true);
+                ui.set_update_status_text(&status);
+            }
+            Message::ToolUpdateApplied(version) => {
+                update_slot.borrow_mut().take();
+                ui.close_update();
+                let text = format!("yt-dlp updated to {version}");
+                if !loading.tool_updated(&text) {
+                    crate::diag::note(&text);
+                }
+                ui.show_toast(&text);
+            }
+            Message::ToolUpdateFailed(error) => ui.show_update_error(&error),
             Message::Problem(text) => {
                 if loading.is_busy() {
                     loading.problem(text.clone());
@@ -590,6 +666,9 @@ fn tick(
             }
             Message::ThumbnailMigrationFinished { processed } => {
                 ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));
+            }
+            Message::ThumbnailRefreshStarted { .. } => {
+                ui.show_toast("Downloading thumbnails");
             }
             Message::RetryScheduled { error, delay_seconds, kind } => {
                 loading.retry_scheduled();

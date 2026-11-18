@@ -18,6 +18,8 @@ export struct BufferedRange {
 export struct QueueItem {
     /// The stable database id of the entry, used to remove exactly one row.
     id: int,
+    /// The visual index of the row in the queue list, used for drag reorder.
+    index: int,
     /// The position of the entry in the active queue.
     position: int,
     title: string,

@@ -97,6 +97,14 @@ impl ToolPaths {
         let name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
         self.root.join(name)
     }
+
+    /// Path where a downloaded update is staged before it replaces the tool.
+    pub fn staged_binary(&self) -> PathBuf {
+        let mut name = self.managed_binary();
+        let suffix = if cfg!(windows) { "new.exe" } else { "new" };
+        name.set_extension(suffix);
+        name
+    }
 }
 
 /// Looks for a managed `yt-dlp` first, then one on `PATH`.

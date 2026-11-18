@@ -8,6 +8,10 @@ export component TopBar inherits Rectangle {
     callback pointer-activity();
     callback brand-clicked();
 
+    public function blur-url() {
+        url-input.clear-focus();
+    }
+
     height: Theme.bar-height;
     background: Theme.panel;
 

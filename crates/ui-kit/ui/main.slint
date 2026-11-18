@@ -15,6 +15,10 @@ import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
 import { StreamItem, QueueItem, HistoryItem, BufferedRange } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
+import "../fonts/NotoSansCJKsc-VF.ttf";
+import "../fonts/NotoSansSymbols2.ttf";
+import "../fonts/NotoColorEmoji.ttf";
+import "../fonts/STIXTwoMath.ttf";
 
 // The shell of the player: a URL bar on top, the video below it.
 //
@@ -76,9 +80,12 @@ export component MainWindow inherits Window {
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
     in-out property <bool> update-open: false;
+    in property <string> update-title: "Update available";
     in property <string> update-version: "";
     in property <string> update-notes: "";
+    in property <string> update-action-label: "Yes, download and install";
     in-out property <bool> update-installing: false;
+    in-out property <string> update-status-text: "Downloading update…";
     in property <string> update-error: "";
     // The progress of the download of an update package.
     in-out property <float> update-download-progress: 0;
@@ -88,6 +95,11 @@ export component MainWindow inherits Window {
     in-out property <bool> queue-open: false;
     in property <[QueueItem]> queue-items: [];
     in property <int> queue-current-index: -1;
+    in property <int> queue-current-id: -1;
+    in property <int> queue-long-press-index: -1;
+    in-out property <length> queue-content-y: 0px;
+    in-out property <length> queue-drag-pointer-y: 0px;
+    in-out property <bool> queue-drag-scroll-tick: false;
     in-out property <bool> history-open: false;
     in property <[HistoryItem]> history-items: [];
 
@@ -113,6 +125,9 @@ export component MainWindow inherits Window {
     callback queue-item-selected(int);
     callback queue-copy-url(string);
     callback queue-remove-entry(int);
+    callback queue-move-requested(int, int);
+    callback queue-row-pressed(int);
+    callback queue-row-released(int);
     callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
@@ -207,7 +222,7 @@ export component MainWindow inherits Window {
     }
 
     // Top bar with URL field
-    TopBar {
+    top-bar := TopBar {
         x: 0;
         y: 0;
         width: parent.width;
@@ -215,6 +230,10 @@ export component MainWindow inherits Window {
         load-requested => { root.load-requested(); }
         pointer-activity => { root.pointer-activity(); }
         brand-clicked => { root.sidebar-open = !root.sidebar-open; }
+    }
+
+    public function blur-url() {
+        top-bar.blur-url();
     }
 
     // Control bar
@@ -311,10 +330,18 @@ export component MainWindow inherits Window {
         height: parent.height;
         items: root.queue-items;
         current-index: root.queue-current-index;
+        current-id: root.queue-current-id;
+        long-press-index: root.queue-long-press-index;
+        queue-content-y <=> root.queue-content-y;
+        drag-pointer-y <=> root.queue-drag-pointer-y;
+        drag-scroll-tick: root.queue-drag-scroll-tick;
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
         copy-url(url) => { root.queue-copy-url(url); }
         remove-entry(id) => { root.queue-remove-entry(id); }
+        move-requested(src, tgt) => { root.queue-move-requested(src, tgt); }
+        queue-row-pressed(index) => { root.queue-row-pressed(index); }
+        queue-row-released(index) => { root.queue-row-released(index); }
         dismissed => { root.queue-open = false; }
     }
 
@@ -329,19 +356,26 @@ export component MainWindow inherits Window {
     }
 
     if root.update-open: Rectangle {
-        width: parent.width; height: parent.height;
+        width: parent.width;
+        height: parent.height;
         background: #00000099;
         Rectangle {
-            x: (parent.width - min(560px, parent.width - 40px)) / 2;
-            y: (parent.height - min(460px, parent.height - 40px)) / 2;
-            width: min(560px, parent.width - 40px); height: min(460px, parent.height - 40px);
-            background: Theme.panel; border-radius: 12px; border-width: 1px; border-color: Theme.border;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(560px, parent.width - 40px);
+            height: min(460px, parent.height - 40px);
+            background: Theme.panel;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.border;
             VerticalLayout {
-                padding: 22px; spacing: 12px;
+                padding: 22px;
+                spacing: 12px;
                 Text {
-                    text: root.update-installing ? "Installing update…" : "Flatline update available";
+                    text: root.update-installing ? root.update-status-text : root.update-title;
                     color: Theme.fg;
                     font-size: 20px;
+                    wrap: word-wrap;
                 }
                 Text {
                     text: "Version " + root.update-version;
@@ -352,7 +386,7 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         padding-right: 12px;
                         Text {
-                            text: root.update-notes;
+                            text: root.update-notes == "" ? "No release notes provided." : root.update-notes;
                             color: Theme.fg;
                             wrap: word-wrap;
                         }
@@ -363,31 +397,32 @@ export component MainWindow inherits Window {
                     alignment: center;
                     spacing: 10px;
                     Text {
-                        text: root.update-download-progress >= 1.0 ? "Installing…" : "Downloading update…";
+                        text: root.update-status-text;
                         color: Theme.muted;
                         horizontal-alignment: center;
+                        wrap: word-wrap;
                     }
                     Rectangle {
                         height: 10px;
                         border-radius: 5px;
                         background: Theme.border;
-                        HorizontalLayout {
-                            padding: 2px;
-                            Rectangle {
-                                width: max(0px, (parent.width - 4px) * root.update-download-progress);
-                                height: 6px;
-                                border-radius: 3px;
-                                background: Theme.accent;
-                            }
+                        Rectangle {
+                            x: 2px;
+                            y: 2px;
+                            width: max(0px, (parent.width - 4px) * clamp(root.update-download-progress, 0.0, 1.0));
+                            height: parent.height - 4px;
+                            border-radius: 3px;
+                            background: Theme.accent;
                         }
                     }
                     Text {
-                        text: Math.round(root.update-download-progress * 100) + "%";
+                        text: Math.round(clamp(root.update-download-progress, 0.0, 1.0) * 100) + "%";
                         color: Theme.muted;
                         font-size: 12px;
                         horizontal-alignment: center;
                     }
-                }                if root.update-error != "": Text {
+                }
+                if root.update-error != "": Text {
                     text: root.update-error;
                     color: Theme.danger;
                     wrap: word-wrap;
@@ -396,26 +431,72 @@ export component MainWindow inherits Window {
                     alignment: end;
                     spacing: 8px;
                     if !root.update-installing && root.update-error == "": Rectangle {
-                        width: 80px; height: 34px;
-                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        width: 80px;
+                        height: 34px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
                         background: btn1.pressed ? Theme.elevated : (btn1.has-hover ? Theme.elevated : Theme.panel);
-                        Text { text: "No"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                        btn1 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                        Text {
+                            text: "No";
+                            color: Theme.fg;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        btn1 := TouchArea {
+                            clicked => {
+                                root.update-open = false;
+                                root.update-dismissed();
+                            }
+                        }
                     }
                     if !root.update-installing && root.update-error == "": Rectangle {
-                        width: 200px; height: 34px;
-                        border-radius: 6px; border-width: 1px; border-color: Theme.accent;
+                        width: 220px;
+                        height: 34px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.accent;
                         background: btn2.pressed ? #5a9bf5 : (btn2.has-hover ? #5a9bf5 : Theme.accent);
-                        Text { text: "Yes, download and install"; color: Theme.on-accent; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                        btn2 := TouchArea { clicked => { root.update-installing = true; root.update-accepted(); } }
+                        Text {
+                            text: root.update-action-label;
+                            color: Theme.on-accent;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        btn2 := TouchArea {
+                            clicked => {
+                                root.update-installing = true;
+                                root.update-status-text = "Downloading update…";
+                                root.update-download-progress = 0.0;
+                                root.update-accepted();
+                            }
+                        }
                     }
-                    if root.update-installing: ProgressIndicator { indeterminate: false; }
+                    if root.update-installing && root.update-error == "": ProgressIndicator {
+                        indeterminate: root.update-download-progress <= 0.0 || root.update-download-progress >= 1.0;
+                    }
                     if root.update-error != "": Rectangle {
-                        width: 80px; height: 34px;
-                        border-radius: 6px; border-width: 1px; border-color: Theme.border;
+                        width: 80px;
+                        height: 34px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
                         background: btn3.pressed ? Theme.elevated : (btn3.has-hover ? Theme.elevated : Theme.panel);
-                        Text { text: "Close"; color: Theme.fg; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
-                        btn3 := TouchArea { clicked => { root.update-open = false; root.update-dismissed(); } }
+                        Text {
+                            text: "Close";
+                            color: Theme.fg;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        btn3 := TouchArea {
+                            clicked => {
+                                root.update-open = false;
+                                root.update-dismissed();
+                            }
+                        }
                     }
                 }
             }
