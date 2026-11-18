@@ -82,6 +82,7 @@ impl Loading {
         self.phase = Phase::Resolving;
         self.status = Status::Busy(RESOLVING);
         self.current_file = false;
+        self.suppress_eof();
     }
 
     /// The URL resolved and the player was given a plan to play.
@@ -89,6 +90,7 @@ impl Loading {
         self.phase = Phase::Starting;
         self.status = Status::Busy(BUFFERING);
         self.current_file = false;
+        self.suppress_eof();
     }
 
     /// Shows progress while the next item in the active queue is prepared.
@@ -96,6 +98,15 @@ impl Loading {
         self.phase = Phase::Resolving;
         self.status = Status::Busy(PARSING_NEXT);
         self.current_file = false;
+        self.suppress_eof();
+    }
+
+    /// Ignores a stale end-of-file from media that is no longer the active one.
+    ///
+    /// The suppression stays in effect while mpv keeps reporting EOF and is
+    /// cleared automatically once that EOF state goes away.
+    pub fn suppress_eof(&mut self) {
+        self.eof_consumed = true;
     }
 
     /// Resolving the URL failed.

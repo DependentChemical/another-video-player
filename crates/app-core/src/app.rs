@@ -26,7 +26,7 @@ use crate::timeline::{LiveAxis, Timeline};
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A URL was resolved and can start playing.
-    Resolved(Result<ResolvedMedia, String>),
+    Resolved(Result<ResolvedMedia, (String, String)>),
     /// A URL was resolved while something else plays, so the user decides.
     Pending(Result<PendingMedia, String>),
     /// A newer `yt-dlp` was downloaded and is now in use.
@@ -408,6 +408,20 @@ impl App {
         self.state.lock().expect("the state is not poisoned").current_url.clone()
     }
 
+    /// Whether a resolved result for `url` still belongs to the active playback.
+    ///
+    /// A result is relevant while it matches the in-flight resolve or the URL of
+    /// the queue entry that is current now.
+    pub fn expects_resolved_url(&self, url: &str) -> bool {
+        if self.resolving_url().as_deref() == Some(url) {
+            return true;
+        }
+        match self.queue.current() {
+            Ok(Some(entry)) => entry.url == url,
+            Ok(None) | Err(_) => false,
+        }
+    }
+
     /// Resolves the URL read from the active queue in the background.
     fn resolve_play(&self, url: String) {
         // Track the URL being resolved for retry purposes
@@ -425,7 +439,7 @@ impl App {
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(&resolver, &session, &url, &sender)
-                .map_err(|error| error.to_string())
+                .map_err(|error| (url.clone(), error.to_string()))
                 .map(|source| {
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
@@ -476,6 +490,7 @@ impl App {
     /// Plays the pending media right away, replacing the active queue.
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
+        self.interrupt_playback();
         let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
@@ -539,7 +554,7 @@ impl App {
         thumbnail_url: Option<&str>,
         uploader: Option<&str>,
     ) {
-        self.clear_retry();
+        self.interrupt_playback();
         if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
         {
             crate::diag::note(&format!("the active queue could not be written: {error}"));
@@ -798,10 +813,14 @@ impl App {
     }
 
     /// Starts the entry with `id` and marks it as the current one.
+    ///
+    /// Any playback, resolve, or retry tied to the previously active media is
+    /// abandoned first so the selected entry plays immediately and a stale end
+    /// of the previous media cannot advance the queue past it.
     pub fn play_queue_entry(&self, id: i64) -> bool {
         match self.queue.set_current(id) {
             Ok(()) => {
-                self.clear_retry();
+                self.interrupt_playback();
                 self.consume_current();
                 true
             }
@@ -810,6 +829,21 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Stops the current playback and clears transient state tied to it.
+    fn interrupt_playback(&self) {
+        let _ = self.engine.stop();
+        self.clear_retry();
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        state.pending_restore = PendingRestore::default();
+        state.resolving_url = None;
+        state.current_id_hash = None;
+        state.current_url = None;
+        state.current_title = None;
+        state.current_thumbnail_url = None;
+        state.current_uploader = None;
+        state.last_history_save = None;
     }
 
     /// Removes an entry from the active queue.
@@ -1007,12 +1041,25 @@ impl App {
         // Compute id_hash for history tracking
         let id_hash = media_model::video_id_hash(url);
 
-        // Check history for saved playback position (only for non-live videos)
-        let history_position = if !source.is_live {
+        // Check history for saved playback position (only for non-live videos).
+        // A saved position that would land within 5 seconds of the end is treated
+        // as fully watched and reset so playback starts from the beginning.
+        let mut history_position = if !source.is_live {
             self.queue.history_get(&id_hash).ok().flatten().map(|entry| entry.position_seconds)
         } else {
             None
         };
+        if let (Some(position), Some(duration)) = (history_position, source.duration)
+            && duration.is_finite()
+            && duration > 0.0
+            && position.is_finite()
+            && position >= (duration - 5.0).max(0.0)
+        {
+            history_position = None;
+            if let Err(error) = self.queue.history_reset_position(&id_hash) {
+                crate::diag::note(&format!("failed to reset history position: {error}"));
+            }
+        }
 
         {
             let mut state = self.state.lock().expect("the state is not poisoned");

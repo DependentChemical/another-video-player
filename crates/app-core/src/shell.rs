@@ -544,6 +544,12 @@ fn tick(
                 let Some(loaded) =
                     app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at)
                 else {
+                    if !app.expects_resolved_url(&url) {
+                        crate::diag::note(
+                            "discarded a resolved video that is no longer relevant to playback",
+                        );
+                        continue;
+                    }
                     crate::diag::note(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
@@ -574,10 +580,16 @@ fn tick(
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err(error)) => {
+            Message::Resolved(Err((url, error))) => {
+                if !app.expects_resolved_url(&url) {
+                    crate::diag::note(
+                        "ignored a resolver error that is no longer relevant to playback",
+                    );
+                    continue;
+                }
                 loading.resolve_failed(error.clone());
                 // Schedule a retry for resolver errors
-                if let Some(url) = app.resolving_url() {
+                if app.resolving_url().as_deref() == Some(url.as_str()) {
                     app.handle_resolver_error(url, error);
                 } else {
                     ui.show_toast(&error);
