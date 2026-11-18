@@ -33,5 +33,16 @@
       }
     }
     }
+  },
+  "Player-Settings": {
+    "display-name": "Player Settings",
+    "Pre-Buffer": {
+      "display-name": "Pre-Buffer Duration",
+      "description": "Seconds of content to buffer before starting playback",
+      "type": "integer",
+      "minimum": 0,
+      "default": 10,
+      "value": null
+    }
   }
 }

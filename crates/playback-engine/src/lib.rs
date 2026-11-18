@@ -166,10 +166,15 @@ impl Engine {
     /// Downloaded media is kept in an append-only cache file below
     /// `cache_dir`, so a paused or scrubbed media is buffered to disk instead
     /// of being thrown away. The directory is created when it is missing.
-    pub fn new(cache_dir: impl AsRef<Path>) -> Result<Engine, Error> {
+    ///
+    /// `pre_buffer_seconds` controls how many seconds of content are buffered
+    /// before playback starts. A value of 0 disables the initial wait.
+    pub fn new(cache_dir: impl AsRef<Path>, pre_buffer_seconds: u32) -> Result<Engine, Error> {
         let cache_dir = cache_dir.as_ref();
         std::fs::create_dir_all(cache_dir).map_err(Error::Cache)?;
         let cache_dir = cache_dir.to_string_lossy();
+
+        let pre_buffer = pre_buffer_seconds.to_string();
 
         let mpv = rsmpv::Mpv::builder()?
             .set_property("vo", "libmpv")?
@@ -193,6 +198,13 @@ impl Engine {
             .set_property("cache-secs", CACHE_SECONDS)?
             .set_property("demuxer-max-bytes", DEMUXER_MAX_BYTES)?
             .set_property("demuxer-max-back-bytes", DEMUXER_MAX_BYTES)?
+            // Wait for at least pre_buffer_seconds of content before starting
+            // playback. `cache-pause-initial` (default yes) pauses initially until
+            // the readahead buffer is filled; `demuxer-readahead-secs` sets the
+            // target fill level in seconds.
+            .set_property("cache-pause-initial", "yes")?
+            .set_property("demuxer-readahead-secs", pre_buffer.as_str())?
+            .set_property("cache-pause-wait", pre_buffer.as_str())?
             .build()?;
 
         // mpv does not deliver file lifecycle events until they are requested.
@@ -526,7 +538,7 @@ mod tests {
     #[test]
     fn a_new_engine_is_idle_and_has_no_duration() {
         // Creating an engine needs libmpv; skip the test when it is absent.
-        let Ok(engine) = Engine::new(cache_dir()) else {
+        let Ok(engine) = Engine::new(cache_dir(), 10) else {
             return;
         };
         assert!(engine.is_idle());
@@ -535,7 +547,7 @@ mod tests {
 
     #[test]
     fn a_new_engine_is_neither_active_nor_buffering() {
-        let Ok(engine) = Engine::new(cache_dir()) else {
+        let Ok(engine) = Engine::new(cache_dir(), 10) else {
             return;
         };
         assert!(!engine.is_active());
@@ -544,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_new_engine_has_no_seekable_live_edge() {
-        let Ok(engine) = Engine::new(cache_dir()) else {
+        let Ok(engine) = Engine::new(cache_dir(), 10) else {
             return;
         };
         assert_eq!(engine.seekable_end(), None);

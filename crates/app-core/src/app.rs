@@ -338,12 +338,13 @@ impl App {
         // Crash or unclean shutdown may have left cache files behind.
         // Clear them before creating the engine so mpv never sees stale data.
         clear_stream_buffer(&stream_buffer);
-        let engine =
-            Engine::new(&stream_buffer).map_err(|error| Error::Engine(error.to_string()))?;
         let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
         let resolver = Resolver::new(command_spec(ytdlp, &paths.cookies()));
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
+        let pre_buffer_seconds = settings.pre_buffer_seconds().0;
+        let engine =
+            Engine::new(&stream_buffer, pre_buffer_seconds).map_err(|error| Error::Engine(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
