@@ -421,10 +421,14 @@ impl ThumbnailCache {
     /// Removes every image file in the cache directory that does not belong
     /// to a row in `thumbnail_cache`, plus any scratch file left behind.
     ///
+    /// Files whose id is still referenced by the active queue are kept even if
+    /// their cache row is missing, so a crash that lost the row does not wipe
+    /// thumbnails that can be repaired.
+    ///
     /// This is the start-up orphan cleanup and is meant to run in the
     /// background.
     pub fn prune_orphans(&self) -> Result<(), Error> {
-        let referenced = self
+        let (referenced, protected_ids) = self
             .db
             .with_connection(|connection| {
                 let mut statement = connection
@@ -444,7 +448,19 @@ impl ThumbnailCache {
                         }
                     }
                 }
-                Ok(names)
+
+                let mut protected = HashSet::new();
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT thumbnail FROM active_queue
+                     WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                for id in rows.flatten() {
+                    if id.starts_with(THUMBNAIL_ID_PREFIX) {
+                        protected.insert(id);
+                    }
+                }
+                Ok((names, protected))
             })
             .map_err(Error::from)?;
 
@@ -463,10 +479,54 @@ impl ThumbnailCache {
                 None => continue,
             };
             if !referenced.contains(name) {
+                let id = name
+                    .strip_suffix(".mid.jpg")
+                    .or_else(|| name.strip_suffix(".small.jpg"))
+                    .or_else(|| name.strip_suffix(".jpg"))
+                    .unwrap_or(name);
+                if protected_ids.contains(id) {
+                    continue;
+                }
                 let _ = fs::remove_file(&path);
             }
         }
         Ok(())
+    }
+
+    /// Recreates a missing `thumbnail_cache` row for `id` when its files exist.
+    ///
+    /// This repairs thumbnails whose files survived a crash but whose database
+    /// record did not, so the active queue can show them without downloading
+    /// them again.
+    pub fn repair_row(&self, id: &str) -> Result<bool, Error> {
+        if self.thumbnail_exists(id)? {
+            return Ok(true);
+        }
+        let full = self.full_file(id);
+        let mid = self.mid_file(id);
+        let small = self.small_file(id);
+        if !full.is_file() || !mid.is_file() || !small.is_file() || !is_renderable_jpeg(&full) {
+            return Ok(false);
+        }
+        let now = unix_time();
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT OR IGNORE INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id,
+                        Option::<String>::None,
+                        full.to_string_lossy(),
+                        mid.to_string_lossy(),
+                        small.to_string_lossy(),
+                        now,
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)?;
+        Ok(true)
     }
 
     /// Removes scratch files left behind by an interrupted download.

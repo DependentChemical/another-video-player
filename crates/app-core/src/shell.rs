@@ -147,6 +147,7 @@ impl Shell {
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
                     ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
                     ui_for_pending.set_media_title(&loaded.title);
                     ui_for_pending
                         .set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
@@ -175,6 +176,7 @@ impl Shell {
             ui.on_pending_queue(move || {
                 let _ = app.queue_pending();
                 ui_for_pending.set_url("");
+                ui_for_pending.blur_url();
             });
         }
         {
@@ -275,9 +277,12 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
+            let ui_for_sources = Rc::clone(&ui);
             ui.on_sources_applied(move |video, audio, muxed| {
                 drain_engine_events(&app, &mut loading.borrow_mut());
                 loading.borrow_mut().sources_switching();
+                ui_for_sources
+                    .set_audio_only(video.is_none() && muxed.is_none() && audio.is_some());
                 app.select_sources(video, audio, muxed);
             });
         }
@@ -591,9 +596,10 @@ fn tick(
                 }
             }
             Message::SigningIn(service) => {
-                // The sign-in happens in a window of its own; the player only
-                // says why that window is there.
-                ui.show_toast(&format!("Sign in to {service} to continue"));
+                ui.show_toast(&format!("Sign in to {} to continue", service.label()));
+            }
+            Message::RegeneratingCookies(service) => {
+                ui.show_toast(&format!("Regenerating cookies.txt for {}", service.name()));
             }
             Message::UpdateAvailable(update) => {
                 ui.show_update(&update.version, &update.notes);

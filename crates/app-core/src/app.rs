@@ -33,6 +33,8 @@ pub enum Message {
     ToolUpdated(String),
     /// A service asks the user to sign in.
     SigningIn(Service),
+    /// The cookie file for a service is being regenerated.
+    RegeneratingCookies(Service),
     /// A newer application release is available.
     UpdateAvailable(updater::Update),
     /// The accepted update is downloading; carries the fraction, from zero to one.
@@ -628,7 +630,19 @@ impl App {
             // Files left behind that no cache row references are deleted first.
             let _ = cache.prune_orphans();
 
+            // A crash can leave the image files on disk without their cache row.
+            // Recreate any missing row the active queue still points at so the
+            // thumbnails are not downloaded again on the next start.
+            if let Ok(entries) = queue.entries() {
+                for entry in &entries {
+                    if let Some(id) = entry.thumbnail_id() {
+                        let _ = cache.repair_row(id);
+                    }
+                }
+            }
+
             if legacy.is_empty() {
+                let _ = cache.release_unreferenced_thumbnails();
                 return;
             }
 
@@ -1690,7 +1704,8 @@ fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
 /// window first. A successful sign-in is followed by one fresh resolve; if the
 /// user closes the window or the helper cannot run, the original challenge is
 /// returned so the normal retry flow can continue and a later challenge can
-/// ask again.
+/// ask again. If the user declines to sign in, cookie regeneration is skipped
+/// and the resolve continues with the same retry flow without new cookies.
 fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
@@ -1704,16 +1719,14 @@ fn resolve_with_session(
     let Some(service) = web_session::challenge_service(url, &error) else {
         return Err(error);
     };
-    // The helper opens a window of its own; the player says why it is there.
-    let _ = notice.send(Box::new(Message::SigningIn(service)));
-    if let Err(problem) = session.sign_in(service, url) {
-        // The helper's failure is the reason the challenge could not be
-        // answered, so it is reported alongside the resolver error instead of
-        // being swallowed: an invisible sign-in would otherwise look like the
-        // player simply ignoring the challenge.
-        return Err(format!("{error} ({problem})"));
+    match session.sign_in(service, url, notice) {
+        Ok(()) => resolver.resolve(url).map_err(|error| error.to_string()),
+        Err(crate::session::Error::Declined) => {
+            let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
+            Err(error)
+        }
+        Err(problem) => Err(format!("{error} ({problem})")),
     }
-    resolver.resolve(url).map_err(|error| error.to_string())
 }
 
 /// Everything that can go wrong while running the application.

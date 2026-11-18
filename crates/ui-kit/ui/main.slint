@@ -219,7 +219,7 @@ export component MainWindow inherits Window {
     }
 
     // Top bar with URL field
-    TopBar {
+    top-bar := TopBar {
         x: 0;
         y: 0;
         width: parent.width;
@@ -227,6 +227,10 @@ export component MainWindow inherits Window {
         load-requested => { root.load-requested(); }
         pointer-activity => { root.pointer-activity(); }
         brand-clicked => { root.sidebar-open = !root.sidebar-open; }
+    }
+
+    public function blur-url() {
+        top-bar.blur-url();
     }
 
     // Control bar

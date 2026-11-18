@@ -365,6 +365,11 @@ impl PlayerUi {
         self.window.set_url(url.into());
     }
 
+    /// Removes focus from the URL bar so it shows its placeholder when empty.
+    pub fn blur_url(&self) {
+        self.window.invoke_blur_url();
+    }
+
     /// The title of the media that is playing.
     pub fn set_media_title(&self, title: &str) {
         self.window.set_media_title(display_title(title).as_ref().into());

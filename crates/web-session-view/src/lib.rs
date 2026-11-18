@@ -10,7 +10,7 @@
 //! should never be able to take the player down with it.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -45,6 +45,8 @@ pub enum Error {
     TimedOut(&'static str),
     /// The user closed the sign-in window.
     Cancelled,
+    /// The user chose not to sign in.
+    SignInDeclined,
     /// The profile holds no cookies for the service.
     NoCookies(Service),
     /// The cookie file could not be written.
@@ -57,6 +59,7 @@ impl fmt::Display for Error {
             Error::Webview(error) => write!(formatter, "the webview failed: {error}"),
             Error::TimedOut(what) => write!(formatter, "{what} did not finish in time"),
             Error::Cancelled => write!(formatter, "the sign-in window was closed"),
+            Error::SignInDeclined => write!(formatter, "the sign-in was declined"),
             Error::NoCookies(service) => write!(formatter, "no {service} cookies were found"),
             Error::Io(error) => write!(formatter, "the cookie file could not be written: {error}"),
         }
@@ -68,7 +71,9 @@ impl std::error::Error for Error {
         match self {
             Error::Webview(error) => Some(error),
             Error::Io(error) => Some(error),
-            Error::TimedOut(_) | Error::Cancelled | Error::NoCookies(_) => None,
+            Error::TimedOut(_) | Error::Cancelled | Error::SignInDeclined | Error::NoCookies(_) => {
+                None
+            }
         }
     }
 }
@@ -87,6 +92,12 @@ impl From<io::Error> for Error {
 
 /// The result of a session.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Reports a session event to the parent process.
+fn emit_event(name: &str) {
+    println!("event:{name}");
+    let _ = io::stdout().flush();
+}
 
 /// Opens the webview, signs in when needed and writes the cookie file.
 ///
@@ -154,11 +165,15 @@ fn session(window: &WebviewWindow, options: &Options, closed: &AtomicBool) -> Re
         Wait::SignedIn => {}
         Wait::Cancelled => return Err(Error::Cancelled),
         Wait::TimedOut => {
+            emit_event("sign-in-required");
             show_sign_in(window, options.service)?;
             window.navigate(login_url(options.service))?;
             match wait_for_sign_in(window, options.service, SIGN_IN_TIMEOUT, closed) {
                 Wait::SignedIn => {}
-                Wait::Cancelled => return Err(Error::Cancelled),
+                Wait::Cancelled => {
+                    emit_event("declined");
+                    return Err(Error::SignInDeclined);
+                }
                 Wait::TimedOut => return Err(Error::TimedOut("the sign-in")),
             }
         }
@@ -166,6 +181,7 @@ fn session(window: &WebviewWindow, options: &Options, closed: &AtomicBool) -> Re
 
     // Loading the target lets the service refresh the cookies that only a
     // real playback page sets before yt-dlp reads the file.
+    emit_event("regenerating");
     window.hide()?;
     window.navigate(options.target.clone())?;
     wait_for_load(window, &options.target, LOAD_TIMEOUT, closed);
