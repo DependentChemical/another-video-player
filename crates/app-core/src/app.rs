@@ -652,6 +652,70 @@ impl App {
         }
     }
 
+    /// Plays the previous media in the queue, if there is one.
+    ///
+    /// This moves the current mark backward and resolves the entry it lands on.
+    pub fn previous(&self) -> bool {
+        match self.queue.current() {
+            Ok(Some(current)) => match self.queue.previous_before(current.position) {
+                Ok(Some(previous)) => {
+                    if let Err(error) = self.queue.set_current(previous.id) {
+                        crate::diag::note(&format!(
+                            "the active queue could not be written: {error}"
+                        ));
+                        return false;
+                    }
+                    self.interrupt_playback();
+                    self.clear_retry();
+                    self.consume_current();
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    crate::diag::note(&format!("the active queue could not be read: {error}"));
+                    false
+                }
+            },
+            Ok(None) => false,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
+            }
+        }
+    }
+
+    /// Plays the next media in the queue, if there is one.
+    ///
+    /// This moves the current mark forward and resolves the entry it lands on.
+    pub fn next(&self) -> bool {
+        match self.queue.current() {
+            Ok(Some(current)) => match self.queue.next_after(current.position) {
+                Ok(Some(next)) => {
+                    if let Err(error) = self.queue.set_current(next.id) {
+                        crate::diag::note(&format!(
+                            "the active queue could not be written: {error}"
+                        ));
+                        return false;
+                    }
+                    self.interrupt_playback();
+                    self.clear_retry();
+                    self.consume_current();
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    crate::diag::note(&format!("the active queue could not be read: {error}"));
+                    false
+                }
+            },
+            Ok(None) => false,
+            Err(error) => {
+                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                false
+            }
+        }
+    }
+
     /// Starts the media the queue left as current, if there is one.
     ///
     /// This is what the program calls on startup so a queue that was filled

@@ -489,6 +489,24 @@ impl Shell {
             let handle = Rc::clone(&ui);
             ui.on_fullscreen_toggled(move || handle.toggle_fullscreen());
         }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            ui.on_previous_requested(move || {
+                if app.previous() {
+                    loading.borrow_mut().resolve_started();
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            ui.on_next_requested(move || {
+                if app.next() {
+                    loading.borrow_mut().resolve_started();
+                }
+            });
+        }
         let spinner_step = Rc::new(Cell::new(0u32));
         {
             let last_pointer_activity = Rc::clone(&last_pointer_activity);

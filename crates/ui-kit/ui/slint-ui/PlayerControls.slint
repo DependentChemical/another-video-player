@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, PreviousButton, NextButton, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
 import { BufferedRange } from "types.slint";
 
 export component PlayerControls inherits Rectangle {
@@ -26,6 +26,8 @@ export component PlayerControls inherits Rectangle {
     callback controls-hovered(bool);
     callback interacting-changed(bool);
     callback sources-toggled();
+    callback previous-requested();
+    callback next-requested();
 
     width: root.width;
     height: Theme.controls-height;
@@ -59,13 +61,56 @@ export component PlayerControls inherits Rectangle {
             spacing: 12px;
             cross-axis-alignment: center;
 
-            PlayPauseButton {
-                width: 44px;
+            // Grouped Previous / PlayPause / Next buttons as a single visual unit.
+            // The container clips the inner buttons so only the outer corners are rounded.
+            playback-controls := Rectangle {
                 height: 32px;
-                playing: root.playing;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.play-toggled();
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+                background: Theme.panel;
+
+                HorizontalLayout {
+                    spacing: 0px;
+
+                    PreviousButton {
+                        width: 44px;
+                        height: 32px;
+                        pointer-activity => { root.pointer-activity(); }
+                        clicked => {
+                            root.previous-requested();
+                        }
+                    }
+
+                    Rectangle {
+                        width: 1px;
+                        background: Theme.border;
+                    }
+
+                    PlayPauseButton {
+                        width: 44px;
+                        height: 32px;
+                        playing: root.playing;
+                        pointer-activity => { root.pointer-activity(); }
+                        clicked => {
+                            root.play-toggled();
+                        }
+                    }
+
+                    Rectangle {
+                        width: 1px;
+                        background: Theme.border;
+                    }
+
+                    NextButton {
+                        width: 44px;
+                        height: 32px;
+                        pointer-activity => { root.pointer-activity(); }
+                        clicked => {
+                            root.next-requested();
+                        }
+                    }
                 }
             }
 

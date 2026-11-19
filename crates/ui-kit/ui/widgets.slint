@@ -87,6 +87,16 @@ export component ReplayIcon inherits Icon {
     glyph: "\u{e059}";
 }
 
+// The triangle that points to the previous track.
+export component PreviousIcon inherits Icon {
+    glyph: "\u{e044}";
+}
+
+// The triangle that points to the next track.
+export component NextIcon inherits Icon {
+    glyph: "\u{e045}";
+}
+
 // The three vertical dots that open extra options.
 export component MoreIcon inherits Icon {
     glyph: "\u{e5d4}";
@@ -213,6 +223,66 @@ export component PlayPauseButton inherits Rectangle {
             width: 16px;
             height: 16px;
         }
+    }
+
+    touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The button that goes to the previous item in the queue.
+export component PreviousButton inherits Rectangle {
+    callback clicked();
+    callback pointer-activity();
+
+    width: 44px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
+
+    PreviousIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+    }
+
+    touch := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.move { root.pointer-activity(); }
+        }
+        moved => { root.pointer-activity(); }
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// The button that goes to the next item in the queue.
+export component NextButton inherits Rectangle {
+    callback clicked();
+    callback pointer-activity();
+
+    width: 44px;
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.border;
+    background: touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel);
+
+    NextIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
     }
 
     touch := TouchArea {

@@ -717,6 +717,27 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// The entry that plays directly before `position`, if there is one.
+    ///
+    /// The positions never move when an entry is removed, so the caller can
+    /// ask this after deleting the current entry to find its predecessor.
+    pub fn previous_before(&self, position: i64) -> Result<Option<QueueEntry>, Error> {
+        self.db
+            .with_connection(|connection| {
+                let table = active_table(connection)?;
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT {COLUMNS} FROM {table} WHERE position < ?1 ORDER BY position DESC LIMIT 1"
+                        ),
+                        params![position],
+                        entry_from_row,
+                    )
+                    .optional()
+            })
+            .map_err(Error::from)
+    }
+
     /// Every playlist, with the built-in active queue first.
     ///
     /// User playlists are ordered by name; their ids stay the stable way to
