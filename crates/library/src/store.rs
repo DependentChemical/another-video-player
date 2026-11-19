@@ -844,8 +844,9 @@ mod tests {
         let queue = queue();
         let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
         let third = queue.push("https://example.com/c", "C", None, None, None).expect("push works");
-        let second =
-            queue.push_next("https://example.com/b", "B", None, None, None).expect("push next works");
+        let second = queue
+            .push_next("https://example.com/b", "B", None, None, None)
+            .expect("push next works");
 
         assert_eq!(second.position, 1);
         assert!(!second.current);

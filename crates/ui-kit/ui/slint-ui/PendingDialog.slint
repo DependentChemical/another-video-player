@@ -153,7 +153,7 @@ export component PendingDialog inherits Rectangle {
                             right-touch := TouchArea {
                                 clicked => {
                                     root.menu-anchor-x = split-button.absolute-position.x - pending-panel.absolute-position.x;
-                                    root.menu-anchor-y = split-button.absolute-position.y - pending-panel.absolute-position.y + split-button.height + 4px;
+                                    root.menu-anchor-y = split-button.absolute-position.y - pending-panel.absolute-position.y + split-button.height + 2px;
                                     root.options-open = !root.options-open;
                                 }
                             }
@@ -190,7 +190,7 @@ export component PendingDialog inherits Rectangle {
 
             Rectangle {
                 x: min(max(8px, root.menu-anchor-x), pending-panel.width - self.width - 8px);
-                y: min(root.menu-anchor-y, pending-panel.height - self.height - 8px);
+                y: root.menu-anchor-y;
                 width: menu-layout.preferred-width;
                 height: menu-layout.preferred-height;
                 background: Theme.panel;
