@@ -212,6 +212,22 @@ pub struct QueueListEntry {
     pub url: String,
 }
 
+/// One entry of the playlist list shown in the playlist dialog.
+///
+/// The built-in active queue is included with [`PlaylistListEntry::is_active_queue`]
+/// set, so the interface can list and pick it exactly like a user playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistListEntry {
+    /// The stable id handed back when the playlist is picked.
+    pub id: String,
+    /// The name shown to the user.
+    pub name: String,
+    /// Whether this is the playlist the player is on.
+    pub active: bool,
+    /// Whether this is the built-in active queue.
+    pub is_active_queue: bool,
+}
+
 /// One entry of the playback history shown in the history dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryListEntry {
@@ -561,13 +577,59 @@ impl PlayerUi {
     /// Opens the dialog that asks what to do with a resolved media.
     ///
     /// The thumbnail is read from disk; when it is missing or cannot be
-    /// decoded the dialog simply shows no picture.
-    pub fn show_pending(&self, title: &str, thumbnail: Option<&Path>) {
+    /// decoded the dialog simply shows no picture. `in_playlist` tells the
+    /// dialog whether the active queue or a user playlist is on screen, so its
+    /// labels say "queue" or "playlist" accordingly.
+    pub fn show_pending(
+        &self,
+        title: &str,
+        thumbnail: Option<&Path>,
+        in_playlist: bool,
+        playlists: &[PlaylistListEntry],
+    ) {
+        self.set_playlists(playlists);
         self.window.set_pending_title(display_title(title).as_ref().into());
+        self.window.set_pending_in_playlist(in_playlist);
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
         self.window.set_pending_thumbnail(image);
         self.window.set_pending_open(true);
+    }
+
+    /// Offers the playlists to the pending dialog and every playlist picker.
+    pub fn set_playlists(&self, playlists: &[PlaylistListEntry]) {
+        let items: Vec<PlaylistItem> = playlists
+            .iter()
+            .map(|playlist| PlaylistItem {
+                id: playlist.id.as_str().into(),
+                name: display_title(&playlist.name).as_ref().into(),
+                active: playlist.active,
+                is_active_queue: playlist.is_active_queue,
+            })
+            .collect();
+        self.window.set_playlist_items(slint::ModelRc::new(slint::VecModel::from(items)));
+    }
+
+    /// Opens the list of playlists.
+    pub fn show_playlists(&self, playlists: &[PlaylistListEntry]) {
+        self.set_playlists(playlists);
+        self.window.set_create_playlist_open(false);
+        self.window.set_create_playlist_duplicate("".into());
+        self.window.set_playlists_open(true);
+    }
+
+    /// Closes the list of playlists.
+    pub fn close_playlists(&self) {
+        self.window.set_playlists_open(false);
+        self.window.set_create_playlist_open(false);
+        self.window.set_create_playlist_duplicate("".into());
+    }
+
+    /// Keeps the creation dialog open and asks whether a duplicate name is
+    /// really wanted.
+    pub fn show_duplicate_playlist(&self, name: &str) {
+        self.window.set_create_playlist_open(true);
+        self.window.set_create_playlist_duplicate(name.into());
     }
 
     /// Closes the pending dialog.
@@ -575,11 +637,22 @@ impl PlayerUi {
         self.window.set_pending_open(false);
     }
 
-    /// Shows the active queue in a list over the video.
+    /// Shows the active playlist in a list over the video.
     ///
-    /// Only thumbnails that exist on disk are decoded; a missing file simply
-    /// leaves the placeholder in the row.
-    pub fn show_queue(&self, entries: &[QueueListEntry]) {
+    /// `title` is "Queue" for the built-in active queue and "Queue [name]" for
+    /// a user playlist. Only thumbnails that exist on disk are decoded; a
+    /// missing file simply leaves the placeholder in the row.
+    pub fn show_queue(
+        &self,
+        entries: &[QueueListEntry],
+        title: &str,
+        playlists: &[PlaylistListEntry],
+    ) {
+        self.set_playlists(playlists);
+        self.window.set_queue_title(title.into());
+        self.window.set_queue_in_playlist(
+            playlists.iter().any(|playlist| playlist.active && !playlist.is_active_queue),
+        );
         let already_open = self.window.get_queue_open();
         let items: Vec<QueueItem> = entries
             .iter()
@@ -774,6 +847,11 @@ impl PlayerUi {
         self.window.on_pending_dismissed(handler);
     }
 
+    /// Called when the user adds the pending media to another playlist.
+    pub fn on_pending_add_to_playlist(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_pending_add_to_playlist(move |playlist| handler(playlist.to_string()));
+    }
+
     /// Called when the user accepts the update.
     pub fn on_update_accepted(&self, handler: impl Fn() + 'static) {
         self.window.on_update_accepted(handler);
@@ -792,6 +870,37 @@ impl PlayerUi {
     /// Called when the user asks for the playback history.
     pub fn on_history_requested(&self, handler: impl Fn() + 'static) {
         self.window.on_history_requested(handler);
+    }
+
+    /// Called when the user asks for the playlist list.
+    pub fn on_playlists_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_playlists_requested(handler);
+    }
+
+    /// Called when the user picks a playlist to play from.
+    ///
+    /// The argument is the stable playlist id; the built-in active queue uses
+    /// a reserved id.
+    pub fn on_playlist_selected(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_playlist_selected(move |id| handler(id.to_string()));
+    }
+
+    /// Called when the user confirms the name of a new playlist.
+    pub fn on_create_playlist(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_create_playlist(move |name| handler(name.to_string()));
+    }
+
+    /// Called when the user confirms a duplicate playlist name.
+    pub fn on_confirm_create_playlist(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_confirm_create_playlist(move |name| handler(name.to_string()));
+    }
+
+    /// Called when the user adds a queue entry to another playlist.
+    ///
+    /// The arguments are the entry id and the target playlist id.
+    pub fn on_queue_add_to_playlist(&self, handler: impl Fn(i32, String) + 'static) {
+        self.window
+            .on_queue_add_to_playlist(move |entry, playlist| handler(entry, playlist.to_string()));
     }
 
     /// Called when the user picks an entry of the active queue.
@@ -908,15 +1017,19 @@ mod tests {
         assert_eq!(ui.window().get_media_title(), "Test Video Title");
         assert_eq!(ui.window().get_media_uploader(), "Test Channel");
 
-        ui.show_queue(&[QueueListEntry {
-            id: 1,
-            position: 0,
-            title: "First".to_string(),
-            uploader: "Uploader".to_string(),
-            thumbnail: None,
-            current: true,
-            url: "https://example.com/video".to_string(),
-        }]);
+        ui.show_queue(
+            &[QueueListEntry {
+                id: 1,
+                position: 0,
+                title: "First".to_string(),
+                uploader: "Uploader".to_string(),
+                thumbnail: None,
+                current: true,
+                url: "https://example.com/video".to_string(),
+            }],
+            "Queue",
+            &[],
+        );
         assert!(ui.window().get_queue_open());
         assert_eq!(ui.window().get_queue_items().row_count(), 1);
         assert_eq!(ui.window().get_queue_items().row_data(0).expect("the row exists").id, 1);
@@ -939,6 +1052,40 @@ mod tests {
         let toasts = ui.window().get_toasts();
         assert_eq!(toasts.row_count(), 1);
         assert_eq!(toasts.row_data(0).expect("one toast").text, "hello");
+
+        let playlists = [
+            PlaylistListEntry {
+                id: "active_queue".to_string(),
+                name: "Active Queue".to_string(),
+                active: false,
+                is_active_queue: true,
+            },
+            PlaylistListEntry {
+                id: "p1".to_string(),
+                name: "Mix".to_string(),
+                active: true,
+                is_active_queue: false,
+            },
+        ];
+
+        ui.show_playlists(&playlists);
+        assert!(ui.window().get_playlists_open());
+        assert_eq!(ui.window().get_playlist_items().row_count(), 2);
+        assert!(ui.window().get_playlist_items().row_data(1).expect("the row exists").active);
+
+        ui.show_queue(&[], "Queue [Mix]", &playlists);
+        assert_eq!(ui.window().get_queue_title(), "Queue [Mix]");
+        assert!(ui.window().get_queue_in_playlist());
+        assert_eq!(ui.window().get_playlist_items().row_count(), 2);
+
+        ui.show_duplicate_playlist("Mix");
+        assert!(ui.window().get_create_playlist_open());
+        assert_eq!(ui.window().get_create_playlist_duplicate(), "Mix");
+
+        ui.close_playlists();
+        assert!(!ui.window().get_playlists_open());
+        assert!(!ui.window().get_create_playlist_open());
+        assert_eq!(ui.window().get_create_playlist_duplicate(), "");
     }
 
     #[test]

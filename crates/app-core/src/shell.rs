@@ -16,7 +16,7 @@ use playback_engine::{EndReason, EngineEvent};
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
-use ui_kit::{HistoryListEntry, PlayerUi, QueueListEntry, StatusKind};
+use ui_kit::{HistoryListEntry, PlayerUi, PlaylistListEntry, QueueListEntry, StatusKind};
 
 use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
@@ -209,7 +209,81 @@ impl Shell {
             let app = Arc::clone(&app);
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_requested(move || {
-                ui_for_queue.show_queue(&queue_list(&app));
+                ui_for_queue.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_playlists = Rc::clone(&ui);
+            ui.on_playlists_requested(move || {
+                ui_for_playlists.show_playlists(&playlist_list(&app));
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_selection = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_playlist_selected(move |id| {
+                if app.select_playlist(id.as_str()) {
+                    loading.borrow_mut().resolve_started();
+                }
+                ui_for_selection.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_create = Rc::clone(&ui);
+            ui.on_create_playlist(move |name| {
+                create_playlist(&app, &ui_for_create, name.as_str(), false);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_create = Rc::clone(&ui);
+            ui.on_confirm_create_playlist(move |name| {
+                create_playlist(&app, &ui_for_create, name.as_str(), true);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_playlist = Rc::clone(&ui);
+            ui.on_queue_add_to_playlist(move |entry, playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                if app.add_entry_to_playlist(entry as i64, playlist_id.as_str()) {
+                    ui_for_playlist.show_toast(&format!("Added to {target}"));
+                } else {
+                    ui_for_playlist.show_toast("The video could not be added to the playlist");
+                }
+                ui_for_playlist.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            ui.on_pending_add_to_playlist(move |playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                if app.add_pending_to_playlist(playlist_id.as_str()) {
+                    ui_for_pending.hide_pending();
+                    ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
+                    ui_for_pending.show_toast(&format!("Added to {target}"));
+                } else {
+                    ui_for_pending.show_toast("The video could not be added to the playlist");
+                }
             });
         }
         {
@@ -259,7 +333,11 @@ impl Shell {
                 if removal.advanced {
                     loading.borrow_mut().resolve_started();
                 }
-                ui_for_queue.show_queue(&queue_list(&app));
+                ui_for_queue.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
             });
         }
         {
@@ -278,7 +356,11 @@ impl Shell {
                 entries.insert(tgt as usize, entry);
                 let ids: Vec<i64> = entries.into_iter().map(|entry| entry.id).collect();
                 if app.reorder_queue(&ids) {
-                    ui_for_queue.show_queue(&queue_list(&app));
+                    ui_for_queue.show_queue(
+                        &queue_list(&app),
+                        &queue_title(&app),
+                        &playlist_list(&app),
+                    );
                 }
             });
         }
@@ -548,6 +630,54 @@ fn queue_list(app: &App) -> Vec<QueueListEntry> {
         .collect()
 }
 
+/// Turns the stored playlists into the rows the dialog draws.
+fn playlist_list(app: &App) -> Vec<PlaylistListEntry> {
+    app.playlists()
+        .into_iter()
+        .map(|playlist| PlaylistListEntry {
+            id: playlist.id,
+            name: playlist.name,
+            active: playlist.active,
+            is_active_queue: playlist.is_active_queue,
+        })
+        .collect()
+}
+
+/// The title of the queue dialog for the active playlist.
+fn queue_title(app: &App) -> String {
+    match app.active_playlist_name() {
+        Some(name) => format!("Queue [{name}]"),
+        None => "Queue".to_string(),
+    }
+}
+
+/// The name of a playlist, for the confirmation toast.
+fn playlist_name(app: &App, playlist_id: &str) -> Option<String> {
+    app.playlists()
+        .into_iter()
+        .find(|playlist| playlist.id == playlist_id)
+        .map(|playlist| playlist.name)
+}
+
+/// Creates a playlist, asking about a duplicate name before it is stored.
+///
+/// `confirmed` is set by the duplicate dialog, so the second attempt actually
+/// creates the playlist instead of asking again.
+fn create_playlist(app: &App, ui: &PlayerUi, name: &str, confirmed: bool) {
+    let name = name.trim();
+    if !confirmed && app.playlist_name_exists(name) {
+        ui.show_duplicate_playlist(name);
+        return;
+    }
+    match app.create_playlist(name) {
+        Ok(playlist) => {
+            ui.show_playlists(&playlist_list(app));
+            ui.show_toast(&format!("Created playlist {}", playlist.name));
+        }
+        Err(error) => ui.show_toast(&error),
+    }
+}
+
 /// Brings the interface and the player back in sync.
 fn tick(
     ui: &PlayerUi,
@@ -614,7 +744,13 @@ fn tick(
                 }
             }
             Message::Pending(Ok(pending)) => {
-                ui.show_pending(&pending.title, pending.thumbnail.as_deref());
+                let in_playlist = app.active_playlist_name().is_some();
+                ui.show_pending(
+                    &pending.title,
+                    pending.thumbnail.as_deref(),
+                    in_playlist,
+                    &playlist_list(app),
+                );
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {

@@ -11,7 +11,9 @@ pub mod cache;
 pub mod store;
 
 pub use cache::ThumbnailCache;
-pub use store::{HistoryEntry, Queue, QueueEntry};
+pub use store::{
+    ACTIVE_QUEUE_ID, ACTIVE_QUEUE_NAME, HistoryEntry, PlaylistInfo, Queue, QueueEntry,
+};
 
 /// Everything that can go wrong while using the library.
 #[derive(Debug)]
@@ -24,6 +26,8 @@ pub enum Error {
     Http(String),
     /// A thumbnail could not be processed.
     Image(image_process::Error),
+    /// A playlist could not be created as asked.
+    Playlist(String),
 }
 
 impl std::fmt::Display for Error {
@@ -33,6 +37,7 @@ impl std::fmt::Display for Error {
             Error::Io(error) => write!(f, "a file could not be handled: {error}"),
             Error::Http(message) => write!(f, "a thumbnail could not be downloaded: {message}"),
             Error::Image(error) => write!(f, "a thumbnail could not be processed: {error}"),
+            Error::Playlist(message) => write!(f, "the playlist could not be changed: {message}"),
         }
     }
 }

@@ -1,22 +1,30 @@
+import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { CloseButton, FlatButton, MoreIcon } from "../widgets.slint";
+import { PlaylistItem } from "types.slint";
 
 export component PendingDialog inherits Rectangle {
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
+    // Whether a user playlist is the active playlist rather than the queue.
+    in property <bool> in-playlist: false;
+    in property <[PlaylistItem]> playlists: [];
     in-out property <bool> pending-open: false;
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-queue-next-requested();
+    callback pending-add-to-playlist(string);
     callback pending-dismissed();
 
     private property <bool> options-open: false;
+    private property <bool> picker-open: false;
     private property <length> menu-anchor-x: 0px;
     private property <length> menu-anchor-y: 0px;
 
     changed pending-open => {
         if !self.pending-open {
             self.options-open = false;
+            self.picker-open = false;
         }
     }
 
@@ -118,7 +126,7 @@ export component PendingDialog inherits Rectangle {
                             background: left-touch.pressed ? Theme.elevated : (left-touch.has-hover ? Theme.elevated : Theme.panel);
 
                             Text {
-                                text: "Add to queue";
+                                text: root.in-playlist ? "Add to playlist" : "Add to queue";
                                 color: Theme.fg;
                                 font-size: 13px;
                                 horizontal-alignment: center;
@@ -128,8 +136,14 @@ export component PendingDialog inherits Rectangle {
                             left-touch := TouchArea {
                                 clicked => {
                                     root.options-open = false;
-                                    root.pending-open = false;
-                                    root.pending-queue-requested();
+                                    if root.in-playlist {
+                                        // On a user playlist the button asks
+                                        // where the item should go.
+                                        root.picker-open = true;
+                                    } else {
+                                        root.pending-open = false;
+                                        root.pending-queue-requested();
+                                    }
                                 }
                             }
                         }
@@ -215,7 +229,7 @@ export component PendingDialog inherits Rectangle {
                             alignment: start;
 
                             Text {
-                                text: "Play Next in Queue";
+                                text: root.in-playlist ? "Play Next in Playlist" : "Play Next in Queue";
                                 color: Theme.fg;
                                 font-size: 13px;
                                 vertical-alignment: center;
@@ -228,6 +242,118 @@ export component PendingDialog inherits Rectangle {
                                 root.pending-open = false;
                                 root.pending-queue-next-requested();
                             }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: add-playlist-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: start;
+
+                            Text {
+                                text: root.in-playlist ? "Add to Another Playlist" : "Add to Playlist";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        add-playlist-touch := TouchArea {
+                            clicked => {
+                                root.options-open = false;
+                                root.picker-open = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The playlist picker sits above the dialog content, so a click
+        // anywhere outside the picker only closes the picker.
+        if root.picker-open: Rectangle {
+            x: 0;
+            y: 0;
+            width: pending-panel.width;
+            height: pending-panel.height;
+            background: #00000066;
+
+            TouchArea {
+                clicked => {
+                    root.picker-open = false;
+                }
+            }
+
+            picker := Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(parent.width - 40px, 360px);
+                height: min(parent.height - 40px, 420px);
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.panel;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000c0;
+
+                TouchArea { }
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Add to Playlist";
+                        color: Theme.fg;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            spacing: 4px;
+                            padding-right: 10px;
+
+                            for playlist in root.playlists: Rectangle {
+                                height: 40px;
+                                border-radius: 6px;
+                                background: picker-touch.has-hover ? Theme.elevated : transparent;
+
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    cross-axis-alignment: center;
+
+                                    Text {
+                                        text: playlist.name;
+                                        color: Theme.fg;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                picker-touch := TouchArea {
+                                    clicked => {
+                                        root.picker-open = false;
+                                        root.pending-add-to-playlist(playlist.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    FlatButton {
+                        height: 32px;
+                        label: "Cancel";
+                        clicked => {
+                            root.picker-open = false;
                         }
                     }
                 }

@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use database::Database;
 use media_model::video_id_hash;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::Error;
 use image_process::{is_renderable_jpeg, normalize_to_jpeg, write_scaled_jpeg};
@@ -327,38 +327,25 @@ impl ThumbnailCache {
     }
 
     /// Deletes the thumbnail record `id` and its three image files, but only
-    /// when no entry in the active queue still points at it.
+    /// when no entry in any playlist still points at it.
     pub fn release_thumbnail(&self, id: &str) -> Result<(), Error> {
         let referenced = self
             .db
-            .with_connection(|connection| {
-                let count: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM active_queue WHERE thumbnail = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )?;
-                Ok(count)
-            })
+            .with_connection(|connection| Ok(referenced_thumbnail_ids(connection)?.contains(id)))
             .map_err(Error::from)?;
 
-        if referenced == 0 {
+        if !referenced {
             self.delete_thumbnail(id)?;
         }
         Ok(())
     }
 
-    /// Deletes every thumbnail record and image file that no entry in the
-    /// active queue points at.
+    /// Deletes every thumbnail record and image file that no entry in any
+    /// playlist points at.
     pub fn release_unreferenced_thumbnails(&self) -> Result<(), Error> {
         self.db
             .with_connection(|connection| {
-                // The ids still referenced by the queue.
-                let mut statement = connection.prepare(
-                    "SELECT DISTINCT thumbnail FROM active_queue
-                 WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
-                )?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                let referenced: HashSet<String> = rows.filter_map(Result::ok).collect();
+                let referenced = referenced_thumbnail_ids(connection)?;
 
                 // Every record in the cache.
                 let mut statement = connection.prepare(
@@ -433,7 +420,7 @@ impl ThumbnailCache {
     /// This is the start-up orphan cleanup and is meant to run in the
     /// background.
     pub fn prune_orphans(&self) -> Result<(), Error> {
-        let (referenced, protected_ids) = self
+        let referenced = self
             .db
             .with_connection(|connection| {
                 let mut statement = connection
@@ -453,31 +440,13 @@ impl ThumbnailCache {
                         }
                     }
                 }
-
-                let mut protected = HashSet::new();
-                let _ = connection
-                    .prepare(
-                        "SELECT DISTINCT thumbnail FROM active_queue
-                     WHERE thumbnail IS NOT NULL AND thumbnail <> ''",
-                    )
-                    .and_then(|mut statement| {
-                        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                        for id in rows.flatten() {
-                            if id.starts_with(THUMBNAIL_ID_PREFIX) {
-                                protected.insert(id);
-                            }
-                        }
-                        Ok(())
-                    })
-                    .or_else(|error| {
-                        // If the active_queue table does not exist (e.g. in isolated tests),
-                        // treat as no protected ids.
-                        let msg = error.to_string();
-                        if msg.contains("no such table") { Ok(()) } else { Err(error) }
-                    });
-                Ok((names, protected))
+                Ok(names)
             })
             .map_err(Error::from)?;
+        // A thumbnail any playlist still references is kept even when its
+        // cache row is missing, so a crash does not wipe a repairable file.
+        let protected_ids =
+            self.db.with_connection(referenced_thumbnail_ids).map_err(Error::from)?;
 
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
@@ -568,6 +537,41 @@ impl ThumbnailCache {
     }
 }
 
+/// Every thumbnail id any playlist entry still points at.
+///
+/// Thumbnails are shared between the active queue and every user playlist, so
+/// cleanup has to look at all their tables. Missing tables are ignored, which
+/// keeps the cache usable in tests that only create the cache schema.
+fn referenced_thumbnail_ids(connection: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut tables = vec!["active_queue".to_string()];
+    if let Ok(mut statement) = connection.prepare("SELECT table_name FROM playlist_table")
+        && let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0))
+    {
+        tables.extend(rows.flatten().filter(|table| {
+            table.starts_with("playlist_")
+                && table
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }));
+    }
+
+    let mut ids = HashSet::new();
+    for table in tables {
+        let sql = format!(
+            "SELECT DISTINCT thumbnail FROM {table} WHERE thumbnail IS NOT NULL AND thumbnail <> ''"
+        );
+        match connection.prepare(&sql) {
+            Ok(mut statement) => {
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                ids.extend(rows.flatten());
+            }
+            Err(error) if error.to_string().contains("no such table") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(ids)
+}
+
 /// Removes a partially downloaded thumbnail when a fetch ends, whether it
 /// succeeded or failed. A successful conversion has already removed it.
 struct ScratchFile<'a>(&'a Path);
@@ -640,6 +644,27 @@ mod tests {
         let first = ThumbnailCache::thumbnail_id_for("https://example.com/a");
         let second = ThumbnailCache::thumbnail_id_for("https://example.com/b");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn every_playlist_keeps_its_thumbnails_referenced() {
+        let db = Database::in_memory().expect("database opens");
+        db.with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TABLE active_queue (thumbnail TEXT);
+                 CREATE TABLE playlist_table (table_name TEXT);
+                 CREATE TABLE playlist_abc (thumbnail TEXT);
+                 INSERT INTO active_queue (thumbnail) VALUES ('thumb_queue');
+                 INSERT INTO playlist_table (table_name) VALUES ('playlist_abc');
+                 INSERT INTO playlist_abc (thumbnail) VALUES ('thumb_playlist');",
+            )?;
+            let referenced = referenced_thumbnail_ids(connection)?;
+            assert!(referenced.contains("thumb_queue"));
+            assert!(referenced.contains("thumb_playlist"));
+            assert_eq!(referenced.len(), 2);
+            Ok(())
+        })
+        .expect("references are read");
     }
 
     #[test]
