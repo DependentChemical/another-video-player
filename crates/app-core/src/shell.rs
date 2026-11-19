@@ -27,6 +27,14 @@ enum PendingUpdate {
     Tool(ytdlp_tool::ToolUpdate),
 }
 
+/// What to do with the playlist that a dialog is about to create.
+#[derive(Debug, Clone, Copy)]
+enum PlaylistIntent {
+    AddEntry(i64),
+    MoveEntry(i64),
+    AddPending,
+}
+
 /// How often the interface is refreshed.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -238,52 +246,106 @@ impl Shell {
                 );
             });
         }
+        let playlist_intent: Rc<RefCell<Option<PlaylistIntent>>> = Rc::new(RefCell::new(None));
         {
             let app = Arc::clone(&app);
             let ui_for_create = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            let intent = Rc::clone(&playlist_intent);
             ui.on_create_playlist(move |name| {
-                create_playlist(&app, &ui_for_create, name.as_str(), false);
+                create_playlist(&app, &ui_for_create, &loading, &intent, name.as_str(), false);
             });
         }
         {
             let app = Arc::clone(&app);
             let ui_for_create = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            let intent = Rc::clone(&playlist_intent);
             ui.on_confirm_create_playlist(move |name| {
-                create_playlist(&app, &ui_for_create, name.as_str(), true);
+                create_playlist(&app, &ui_for_create, &loading, &intent, name.as_str(), true);
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_create_playlist_dismissed(move || {
+                *intent.borrow_mut() = None;
+                ui_for_create.close_create_playlist();
             });
         }
         {
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             let ui_for_playlist = Rc::clone(&ui);
             ui.on_queue_add_to_playlist(move |entry, playlist_id| {
                 let target = playlist_name(&app, playlist_id.as_str())
                     .unwrap_or_else(|| "the playlist".to_string());
-                if app.add_entry_to_playlist(entry as i64, playlist_id.as_str()) {
-                    ui_for_playlist.show_toast(&format!("Added to {target}"));
-                } else {
-                    ui_for_playlist.show_toast("The video could not be added to the playlist");
-                }
-                ui_for_playlist.show_queue(
-                    &queue_list(&app),
-                    &queue_title(&app),
-                    &playlist_list(&app),
+                playlist_action(
+                    &app,
+                    &ui_for_playlist,
+                    &loading,
+                    PlaylistIntent::AddEntry(entry as i64),
+                    playlist_id.as_str(),
+                    &target,
                 );
             });
         }
         {
             let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_playlist = Rc::clone(&ui);
+            ui.on_queue_move_to_playlist(move |entry, playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                playlist_action(
+                    &app,
+                    &ui_for_playlist,
+                    &loading,
+                    PlaylistIntent::MoveEntry(entry as i64),
+                    playlist_id.as_str(),
+                    &target,
+                );
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_queue_add_to_new_playlist(move |entry| {
+                *intent.borrow_mut() = Some(PlaylistIntent::AddEntry(entry as i64));
+                ui_for_create.show_create_playlist();
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_queue_move_to_new_playlist(move |entry| {
+                *intent.borrow_mut() = Some(PlaylistIntent::MoveEntry(entry as i64));
+                ui_for_create.show_create_playlist();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             let ui_for_pending = Rc::clone(&ui);
             ui.on_pending_add_to_playlist(move |playlist_id| {
                 let target = playlist_name(&app, playlist_id.as_str())
                     .unwrap_or_else(|| "the playlist".to_string());
-                if app.add_pending_to_playlist(playlist_id.as_str()) {
-                    ui_for_pending.hide_pending();
-                    ui_for_pending.set_url("");
-                    ui_for_pending.blur_url();
-                    ui_for_pending.show_toast(&format!("Added to {target}"));
-                } else {
-                    ui_for_pending.show_toast("The video could not be added to the playlist");
-                }
+                playlist_action(
+                    &app,
+                    &ui_for_pending,
+                    &loading,
+                    PlaylistIntent::AddPending,
+                    playlist_id.as_str(),
+                    &target,
+                );
+            });
+        }
+        {
+            let ui_for_pending = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_pending_add_to_new_playlist(move || {
+                *intent.borrow_mut() = Some(PlaylistIntent::AddPending);
+                ui_for_pending.show_create_playlist();
             });
         }
         {
@@ -662,8 +724,16 @@ fn playlist_name(app: &App, playlist_id: &str) -> Option<String> {
 /// Creates a playlist, asking about a duplicate name before it is stored.
 ///
 /// `confirmed` is set by the duplicate dialog, so the second attempt actually
-/// creates the playlist instead of asking again.
-fn create_playlist(app: &App, ui: &PlayerUi, name: &str, confirmed: bool) {
+/// creates the playlist instead of asking again. When the dialog was opened
+/// from a picker, `intent` says what should happen with the new playlist.
+fn create_playlist(
+    app: &App,
+    ui: &PlayerUi,
+    loading: &Rc<RefCell<Loading>>,
+    intent: &Rc<RefCell<Option<PlaylistIntent>>>,
+    name: &str,
+    confirmed: bool,
+) {
     let name = name.trim();
     if !confirmed && app.playlist_name_exists(name) {
         ui.show_duplicate_playlist(name);
@@ -671,10 +741,67 @@ fn create_playlist(app: &App, ui: &PlayerUi, name: &str, confirmed: bool) {
     }
     match app.create_playlist(name) {
         Ok(playlist) => {
-            ui.show_playlists(&playlist_list(app));
-            ui.show_toast(&format!("Created playlist {}", playlist.name));
+            let action = intent.borrow_mut().take();
+            ui.close_create_playlist();
+            match action {
+                Some(action) => playlist_action(
+                    app,
+                    ui,
+                    loading,
+                    action,
+                    playlist.id.as_str(),
+                    playlist.name.as_str(),
+                ),
+                None => {
+                    ui.show_playlists(&playlist_list(app));
+                    ui.show_toast(&format!("Created playlist {}", playlist.name));
+                }
+            }
         }
         Err(error) => ui.show_toast(&error),
+    }
+}
+
+/// Applies an action to a playlist after the target is known.
+fn playlist_action(
+    app: &App,
+    ui: &PlayerUi,
+    loading: &Rc<RefCell<Loading>>,
+    action: PlaylistIntent,
+    playlist_id: &str,
+    target_name: &str,
+) {
+    match action {
+        PlaylistIntent::AddEntry(entry_id) => {
+            if app.add_entry_to_playlist(entry_id, playlist_id) {
+                ui.show_toast(&format!("Added to {target_name}"));
+            } else {
+                ui.show_toast("The video could not be added to the playlist");
+            }
+            ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+        }
+        PlaylistIntent::MoveEntry(entry_id) => {
+            match app.move_entry_to_playlist(entry_id, playlist_id) {
+                Some(removal) => {
+                    if removal.advanced {
+                        loading.borrow_mut().resolve_started();
+                    }
+                    ui.show_toast(&format!("Moved to {target_name}"));
+                }
+                None => ui.show_toast("The video could not be moved to the playlist"),
+            }
+            ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+        }
+        PlaylistIntent::AddPending => {
+            if app.add_pending_to_playlist(playlist_id) {
+                ui.hide_pending();
+                ui.set_url("");
+                ui.blur_url();
+                ui.show_toast(&format!("Added to {target_name}"));
+            } else {
+                ui.show_toast("The video could not be added to the playlist");
+            }
+        }
     }
 }
 

@@ -508,20 +508,45 @@ impl App {
         *self.pending.lock().expect("the pending media is not poisoned") = Some(pending);
     }
 
-    /// Plays the pending media right away, replacing the active queue.
+    /// Plays the pending media right away.
+    ///
+    /// The active queue is replaced, because it is the scratch list. A user
+    /// playlist is preserved: the media is appended and becomes its current
+    /// entry, so "Play now" never destroys a curated list.
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
         self.interrupt_playback();
         let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
-        self.prepare_current(
-            &pending.url,
-            &pending.title,
-            thumbnail,
-            thumbnail_url.as_deref(),
-            uploader.as_deref(),
-        );
+        let in_playlist = matches!(self.queue.active_playlist_id(), Ok(Some(_)));
+        if in_playlist {
+            let entry = match self.queue.push(
+                &pending.url,
+                &pending.title,
+                thumbnail,
+                thumbnail_url.as_deref(),
+                uploader.as_deref(),
+            ) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    crate::diag::note(&format!("the playlist could not be written: {error}"));
+                    return None;
+                }
+            };
+            if let Err(error) = self.queue.set_current(entry.id) {
+                crate::diag::note(&format!("the playlist could not be written: {error}"));
+                return None;
+            }
+        } else {
+            self.prepare_current(
+                &pending.url,
+                &pending.title,
+                thumbnail,
+                thumbnail_url.as_deref(),
+                uploader.as_deref(),
+            );
+        }
         let loaded =
             self.consume_resolved(&pending.url, pending.source, thumbnail, pending.resolved_at)?;
         Some((pending.url, loaded))
@@ -1024,15 +1049,33 @@ impl App {
     /// to the entry that follows it; when no entry follows it, the player is
     /// stopped.
     pub fn remove_queue_entry(&self, id: i64) -> QueueRemoval {
-        let removed = match self.queue.remove_entry(id) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return QueueRemoval::default(),
+        match self.queue.remove_entry(id) {
+            Ok(Some(entry)) => self.finish_removal(entry),
+            Ok(None) => QueueRemoval::default(),
             Err(error) => {
                 crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
-                return QueueRemoval::default();
+                QueueRemoval::default()
             }
-        };
+        }
+    }
 
+    /// Moves an entry from the active playlist into `playlist_id`.
+    ///
+    /// Returns the removal details so the caller can start whatever follows
+    /// when the moved entry was the one playing.
+    pub fn move_entry_to_playlist(&self, entry_id: i64, playlist_id: &str) -> Option<QueueRemoval> {
+        match self.queue.move_entry_to_playlist(entry_id, playlist_id) {
+            Ok(Some(entry)) => Some(self.finish_removal(entry)),
+            Ok(None) => None,
+            Err(error) => {
+                crate::diag::note(&format!("the playlist entry could not be moved: {error}"));
+                None
+            }
+        }
+    }
+
+    /// Handles the shared work after an entry left the active playlist.
+    fn finish_removal(&self, removed: library::QueueEntry) -> QueueRemoval {
         // Deleting an entry drops its thumbnail when nothing else references it.
         if let Some(thumbnail_id) = removed.thumbnail_id()
             && let Err(error) = self.cache.release_thumbnail(thumbnail_id)

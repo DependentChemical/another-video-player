@@ -140,6 +140,7 @@ export component MainWindow inherits Window {
     callback playlist-selected(string);
     callback create-playlist(string);
     callback confirm-create-playlist(string);
+    callback create-playlist-dismissed();
     callback history-requested();
     callback queue-item-selected(int);
     callback queue-copy-url(string);
@@ -148,7 +149,11 @@ export component MainWindow inherits Window {
     callback queue-row-pressed(int);
     callback queue-row-released(int);
     callback queue-add-to-playlist(int, string);
+    callback queue-move-to-playlist(int, string);
+    callback queue-add-to-new-playlist(int);
+    callback queue-move-to-new-playlist(int);
     callback pending-add-to-playlist(string);
+    callback pending-add-to-new-playlist();
     callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
@@ -350,6 +355,7 @@ export component MainWindow inherits Window {
         pending-queue-requested => { root.pending-queue-requested(); }
         pending-queue-next-requested => { root.pending-queue-next-requested(); }
         pending-add-to-playlist(id) => { root.pending-add-to-playlist(id); }
+        pending-add-to-new-playlist => { root.pending-add-to-new-playlist(); }
         pending-dismissed => { root.pending-dismissed(); }
     }
 
@@ -375,6 +381,9 @@ export component MainWindow inherits Window {
         queue-row-pressed(index) => { root.queue-row-pressed(index); }
         queue-row-released(index) => { root.queue-row-released(index); }
         add-to-playlist(entry, playlist) => { root.queue-add-to-playlist(entry, playlist); }
+        move-to-playlist(entry, playlist) => { root.queue-move-to-playlist(entry, playlist); }
+        add-to-new-playlist(entry) => { root.queue-add-to-new-playlist(entry); }
+        move-to-new-playlist(entry) => { root.queue-move-to-new-playlist(entry); }
         dismissed => { root.queue-open = false; }
     }
 
@@ -409,6 +418,7 @@ export component MainWindow inherits Window {
         dismissed => {
             root.create-playlist-open = false;
             root.create-playlist-duplicate = "";
+            root.create-playlist-dismissed();
         }
     }
 

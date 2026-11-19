@@ -61,7 +61,7 @@ export component CreatePlaylistDialog inherits Rectangle {
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;
         width: min(root.width - 40px, 420px);
-        height: min(root.height - 40px, 260px);
+        height: body.preferred-height;
         border-radius: 12px;
         border-width: 1px;
         border-color: Theme.border;
@@ -71,7 +71,7 @@ export component CreatePlaylistDialog inherits Rectangle {
 
         TouchArea { }
 
-        VerticalLayout {
+        body := VerticalLayout {
             padding: 16px;
             spacing: 12px;
 

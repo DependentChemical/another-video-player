@@ -865,6 +865,56 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Moves one entry from the active playlist into another playlist.
+    ///
+    /// The entry is copied with all its details and then removed from the
+    /// active playlist in the same transaction. The original entry is returned
+    /// so the caller can continue playback exactly as after a deletion.
+    pub fn move_entry_to_playlist(
+        &self,
+        entry_id: i64,
+        playlist_id: &str,
+    ) -> Result<Option<QueueEntry>, Error> {
+        self.db
+            .with_connection(|connection| {
+                let source = active_table(connection)?;
+                let target = playlist_table_in(connection, playlist_id)?;
+                if source == target {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let transaction = connection.unchecked_transaction()?;
+                let entry = transaction
+                    .query_row(
+                        &format!("SELECT {COLUMNS} FROM {source} WHERE id = ?1"),
+                        params![entry_id],
+                        entry_from_row,
+                    )
+                    .optional()?;
+                let Some(entry) = entry else {
+                    return Ok(None);
+                };
+                let count: i64 = transaction.query_row(
+                    &format!("SELECT COUNT(*) FROM {target}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                let position: i64 = transaction.query_row(
+                    &format!("SELECT COALESCE(MAX(position), -1) + 1 FROM {target}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                let copy = QueueEntry { id: 0, position, current: count == 0, ..entry.clone() };
+                insert_entry(&transaction, &target, &copy)?;
+                touch_current(&transaction, &target)?;
+                transaction
+                    .execute(&format!("DELETE FROM {source} WHERE id = ?1"), params![entry_id])?;
+                touch_current(&transaction, &source)?;
+                transaction.commit()?;
+                Ok(Some(entry))
+            })
+            .map_err(Error::from)
+    }
+
     /// Gets a history entry by its id_hash.
     pub fn history_get(&self, id_hash: &str) -> Result<Option<HistoryEntry>, Error> {
         self.db
@@ -1592,6 +1642,68 @@ mod tests {
             .find(|info| info.id == playlist.id)
             .expect("playlist is listed");
         assert_eq!(info.current_entry_id, Some(copy.id));
+    }
+
+    #[test]
+    fn moving_an_entry_copies_it_and_removes_the_original() {
+        let queue = queue();
+        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        let playlist = queue.create_playlist("Elsewhere").expect("create works");
+
+        let moved = queue
+            .move_entry_to_playlist(first.id, &playlist.id)
+            .expect("move works")
+            .expect("the entry existed");
+
+        assert_eq!(moved.id, first.id);
+        assert!(moved.current);
+        assert_eq!(queue.entries().expect("entries work").len(), 1);
+        assert_eq!(queue.current().expect("current works"), None);
+
+        queue.select_playlist(&playlist.id).expect("select works");
+        let entries = queue.entries().expect("entries work");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "https://example.com/a");
+        assert!(entries[0].current);
+    }
+
+    #[test]
+    fn moving_into_a_non_empty_playlist_keeps_its_current_entry() {
+        let queue = queue();
+        let playlist = queue.create_playlist("Elsewhere").expect("create works");
+        queue.select_playlist(&playlist.id).expect("select works");
+        let existing =
+            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.set_current(existing.id).expect("current works");
+
+        queue.select_playlist(ACTIVE_QUEUE_ID).expect("select works");
+        let moving =
+            queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue
+            .move_entry_to_playlist(moving.id, &playlist.id)
+            .expect("move works")
+            .expect("the entry existed");
+
+        queue.select_playlist(&playlist.id).expect("select works");
+        let entries = queue.entries().expect("entries work");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].current);
+        assert_eq!(entries[0].url, "https://example.com/b");
+        assert!(!entries[1].current);
+        assert_eq!(entries[1].url, "https://example.com/a");
+    }
+
+    #[test]
+    fn moving_an_entry_to_its_own_playlist_is_rejected() {
+        let queue = queue();
+        let entry = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+
+        assert!(
+            queue.move_entry_to_playlist(entry.id, ACTIVE_QUEUE_ID).is_err(),
+            "moving within the same playlist would duplicate the entry"
+        );
+        assert_eq!(queue.count().expect("count works"), 1);
     }
 
     #[test]

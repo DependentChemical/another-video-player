@@ -14,6 +14,7 @@ export component PendingDialog inherits Rectangle {
     callback pending-queue-requested();
     callback pending-queue-next-requested();
     callback pending-add-to-playlist(string);
+    callback pending-add-to-new-playlist();
     callback pending-dismissed();
 
     private property <bool> options-open: false;
@@ -327,6 +328,7 @@ export component PendingDialog inherits Rectangle {
                                 background: picker-touch.has-hover ? Theme.elevated : transparent;
 
                                 HorizontalLayout {
+                                    alignment: start;
                                     padding-left: 10px;
                                     padding-right: 10px;
                                     cross-axis-alignment: center;
@@ -336,6 +338,8 @@ export component PendingDialog inherits Rectangle {
                                         color: Theme.fg;
                                         font-size: 13px;
                                         vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        horizontal-alignment: left;
                                     }
                                 }
 
@@ -346,6 +350,16 @@ export component PendingDialog inherits Rectangle {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    FlatButton {
+                        height: 32px;
+                        label: "Add to New Playlist";
+                        primary: true;
+                        clicked => {
+                            root.picker-open = false;
+                            root.pending-add-to-new-playlist();
                         }
                     }
 

@@ -625,6 +625,18 @@ impl PlayerUi {
         self.window.set_create_playlist_duplicate("".into());
     }
 
+    /// Opens the dialog that asks for a new playlist name.
+    pub fn show_create_playlist(&self) {
+        self.window.set_create_playlist_duplicate("".into());
+        self.window.set_create_playlist_open(true);
+    }
+
+    /// Closes the dialog that asks for a new playlist name.
+    pub fn close_create_playlist(&self) {
+        self.window.set_create_playlist_open(false);
+        self.window.set_create_playlist_duplicate("".into());
+    }
+
     /// Keeps the creation dialog open and asks whether a duplicate name is
     /// really wanted.
     pub fn show_duplicate_playlist(&self, name: &str) {
@@ -852,6 +864,11 @@ impl PlayerUi {
         self.window.on_pending_add_to_playlist(move |playlist| handler(playlist.to_string()));
     }
 
+    /// Called when the user adds the pending media to a playlist they create.
+    pub fn on_pending_add_to_new_playlist(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_add_to_new_playlist(handler);
+    }
+
     /// Called when the user accepts the update.
     pub fn on_update_accepted(&self, handler: impl Fn() + 'static) {
         self.window.on_update_accepted(handler);
@@ -895,12 +912,35 @@ impl PlayerUi {
         self.window.on_confirm_create_playlist(move |name| handler(name.to_string()));
     }
 
+    /// Called when the user closes the new playlist dialog without creating.
+    pub fn on_create_playlist_dismissed(&self, handler: impl Fn() + 'static) {
+        self.window.on_create_playlist_dismissed(handler);
+    }
+
     /// Called when the user adds a queue entry to another playlist.
     ///
     /// The arguments are the entry id and the target playlist id.
     pub fn on_queue_add_to_playlist(&self, handler: impl Fn(i32, String) + 'static) {
         self.window
             .on_queue_add_to_playlist(move |entry, playlist| handler(entry, playlist.to_string()));
+    }
+
+    /// Called when the user moves a queue entry to another playlist.
+    ///
+    /// The arguments are the entry id and the target playlist id.
+    pub fn on_queue_move_to_playlist(&self, handler: impl Fn(i32, String) + 'static) {
+        self.window
+            .on_queue_move_to_playlist(move |entry, playlist| handler(entry, playlist.to_string()));
+    }
+
+    /// Called when the user adds a queue entry to a playlist they create now.
+    pub fn on_queue_add_to_new_playlist(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_add_to_new_playlist(handler);
+    }
+
+    /// Called when the user moves a queue entry to a playlist they create now.
+    pub fn on_queue_move_to_new_playlist(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_move_to_new_playlist(handler);
     }
 
     /// Called when the user picks an entry of the active queue.
