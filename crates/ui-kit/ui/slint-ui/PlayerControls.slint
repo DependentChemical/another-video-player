@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, PreviousButton, NextButton, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PauseIcon, PlayIcon, PreviousIcon, NextIcon, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
 import { BufferedRange } from "types.slint";
 
 export component PlayerControls inherits Rectangle {
@@ -61,8 +61,7 @@ export component PlayerControls inherits Rectangle {
             spacing: 12px;
             cross-axis-alignment: center;
 
-            // Grouped Previous / PlayPause / Next buttons as a single visual unit.
-            // The container clips the inner buttons so only the outer corners are rounded.
+            // Grouped Previous / PlayPause / Next buttons as a single pill.
             playback-controls := Rectangle {
                 height: 32px;
                 border-radius: 6px;
@@ -74,12 +73,25 @@ export component PlayerControls inherits Rectangle {
                 HorizontalLayout {
                     spacing: 0px;
 
-                    PreviousButton {
+                    Rectangle {
                         width: 44px;
-                        height: 32px;
-                        pointer-activity => { root.pointer-activity(); }
-                        clicked => {
-                            root.previous-requested();
+                        background: previous-touch.pressed ? Theme.elevated : (previous-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        PreviousIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        previous-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.previous-requested();
+                            }
                         }
                     }
 
@@ -88,13 +100,31 @@ export component PlayerControls inherits Rectangle {
                         background: Theme.border;
                     }
 
-                    PlayPauseButton {
+                    Rectangle {
                         width: 44px;
-                        height: 32px;
-                        playing: root.playing;
-                        pointer-activity => { root.pointer-activity(); }
-                        clicked => {
-                            root.play-toggled();
+                        background: play-touch.pressed ? Theme.elevated : (play-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        if !root.playing: PlayIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+                        if root.playing: PauseIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        play-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.play-toggled();
+                            }
                         }
                     }
 
@@ -103,12 +133,25 @@ export component PlayerControls inherits Rectangle {
                         background: Theme.border;
                     }
 
-                    NextButton {
+                    Rectangle {
                         width: 44px;
-                        height: 32px;
-                        pointer-activity => { root.pointer-activity(); }
-                        clicked => {
-                            root.next-requested();
+                        background: next-touch.pressed ? Theme.elevated : (next-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        NextIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        next-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.next-requested();
+                            }
                         }
                     }
                 }
