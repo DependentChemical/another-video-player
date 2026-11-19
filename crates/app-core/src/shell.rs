@@ -194,6 +194,15 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            ui.on_pending_queue_next(move || {
+                let _ = app.queue_pending_next();
+                ui_for_pending.set_url("");
+                ui_for_pending.blur_url();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
             ui.on_pending_dismissed(move || app.dismiss_pending());
         }
         {

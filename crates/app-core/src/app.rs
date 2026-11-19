@@ -529,6 +529,16 @@ impl App {
 
     /// Appends the pending media to the active queue.
     pub fn queue_pending(&self) -> bool {
+        self.queue_pending_with(false)
+    }
+
+    /// Appends the pending media to the active queue, right after the current
+    /// entry when requested.
+    pub fn queue_pending_next(&self) -> bool {
+        self.queue_pending_with(true)
+    }
+
+    fn queue_pending_with(&self, next: bool) -> bool {
         let Some(pending) = self.pending.lock().expect("the pending media is not poisoned").take()
         else {
             return false;
@@ -536,13 +546,24 @@ impl App {
         let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
-        let entry = match self.queue.push(
-            &pending.url,
-            &pending.title,
-            thumbnail,
-            thumbnail_url.as_deref(),
-            uploader.as_deref(),
-        ) {
+        let result = if next {
+            self.queue.push_next(
+                &pending.url,
+                &pending.title,
+                thumbnail,
+                thumbnail_url.as_deref(),
+                uploader.as_deref(),
+            )
+        } else {
+            self.queue.push(
+                &pending.url,
+                &pending.title,
+                thumbnail,
+                thumbnail_url.as_deref(),
+                uploader.as_deref(),
+            )
+        };
+        let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
                 crate::diag::note(&format!("the active queue could not be written: {error}"));

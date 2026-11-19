@@ -262,6 +262,88 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Inserts an entry right after the one playing now, or appends it when
+    /// nothing is current yet.
+    pub fn push_next(
+        &self,
+        url: impl Into<String>,
+        title: impl Into<String>,
+        thumbnail: Option<&str>,
+        thumbnail_url: Option<&str>,
+        uploader: Option<&str>,
+    ) -> Result<QueueEntry, Error> {
+        let url = url.into();
+        let title = title.into();
+        let thumbnail = thumbnail.map(str::to_string);
+        let thumbnail_url = thumbnail_url.map(str::to_string);
+        let uploader = uploader.map(str::to_string);
+        let id_hash = video_id_hash(&url);
+        self.db
+            .with_connection(|connection| {
+                let count: i64 =
+                    connection
+                        .query_row("SELECT COUNT(*) FROM active_queue", [], |row| row.get(0))?;
+                let current_position: Option<i64> = connection
+                    .query_row(
+                        "SELECT position FROM active_queue WHERE current = 1 ORDER BY position LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let position: i64 = match current_position {
+                    Some(position) => {
+                        connection.execute(
+                            "UPDATE active_queue SET position = position + 1 WHERE position > ?1",
+                            params![position],
+                        )?;
+                        position + 1
+                    }
+                    None => connection.query_row(
+                        "SELECT COALESCE(MAX(position), -1) + 1 FROM active_queue",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                };
+
+                let mut entry = QueueEntry {
+                    id: 0,
+                    position,
+                    url: url.clone(),
+                    title,
+                    thumbnail,
+                    thumbnail_url,
+                    uploader,
+                    id_hash: id_hash.clone(),
+                    current: count == 0,
+                    resolved_source: None,
+                    resolved_at: None,
+                    selected_video: None,
+                    selected_audio: None,
+                    selected_muxed: None,
+                };
+                connection.execute(
+                    "INSERT INTO active_queue (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, selected_video, selected_audio, selected_muxed)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        entry.position,
+                        entry.url,
+                        entry.title,
+                        entry.thumbnail,
+                        entry.thumbnail_url,
+                        entry.uploader,
+                        entry.id_hash,
+                        entry.current as i64,
+                        entry.selected_video,
+                        entry.selected_audio,
+                        entry.selected_muxed,
+                    ],
+                )?;
+                entry.id = connection.last_insert_rowid();
+                Ok(entry)
+            })
+            .map_err(Error::from)
+    }
+
     /// Replaces the whole queue with a single, current entry.
     ///
     /// This is what "play now" does: the old queue is dropped and the new
@@ -755,6 +837,27 @@ mod tests {
             "https://example.com/a"
         );
         assert_eq!(queue.entries().expect("entries work").len(), 2);
+    }
+
+    #[test]
+    fn push_next_inserts_after_current_entry() {
+        let queue = queue();
+        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let third = queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        let second =
+            queue.push_next("https://example.com/b", "B", None, None, None).expect("push next works");
+
+        assert_eq!(second.position, 1);
+        assert!(!second.current);
+        let entries = queue.entries().expect("entries work");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, first.id);
+        assert_eq!(entries[0].position, 0);
+        assert_eq!(entries[1].id, second.id);
+        assert_eq!(entries[1].url, "https://example.com/b");
+        assert_eq!(entries[2].id, third.id);
+        assert_eq!(entries[2].position, 2);
+        assert!(entries[0].current);
     }
 
     #[test]

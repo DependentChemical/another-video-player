@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { CloseButton, FlatButton } from "../widgets.slint";
+import { CloseButton, FlatButton, MoreIcon } from "../widgets.slint";
 
 export component PendingDialog inherits Rectangle {
     in property <string> pending-title: "";
@@ -7,7 +7,18 @@ export component PendingDialog inherits Rectangle {
     in-out property <bool> pending-open: false;
     callback pending-play-requested();
     callback pending-queue-requested();
+    callback pending-queue-next-requested();
     callback pending-dismissed();
+
+    private property <bool> options-open: false;
+    private property <length> menu-anchor-x: 0px;
+    private property <length> menu-anchor-y: 0px;
+
+    changed pending-open => {
+        if !self.pending-open {
+            self.options-open = false;
+        }
+    }
 
     background: #00000088;
 
@@ -21,7 +32,7 @@ export component PendingDialog inherits Rectangle {
     pending-panel := Rectangle {
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;
-        width: min(root.width - 40px, 420px);
+        width: min(root.width - 40px, 460px);
         height: min(root.height - 40px, 440px);
         border-radius: 10px;
         border-width: 1px;
@@ -37,7 +48,15 @@ export component PendingDialog inherits Rectangle {
             spacing: 12px;
 
             HorizontalLayout {
-                alignment: end;
+                alignment: space-between;
+
+                Text {
+                    text: "New Video";
+                    color: Theme.fg;
+                    font-size: 16px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
 
                 CloseButton {
                     clicked => {
@@ -83,13 +102,62 @@ export component PendingDialog inherits Rectangle {
                 spacing: 8px;
                 alignment: end;
 
-                FlatButton {
-                    width: 130px;
+                split-button := Rectangle {
                     height: 34px;
-                    label: "Add to queue";
-                    clicked => {
-                        root.pending-open = false;
-                        root.pending-queue-requested();
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    clip: true;
+                    background: Theme.panel;
+
+                    HorizontalLayout {
+                        spacing: 0px;
+
+                        Rectangle {
+                            width: 130px;
+                            background: left-touch.pressed ? Theme.elevated : (left-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                            Text {
+                                text: "Add to queue";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            left-touch := TouchArea {
+                                clicked => {
+                                    root.options-open = false;
+                                    root.pending-open = false;
+                                    root.pending-queue-requested();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 1px;
+                            background: Theme.border;
+                        }
+
+                        Rectangle {
+                            width: 34px;
+                            background: right-touch.pressed ? Theme.elevated : (right-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                            MoreIcon {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                size: 18px;
+                                ink: right-touch.has-hover ? Theme.fg : Theme.muted;
+                            }
+
+                            right-touch := TouchArea {
+                                clicked => {
+                                    root.menu-anchor-x = split-button.absolute-position.x - pending-panel.absolute-position.x;
+                                    root.menu-anchor-y = split-button.absolute-position.y - pending-panel.absolute-position.y + split-button.height + 4px;
+                                    root.options-open = !root.options-open;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -99,8 +167,68 @@ export component PendingDialog inherits Rectangle {
                     label: "Play now";
                     primary: true;
                     clicked => {
+                        root.options-open = false;
                         root.pending-open = false;
                         root.pending-play-requested();
+                    }
+                }
+            }
+        }
+
+        if root.options-open: Rectangle {
+            x: 0;
+            y: 0;
+            width: pending-panel.width;
+            height: pending-panel.height;
+            background: transparent;
+
+            TouchArea {
+                clicked => {
+                    root.options-open = false;
+                }
+            }
+
+            Rectangle {
+                x: min(max(8px, root.menu-anchor-x), pending-panel.width - self.width - 8px);
+                y: min(root.menu-anchor-y, pending-panel.height - self.height - 8px);
+                width: menu-layout.preferred-width;
+                height: menu-layout.preferred-height;
+                background: Theme.panel;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 8px;
+                drop-shadow-color: #00000080;
+
+                menu-layout := VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: play-next-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: start;
+
+                            Text {
+                                text: "Play Next in Queue";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        play-next-touch := TouchArea {
+                            clicked => {
+                                root.options-open = false;
+                                root.pending-open = false;
+                                root.pending-queue-next-requested();
+                            }
+                        }
                     }
                 }
             }

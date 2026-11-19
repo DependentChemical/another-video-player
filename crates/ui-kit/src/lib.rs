@@ -764,6 +764,11 @@ impl PlayerUi {
         self.window.on_pending_queue_requested(handler);
     }
 
+    /// Called when the user asks to play the pending media next in the queue.
+    pub fn on_pending_queue_next(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_queue_next_requested(handler);
+    }
+
     /// Called when the user dismisses the pending dialog.
     pub fn on_pending_dismissed(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_dismissed(handler);

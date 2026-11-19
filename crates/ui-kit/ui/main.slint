@@ -117,6 +117,7 @@ export component MainWindow inherits Window {
     callback interacting-changed(bool);
     callback pending-play-requested();
     callback pending-queue-requested();
+    callback pending-queue-next-requested();
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
@@ -321,6 +322,7 @@ export component MainWindow inherits Window {
         pending-open <=> root.pending-open;
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
+        pending-queue-next-requested => { root.pending-queue-next-requested(); }
         pending-dismissed => { root.pending-dismissed(); }
     }
 
