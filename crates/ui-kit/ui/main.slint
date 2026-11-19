@@ -12,7 +12,11 @@ import { SourceColumn } from "slint-ui/SourceColumn.slint";
 import { Sidebar } from "slint-ui/Sidebar.slint";
 import { QueueDialog } from "slint-ui/QueueDialog.slint";
 import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
-import { StreamItem, QueueItem, HistoryItem, BufferedRange } from "slint-ui/types.slint";
+import { PlaylistDialog } from "slint-ui/PlaylistDialog.slint";
+import { CreatePlaylistDialog } from "slint-ui/CreatePlaylistDialog.slint";
+import {
+    PlaylistItem, StreamItem, QueueItem, HistoryItem, BufferedRange
+} from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
 import "../fonts/NotoSansCJKsc-VF.ttf";
@@ -93,6 +97,9 @@ export component MainWindow inherits Window {
     in-out property <bool> sidebar-open: false;
     // The queue and history lists shown from the sidebar.
     in-out property <bool> queue-open: false;
+    // "Queue" or "Queue [name]" for the active playlist.
+    in property <string> queue-title: "Queue";
+    in property <bool> queue-in-playlist: false;
     in property <[QueueItem]> queue-items: [];
     in property <int> queue-current-index: -1;
     in property <int> queue-current-id: -1;
@@ -102,6 +109,13 @@ export component MainWindow inherits Window {
     in-out property <bool> queue-drag-scroll-tick: false;
     in-out property <bool> history-open: false;
     in property <[HistoryItem]> history-items: [];
+    // The playlist list and the name dialog that opens over it.
+    in-out property <bool> playlists-open: false;
+    in property <[PlaylistItem]> playlist-items: [];
+    in-out property <bool> create-playlist-open: false;
+    in-out property <string> create-playlist-duplicate: "";
+    // Whether the pending dialog belongs to a user playlist.
+    in property <bool> pending-in-playlist: false;
 
     // ------------------------------------------------------------ events --
     callback load-requested();
@@ -117,10 +131,16 @@ export component MainWindow inherits Window {
     callback interacting-changed(bool);
     callback pending-play-requested();
     callback pending-queue-requested();
+    callback pending-queue-next-requested();
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
     callback queue-requested();
+    callback playlists-requested();
+    callback playlist-selected(string);
+    callback create-playlist(string);
+    callback confirm-create-playlist(string);
+    callback create-playlist-dismissed();
     callback history-requested();
     callback queue-item-selected(int);
     callback queue-copy-url(string);
@@ -128,6 +148,12 @@ export component MainWindow inherits Window {
     callback queue-move-requested(int, int);
     callback queue-row-pressed(int);
     callback queue-row-released(int);
+    callback queue-add-to-playlist(int, string);
+    callback queue-move-to-playlist(int, string);
+    callback queue-add-to-new-playlist(int);
+    callback queue-move-to-new-playlist(int);
+    callback pending-add-to-playlist(string);
+    callback pending-add-to-new-playlist();
     callback history-item-selected(string);
 
     // --------------------------------------------------------- internals --
@@ -276,6 +302,10 @@ export component MainWindow inherits Window {
             root.sidebar-open = false;
             root.queue-requested();
         }
+        playlists-clicked => {
+            root.sidebar-open = false;
+            root.playlists-requested();
+        }
         history-clicked => {
             root.sidebar-open = false;
             root.history-requested();
@@ -318,9 +348,14 @@ export component MainWindow inherits Window {
         height: parent.height;
         pending-title: root.pending-title;
         pending-thumbnail: root.pending-thumbnail;
+        in-playlist: root.pending-in-playlist;
+        playlists: root.playlist-items;
         pending-open <=> root.pending-open;
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
+        pending-queue-next-requested => { root.pending-queue-next-requested(); }
+        pending-add-to-playlist(id) => { root.pending-add-to-playlist(id); }
+        pending-add-to-new-playlist => { root.pending-add-to-new-playlist(); }
         pending-dismissed => { root.pending-dismissed(); }
     }
 
@@ -328,10 +363,13 @@ export component MainWindow inherits Window {
     if root.queue-open: QueueDialog {
         width: parent.width;
         height: parent.height;
+        title: root.queue-title;
         items: root.queue-items;
         current-index: root.queue-current-index;
         current-id: root.queue-current-id;
         long-press-index: root.queue-long-press-index;
+        in-playlist: root.queue-in-playlist;
+        playlists: root.playlist-items;
         queue-content-y <=> root.queue-content-y;
         drag-pointer-y <=> root.queue-drag-pointer-y;
         drag-scroll-tick: root.queue-drag-scroll-tick;
@@ -342,6 +380,10 @@ export component MainWindow inherits Window {
         move-requested(src, tgt) => { root.queue-move-requested(src, tgt); }
         queue-row-pressed(index) => { root.queue-row-pressed(index); }
         queue-row-released(index) => { root.queue-row-released(index); }
+        add-to-playlist(entry, playlist) => { root.queue-add-to-playlist(entry, playlist); }
+        move-to-playlist(entry, playlist) => { root.queue-move-to-playlist(entry, playlist); }
+        add-to-new-playlist(entry) => { root.queue-add-to-new-playlist(entry); }
+        move-to-new-playlist(entry) => { root.queue-move-to-new-playlist(entry); }
         dismissed => { root.queue-open = false; }
     }
 
@@ -353,6 +395,31 @@ export component MainWindow inherits Window {
         open <=> root.history-open;
         item-selected(url) => { root.history-item-selected(url); }
         dismissed => { root.history-open = false; }
+    }
+
+    // Playlist list and the name dialog that opens over it.
+    if root.playlists-open: PlaylistDialog {
+        width: parent.width;
+        height: parent.height;
+        items: root.playlist-items;
+        open <=> root.playlists-open;
+        playlist-selected(id) => { root.playlist-selected(id); }
+        create-requested => { root.create-playlist-open = true; }
+        dismissed => { root.playlists-open = false; }
+    }
+
+    if root.create-playlist-open: CreatePlaylistDialog {
+        width: parent.width;
+        height: parent.height;
+        duplicate-name <=> root.create-playlist-duplicate;
+        open <=> root.create-playlist-open;
+        create(name) => { root.create-playlist(name); }
+        confirm-create(name) => { root.confirm-create-playlist(name); }
+        dismissed => {
+            root.create-playlist-open = false;
+            root.create-playlist-duplicate = "";
+            root.create-playlist-dismissed();
+        }
     }
 
     if root.update-open: Rectangle {

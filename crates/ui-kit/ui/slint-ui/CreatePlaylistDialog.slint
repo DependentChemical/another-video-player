@@ -1,0 +1,176 @@
+import { Theme } from "../theme.slint";
+import { CloseButton, FlatButton } from "../widgets.slint";
+
+// Asks for the name of a new playlist.
+//
+// It also carries the duplicate confirmation: the host checks the existing
+// names and sets `duplicate-name` when the user asked for a name that is
+// already taken, so the same dialog can ask whether to create it anyway.
+export component CreatePlaylistDialog inherits Rectangle {
+    in-out property <bool> open: false;
+    // Empty unless the host is asking whether a duplicate name is okay.
+    in-out property <string> duplicate-name: "";
+    callback create(string);
+    callback confirm-create(string);
+    callback dismissed();
+
+    private property <string> error: "";
+    private property <string> pending-name: "";
+    private property <string> name-text: "";
+
+    function submit() {
+        let name = root.name-text;
+        if name == "" {
+            root.error = "Enter a playlist name.";
+            return;
+        }
+        if name.to-lowercase() == "active queue" {
+            root.error = "\"Active Queue\" is reserved for the built-in queue.";
+            return;
+        }
+        root.error = "";
+        root.pending-name = root.name-text;
+        root.create(root.name-text);
+    }
+
+    changed open => {
+        if (root.open) {
+            root.name-text = "";
+            root.error = "";
+            root.pending-name = "";
+        }
+    }
+
+    changed duplicate-name => {
+        if (root.duplicate-name != "") {
+            root.pending-name = root.duplicate-name;
+        }
+    }
+
+    background: #000000aa;
+
+    TouchArea {
+        clicked => {
+            root.open = false;
+            root.duplicate-name = "";
+            root.dismissed();
+        }
+    }
+
+    panel := Rectangle {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: min(root.width - 40px, 420px);
+        height: body.preferred-height;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        background: Theme.panel;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: #000000c0;
+
+        TouchArea { }
+
+        body := VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                alignment: space-between;
+
+                Text {
+                    text: root.duplicate-name == "" ? "New Playlist" : "Playlist Already Exists";
+                    color: Theme.fg;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                CloseButton {
+                    clicked => {
+                        root.open = false;
+                        root.duplicate-name = "";
+                        root.dismissed();
+                    }
+                }
+            }
+
+            if root.duplicate-name == "": Rectangle {
+                height: 36px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: input.has-focus ? Theme.accent : Theme.border;
+                background: Theme.elevated;
+
+                input := TextInput {
+                    x: 10px;
+                    y: 0;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    text <=> root.name-text;
+                    color: Theme.fg;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    accepted => {
+                        root.submit();
+                    }
+                }
+            }
+
+            if root.duplicate-name != "": Text {
+                text: "A playlist named \"" + root.duplicate-name
+                    + "\" already exists. Do you want to create another one?";
+                color: Theme.fg;
+                font-size: 13px;
+                wrap: word-wrap;
+                vertical-stretch: 1;
+            }
+
+            if root.error != "": Text {
+                text: root.error;
+                color: Theme.danger;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+
+                FlatButton {
+                    width: 90px;
+                    height: 34px;
+                    label: "Cancel";
+                    clicked => {
+                        root.open = false;
+                        root.duplicate-name = "";
+                        root.dismissed();
+                    }
+                }
+
+                if root.duplicate-name == "": FlatButton {
+                    width: 90px;
+                    height: 34px;
+                    label: "Create";
+                    primary: true;
+                    clicked => {
+                        root.submit();
+                    }
+                }
+
+                if root.duplicate-name != "": FlatButton {
+                    width: 140px;
+                    height: 34px;
+                    label: "Create Anyway";
+                    primary: true;
+                    clicked => {
+                        let name = root.pending-name;
+                        root.open = false;
+                        root.duplicate-name = "";
+                        root.confirm-create(name);
+                    }
+                }
+            }
+        }
+    }
+}

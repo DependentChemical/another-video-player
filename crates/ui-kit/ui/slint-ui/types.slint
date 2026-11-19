@@ -37,3 +37,15 @@ export struct HistoryItem {
     uploader: string,
     url: string,
 }
+
+/// One playlist in the playlist list and every playlist picker.
+export struct PlaylistItem {
+    /// The stable id handed back when the playlist is picked.
+    id: string,
+    /// The name shown to the user.
+    name: string,
+    /// Whether this is the playlist the player is on.
+    active: bool,
+    /// Whether this is the built-in active queue.
+    is-active-queue: bool,
+}

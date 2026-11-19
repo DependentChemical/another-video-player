@@ -1,15 +1,22 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { CloseButton, PlayIcon, MoreIcon, ContentCopyIcon, DeleteIcon } from "../widgets.slint";
-import { QueueItem } from "types.slint";
+import {
+    CloseButton, FlatButton, Icon, PlayIcon, MoreIcon, ContentCopyIcon, DeleteIcon
+} from "../widgets.slint";
+import { PlaylistItem, QueueItem } from "types.slint";
 
-// The list of the active queue, shown from the sidebar.
+// The list of the active playlist, shown from the sidebar.
 export component QueueDialog inherits Rectangle {
     in-out property <bool> open: false;
+    // "Queue" for the built-in queue, "Queue [name]" for a user playlist.
+    in property <string> title: "Queue";
     in property <[QueueItem]> items: [];
     in property <int> current-index: -1;
     in property <int> current-id: -1;
     in property <int> long-press-index: -1;
+    // Whether the list belongs to a user playlist rather than the queue.
+    in property <bool> in-playlist: false;
+    in property <[PlaylistItem]> playlists: [];
     in-out property <length> queue-content-y: 0px;
     // The absolute (window) y of the pointer during a drag. Kept by the
     // dragged row itself because Slint only updates the grabbed `TouchArea`
@@ -22,12 +29,19 @@ export component QueueDialog inherits Rectangle {
     in property <bool> drag-scroll-tick: false;
     in-out property <bool> menu-open: false;
     in-out property <string> menu-url: "";
+    in-out property <int> menu-entry-id: -1;
+    private property <bool> picker-open: false;
+    private property <bool> picker-moves: false;
     callback item-selected(int);
     callback copy-url(string);
     callback remove-entry(int);
     callback move-requested(int, int);
     callback queue-row-pressed(int);
     callback queue-row-released(int);
+    callback add-to-playlist(int, string);
+    callback move-to-playlist(int, string);
+    callback add-to-new-playlist(int);
+    callback move-to-new-playlist(int);
     callback dismissed();
 
     private property <length> row-spacing: 4px;
@@ -61,6 +75,8 @@ export component QueueDialog inherits Rectangle {
     changed open => {
         if !self.open {
             self.menu-open = false;
+            self.picker-open = false;
+            self.picker-moves = false;
         }
     }
 
@@ -93,7 +109,7 @@ export component QueueDialog inherits Rectangle {
                 alignment: space-between;
 
                 Text {
-                    text: "Queue";
+                    text: root.title;
                     color: Theme.fg;
                     font-size: 18px;
                     font-weight: 600;
@@ -301,6 +317,7 @@ export component QueueDialog inherits Rectangle {
                                                         - panel.absolute-position.y + option-button.height + 4px;
                                                     root.menu-open = true;
                                                     root.menu-url = item.url;
+                                                    root.menu-entry-id = item.id;
                                                 }
                                             }
                                         }
@@ -371,6 +388,7 @@ export component QueueDialog inherits Rectangle {
                 menu-layout := VerticalLayout {
                     padding: 4px;
                     spacing: 2px;
+                    alignment: start;
 
                     Rectangle {
                         height: 32px;
@@ -378,6 +396,7 @@ export component QueueDialog inherits Rectangle {
                         background: menu-touch.has-hover ? Theme.elevated : transparent;
 
                         HorizontalLayout {
+                            alignment: start;
                             spacing: 8px;
                             padding-left: 8px;
                             padding-right: 8px;
@@ -390,6 +409,8 @@ export component QueueDialog inherits Rectangle {
                                 text: "Copy URL";
                                 color: Theme.fg;
                                 font-size: 13px;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: left;
                             }
                         }
 
@@ -398,6 +419,185 @@ export component QueueDialog inherits Rectangle {
                                 root.copy-url(root.menu-url);
                                 root.menu-open = false;
                             }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: playlist-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            cross-axis-alignment: center;
+
+                            Icon {
+                                glyph: "\u{e405}";
+                                size: 16px;
+                                ink: playlist-touch.has-hover ? Theme.accent : Theme.muted;
+                            }
+                            Text {
+                                text: root.in-playlist ? "Add to Another Playlist" : "Add to Playlist";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: left;
+                            }
+                        }
+
+                        playlist-touch := TouchArea {
+                            clicked => {
+                                root.menu-open = false;
+                                root.picker-moves = false;
+                                root.picker-open = true;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: move-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            cross-axis-alignment: center;
+
+                            Icon {
+                                glyph: "\u{e405}";
+                                size: 16px;
+                                ink: move-touch.has-hover ? Theme.accent : Theme.muted;
+                            }
+                            Text {
+                                text: root.in-playlist ? "Move to Another Playlist" : "Move to Playlist";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: left;
+                            }
+                        }
+
+                        move-touch := TouchArea {
+                            clicked => {
+                                root.menu-open = false;
+                                root.picker-moves = true;
+                                root.picker-open = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The playlist picker sits above the row menu and asks where the
+        // current row should be added or moved. Outside clicks cancel it.
+        if root.picker-open: Rectangle {
+            width: panel.width;
+            height: panel.height;
+            background: #00000066;
+
+            TouchArea {
+                clicked => {
+                    root.picker-open = false;
+                }
+            }
+
+            picker := Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(parent.width - 40px, 360px);
+                height: min(parent.height - 40px, 420px);
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.panel;
+                drop-shadow-blur: 18px;
+                drop-shadow-color: #000000c0;
+
+                TouchArea { }
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.picker-moves ? "Move to Playlist" : "Add to Playlist";
+                        color: Theme.fg;
+                        font-size: 15px;
+                        font-weight: 600;
+                    }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            spacing: 4px;
+                            padding-right: 10px;
+
+                            for playlist in root.playlists: Rectangle {
+                                height: 40px;
+                                border-radius: 6px;
+                                background: picker-touch.has-hover && (!root.picker-moves || !playlist.active)
+                                    ? Theme.elevated
+                                    : transparent;
+
+                                HorizontalLayout {
+                                    alignment: start;
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    cross-axis-alignment: center;
+
+                                    Text {
+                                        text: playlist.name;
+                                        color: root.picker-moves && playlist.active ? Theme.muted : Theme.fg;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        horizontal-alignment: left;
+                                    }
+                                }
+
+                                picker-touch := TouchArea {
+                                    clicked => {
+                                        if !root.picker-moves || !playlist.active {
+                                            root.picker-open = false;
+                                            if root.picker-moves {
+                                                root.move-to-playlist(root.menu-entry-id, playlist.id);
+                                            } else {
+                                                root.add-to-playlist(root.menu-entry-id, playlist.id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    FlatButton {
+                        height: 32px;
+                        label: root.picker-moves ? "Move to New Playlist" : "Add to New Playlist";
+                        primary: true;
+                        clicked => {
+                            root.picker-open = false;
+                            if root.picker-moves {
+                                root.move-to-new-playlist(root.menu-entry-id);
+                            } else {
+                                root.add-to-new-playlist(root.menu-entry-id);
+                            }
+                        }
+                    }
+
+                    FlatButton {
+                        height: 32px;
+                        label: "Cancel";
+                        clicked => {
+                            root.picker-open = false;
                         }
                     }
                 }
@@ -436,7 +636,7 @@ export component QueueDialog inherits Rectangle {
     }
 
     // Commit the move: hand the source/target indices to the host, which
-    // rebuilds the id order in active_queue and repaints the queue.
+    // rebuilds the id order in the active playlist and repaints the queue.
     function commit_move() {
         let source = root.long-press-index;
         let target = root.drag-target;

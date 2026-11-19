@@ -16,7 +16,7 @@ use playback_engine::{EndReason, EngineEvent};
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
-use ui_kit::{HistoryListEntry, PlayerUi, QueueListEntry, StatusKind};
+use ui_kit::{HistoryListEntry, PlayerUi, PlaylistListEntry, QueueListEntry, StatusKind};
 
 use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
@@ -25,6 +25,14 @@ use crate::loading::{self, Loading};
 enum PendingUpdate {
     App(updater::Update),
     Tool(ytdlp_tool::ToolUpdate),
+}
+
+/// What to do with the playlist that a dialog is about to create.
+#[derive(Debug, Clone, Copy)]
+enum PlaylistIntent {
+    AddEntry(i64),
+    MoveEntry(i64),
+    AddPending,
 }
 
 /// How often the interface is refreshed.
@@ -194,13 +202,150 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            ui.on_pending_queue_next(move || {
+                let _ = app.queue_pending_next();
+                ui_for_pending.set_url("");
+                ui_for_pending.blur_url();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
             ui.on_pending_dismissed(move || app.dismiss_pending());
         }
         {
             let app = Arc::clone(&app);
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_requested(move || {
-                ui_for_queue.show_queue(&queue_list(&app));
+                ui_for_queue.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_playlists = Rc::clone(&ui);
+            ui.on_playlists_requested(move || {
+                ui_for_playlists.show_playlists(&playlist_list(&app));
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_selection = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_playlist_selected(move |id| {
+                if app.select_playlist(id.as_str()) {
+                    loading.borrow_mut().resolve_started();
+                }
+                ui_for_selection.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
+            });
+        }
+        let playlist_intent: Rc<RefCell<Option<PlaylistIntent>>> = Rc::new(RefCell::new(None));
+        {
+            let app = Arc::clone(&app);
+            let ui_for_create = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_create_playlist(move |name| {
+                create_playlist(&app, &ui_for_create, &loading, &intent, name.as_str(), false);
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_create = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_confirm_create_playlist(move |name| {
+                create_playlist(&app, &ui_for_create, &loading, &intent, name.as_str(), true);
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_create_playlist_dismissed(move || {
+                *intent.borrow_mut() = None;
+                ui_for_create.close_create_playlist();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_playlist = Rc::clone(&ui);
+            ui.on_queue_add_to_playlist(move |entry, playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                playlist_action(
+                    &app,
+                    &ui_for_playlist,
+                    &loading,
+                    PlaylistIntent::AddEntry(entry as i64),
+                    playlist_id.as_str(),
+                    &target,
+                );
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_playlist = Rc::clone(&ui);
+            ui.on_queue_move_to_playlist(move |entry, playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                playlist_action(
+                    &app,
+                    &ui_for_playlist,
+                    &loading,
+                    PlaylistIntent::MoveEntry(entry as i64),
+                    playlist_id.as_str(),
+                    &target,
+                );
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_queue_add_to_new_playlist(move |entry| {
+                *intent.borrow_mut() = Some(PlaylistIntent::AddEntry(entry as i64));
+                ui_for_create.show_create_playlist();
+            });
+        }
+        {
+            let ui_for_create = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_queue_move_to_new_playlist(move |entry| {
+                *intent.borrow_mut() = Some(PlaylistIntent::MoveEntry(entry as i64));
+                ui_for_create.show_create_playlist();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
+            let ui_for_pending = Rc::clone(&ui);
+            ui.on_pending_add_to_playlist(move |playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                playlist_action(
+                    &app,
+                    &ui_for_pending,
+                    &loading,
+                    PlaylistIntent::AddPending,
+                    playlist_id.as_str(),
+                    &target,
+                );
+            });
+        }
+        {
+            let ui_for_pending = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_pending_add_to_new_playlist(move || {
+                *intent.borrow_mut() = Some(PlaylistIntent::AddPending);
+                ui_for_pending.show_create_playlist();
             });
         }
         {
@@ -250,7 +395,11 @@ impl Shell {
                 if removal.advanced {
                     loading.borrow_mut().resolve_started();
                 }
-                ui_for_queue.show_queue(&queue_list(&app));
+                ui_for_queue.show_queue(
+                    &queue_list(&app),
+                    &queue_title(&app),
+                    &playlist_list(&app),
+                );
             });
         }
         {
@@ -269,7 +418,11 @@ impl Shell {
                 entries.insert(tgt as usize, entry);
                 let ids: Vec<i64> = entries.into_iter().map(|entry| entry.id).collect();
                 if app.reorder_queue(&ids) {
-                    ui_for_queue.show_queue(&queue_list(&app));
+                    ui_for_queue.show_queue(
+                        &queue_list(&app),
+                        &queue_title(&app),
+                        &playlist_list(&app),
+                    );
                 }
             });
         }
@@ -539,6 +692,119 @@ fn queue_list(app: &App) -> Vec<QueueListEntry> {
         .collect()
 }
 
+/// Turns the stored playlists into the rows the dialog draws.
+fn playlist_list(app: &App) -> Vec<PlaylistListEntry> {
+    app.playlists()
+        .into_iter()
+        .map(|playlist| PlaylistListEntry {
+            id: playlist.id,
+            name: playlist.name,
+            active: playlist.active,
+            is_active_queue: playlist.is_active_queue,
+        })
+        .collect()
+}
+
+/// The title of the queue dialog for the active playlist.
+fn queue_title(app: &App) -> String {
+    match app.active_playlist_name() {
+        Some(name) => format!("Queue [{name}]"),
+        None => "Queue".to_string(),
+    }
+}
+
+/// The name of a playlist, for the confirmation toast.
+fn playlist_name(app: &App, playlist_id: &str) -> Option<String> {
+    app.playlists()
+        .into_iter()
+        .find(|playlist| playlist.id == playlist_id)
+        .map(|playlist| playlist.name)
+}
+
+/// Creates a playlist, asking about a duplicate name before it is stored.
+///
+/// `confirmed` is set by the duplicate dialog, so the second attempt actually
+/// creates the playlist instead of asking again. When the dialog was opened
+/// from a picker, `intent` says what should happen with the new playlist.
+fn create_playlist(
+    app: &App,
+    ui: &PlayerUi,
+    loading: &Rc<RefCell<Loading>>,
+    intent: &Rc<RefCell<Option<PlaylistIntent>>>,
+    name: &str,
+    confirmed: bool,
+) {
+    let name = name.trim();
+    if !confirmed && app.playlist_name_exists(name) {
+        ui.show_duplicate_playlist(name);
+        return;
+    }
+    match app.create_playlist(name) {
+        Ok(playlist) => {
+            let action = intent.borrow_mut().take();
+            ui.close_create_playlist();
+            match action {
+                Some(action) => playlist_action(
+                    app,
+                    ui,
+                    loading,
+                    action,
+                    playlist.id.as_str(),
+                    playlist.name.as_str(),
+                ),
+                None => {
+                    ui.show_playlists(&playlist_list(app));
+                    ui.show_toast(&format!("Created playlist {}", playlist.name));
+                }
+            }
+        }
+        Err(error) => ui.show_toast(&error),
+    }
+}
+
+/// Applies an action to a playlist after the target is known.
+fn playlist_action(
+    app: &App,
+    ui: &PlayerUi,
+    loading: &Rc<RefCell<Loading>>,
+    action: PlaylistIntent,
+    playlist_id: &str,
+    target_name: &str,
+) {
+    match action {
+        PlaylistIntent::AddEntry(entry_id) => {
+            if app.add_entry_to_playlist(entry_id, playlist_id) {
+                ui.show_toast(&format!("Added to {target_name}"));
+            } else {
+                ui.show_toast("The video could not be added to the playlist");
+            }
+            ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+        }
+        PlaylistIntent::MoveEntry(entry_id) => {
+            match app.move_entry_to_playlist(entry_id, playlist_id) {
+                Some(removal) => {
+                    if removal.advanced {
+                        loading.borrow_mut().resolve_started();
+                    }
+                    ui.show_toast(&format!("Moved to {target_name}"));
+                }
+                None => ui.show_toast("The video could not be moved to the playlist"),
+            }
+            ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+        }
+        PlaylistIntent::AddPending => {
+            if app.add_pending_to_playlist(playlist_id) {
+                ui.hide_pending();
+                ui.set_url("");
+                ui.blur_url();
+                ui.show_toast(&format!("Added to {target_name}"));
+            } else {
+                ui.show_toast("The video could not be added to the playlist");
+            }
+        }
+    }
+}
+
 /// Brings the interface and the player back in sync.
 fn tick(
     ui: &PlayerUi,
@@ -605,7 +871,13 @@ fn tick(
                 }
             }
             Message::Pending(Ok(pending)) => {
-                ui.show_pending(&pending.title, pending.thumbnail.as_deref());
+                let in_playlist = app.active_playlist_name().is_some();
+                ui.show_pending(
+                    &pending.title,
+                    pending.thumbnail.as_deref(),
+                    in_playlist,
+                    &playlist_list(app),
+                );
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {

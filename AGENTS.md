@@ -111,6 +111,17 @@ is not enforced.
 `cargo run -p app-core` is enough to try it: the player downloads `yt-dlp`
 for itself when it is missing, and looks for a newer one on every start.
 
+## Verification checklist
+
+When asked to "do checks" or verify changes, run at minimum:
+
+1. `cargo fmt --all` — ensures consistent formatting (CI fails without it)
+2. `cargo test --workspace` — all unit tests pass
+3. `cargo clippy --workspace --all-targets -- -D warnings` — no warnings
+4. `cargo xtask isolation` — isolation rules satisfied
+
+This sequence mirrors the `dev-test` workflow and the release build pipeline.
+
 ## Project layout
 
 - `crates/app-core` — the composition root: the window, the wiring and the

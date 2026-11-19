@@ -8,6 +8,7 @@ import { Icon } from "../widgets.slint";
 export component Sidebar inherits Rectangle {
     in property <bool> open: false;
     callback queue-clicked();
+    callback playlists-clicked();
     callback history-clicked();
     callback dismissed();
 
@@ -73,6 +74,39 @@ export component Sidebar inherits Rectangle {
                 queue-touch := TouchArea {
                     clicked => {
                         root.queue-clicked();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: 8px;
+                background: playlists-touch.has-hover ? Theme.elevated : transparent;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+                    alignment: start;
+                    cross-axis-alignment: center;
+
+                    Icon {
+                        glyph: "\u{e405}";
+                        size: 20px;
+                        ink: playlists-touch.has-hover ? Theme.fg : Theme.muted;
+                    }
+
+                    Text {
+                        text: "Playlists";
+                        color: Theme.fg;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                playlists-touch := TouchArea {
+                    clicked => {
+                        root.playlists-clicked();
                     }
                 }
             }
