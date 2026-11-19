@@ -335,6 +335,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Updates the pre-buffer settings for the next load.
+    ///
+    /// For live streams, pass `is_live = true` to disable initial buffering
+    /// so playback starts immediately. The user can still manually pre-buffer
+    /// by pausing the stream. For regular media, pass `is_live = false` to
+    /// use the configured `pre_buffer_seconds`.
+    pub fn set_pre_buffer(&self, pre_buffer_seconds: u32, is_live: bool) -> Result<(), Error> {
+        if is_live {
+            self.core.set_property("cache-pause-initial", "no")?;
+            self.core.set_property("demuxer-readahead-secs", "0")?;
+            self.core.set_property("cache-pause-wait", "0")?;
+        } else {
+            let pre_buffer = pre_buffer_seconds.to_string();
+            self.core.set_property("cache-pause-initial", "yes")?;
+            self.core.set_property("demuxer-readahead-secs", pre_buffer.as_str())?;
+            self.core.set_property("cache-pause-wait", pre_buffer.as_str())?;
+        }
+        Ok(())
+    }
+
     /// The current playback position in seconds.
     pub fn position(&self) -> f64 {
         self.core.get_property::<f64>("time-pos").unwrap_or(0.0)

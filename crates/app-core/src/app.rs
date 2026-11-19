@@ -1300,7 +1300,7 @@ impl App {
 
         match plan {
             Some(plan) => {
-                if let Err(error) = self.start(&plan) {
+                if let Err(error) = self.start(&plan, loaded.is_live) {
                     self.handle_playback_error(url.to_string(), error);
                 } else if let Err(error) = self.engine.play() {
                     self.handle_playback_error(url.to_string(), error.to_string());
@@ -1441,9 +1441,13 @@ impl App {
             }
         };
 
-        let pending = {
+        let is_live = {
             let state = self.state.lock().expect("the state is not poisoned");
-            if state.is_live {
+            state.is_live
+        };
+        let pending = {
+            let _state = self.state.lock().expect("the state is not poisoned");
+            if is_live {
                 Some(PendingSeek::LiveEdge)
             } else {
                 let position = self.engine.position().max(0.0);
@@ -1451,7 +1455,7 @@ impl App {
             }
         };
 
-        if let Err(error) = self.start(&plan) {
+        if let Err(error) = self.start(&plan, is_live) {
             self.report(error);
             return;
         }
@@ -1889,10 +1893,14 @@ impl App {
     }
 
     /// Loads a finished playback plan into the player.
-    fn start(&self, plan: &PlaybackPlan) -> Result<(), String> {
+    fn start(&self, plan: &PlaybackPlan, is_live: bool) -> Result<(), String> {
         // Every load belongs to a different media, and a cached packet from
         // the old source would be plain garbage to the new demuxer.
         clear_stream_buffer(&self.stream_buffer);
+        let pre_buffer_seconds = self.settings.pre_buffer_seconds().0;
+        self.engine
+            .set_pre_buffer(pre_buffer_seconds, is_live)
+            .map_err(|error| error.to_string())?;
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
