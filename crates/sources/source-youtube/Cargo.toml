@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "source-youtube"
 description = "YouTube-specific session and cookie behavior for Flatline."
 version.workspace = true
@@ -12,6 +12,10 @@ authors.workspace = true
 media-model = { workspace = true }
 web-session = { workspace = true }
 url = { workspace = true }
+ureq = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
 
 [lib]
 name = "source_youtube"

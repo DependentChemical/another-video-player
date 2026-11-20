@@ -1,7 +1,9 @@
-//! YouTube-specific session and cookie behavior for Flatline.
+﻿//! YouTube-specific session and cookie behavior for Flatline.
 //!
 //! Layer 1 source capability: owns only the YouTube deviations from the
 //! generic web-session flow and is wired in by the composition root.
+
+pub mod sponsorblock;
 
 use media_model::Service;
 use url::Url;

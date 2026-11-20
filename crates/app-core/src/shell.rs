@@ -833,15 +833,27 @@ fn tick(
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(media)) => {
-                let crate::app::ResolvedMedia { url, thumbnail, resolved_at, reason, source } =
-                    media;
+                let crate::app::ResolvedMedia {
+                    url,
+                    thumbnail,
+                    resolved_at,
+                    reason,
+                    source,
+                    sponsorblock_segments,
+                } = media;
                 app_logging::debug(format!(
-                    "handling a resolved video: url={url} reason={}",
-                    reason.as_str()
+                    "handling a resolved video: url={url} reason={} sponsorblock_segments={}",
+                    reason.as_str(),
+                    sponsorblock_segments.len()
                 ));
-                let Some(loaded) =
-                    app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at, reason)
-                else {
+                let Some(loaded) = app.consume_resolved(
+                    &url,
+                    source,
+                    thumbnail.as_deref(),
+                    resolved_at,
+                    reason,
+                    sponsorblock_segments,
+                ) else {
                     if !app.expects_resolved_url(&url) {
                         app_logging::debug(
                             "discarded a resolved video that is no longer relevant to playback",
@@ -963,6 +975,7 @@ fn tick(
                 }
                 ui.show_toast(&text);
             }
+            Message::Toast(text) => ui.show_toast(&text),
             Message::ThumbnailMigrationStarted { count } => {
                 ui.show_toast(&format!("Migrating {count} thumbnails to the new cache…"));
             }
@@ -996,6 +1009,7 @@ fn tick(
 
     // Save playback position to history periodically (for non-live videos)
     app.save_history_position();
+    app.apply_sponsorblock_skips();
 
     // keep-open leaves the completed file loaded, so advance from the
     // persistent EOF property instead of waiting for the file-unload event.

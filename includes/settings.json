@@ -22,16 +22,16 @@
           }
         }
       },
-      "main-list":{
-      "Youtube": {
-        "regex": "(?i)^(https?://)?(www\\.|m\\.)?(youtube\\.com|youtu\\.be)/",
-        "sources-default": {
-          "video": "720,default,best",
-          "audio": "default,best",
-          "combined": "720,default,best"
+      "main-list": {
+        "Youtube": {
+          "regex": "(?i)^(https?://)?(www\\.|m\\.)?(youtube\\.com|youtu\\.be)/",
+          "sources-default": {
+            "video": "720,default,best",
+            "audio": "default,best",
+            "combined": "720,default,best"
+          }
         }
       }
-    }
     }
   },
   "Player-Settings": {
@@ -43,6 +43,50 @@
       "minimum": 0,
       "default": 10,
       "value": null
+    },
+    "SponsorBlock": {
+      "display-name": "SponsorBlock",
+      "description": "Automatically skip labeled segments in YouTube videos",
+      "sponsor": {
+        "display-name": "Sponsor",
+        "default": true,
+        "value": null
+      },
+      "selfpromo": {
+        "display-name": "Self Promotion",
+        "default": true,
+        "value": null
+      },
+      "interaction": {
+        "display-name": "Interaction Reminder",
+        "default": true,
+        "value": null
+      },
+      "intro": {
+        "display-name": "Intro",
+        "default": true,
+        "value": null
+      },
+      "outro": {
+        "display-name": "Outro",
+        "default": true,
+        "value": null
+      },
+      "preview": {
+        "display-name": "Preview",
+        "default": true,
+        "value": null
+      },
+      "hook": {
+        "display-name": "Hook",
+        "default": true,
+        "value": null
+      },
+      "filler": {
+        "display-name": "Filler",
+        "default": true,
+        "value": null
+      }
     }
   },
   "Logging": {
