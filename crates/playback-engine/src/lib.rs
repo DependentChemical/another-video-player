@@ -37,6 +37,12 @@ const CACHE_SECONDS: &str = "1000000000";
 /// downloaded ranges stay seekable.
 const DEMUXER_MAX_BYTES: &str = "1024MiB";
 
+/// How long a live stream buffers before playback starts or resumes.
+///
+/// Kept within the UI's live-edge window so playback starts quickly while
+/// still being presented as live.
+const LIVE_PRE_BUFFER_SECONDS: u32 = 4;
+
 /// A span of the media that mpv has already downloaded.
 ///
 /// The ranges are in stream timestamps, in seconds, and are not necessarily
@@ -384,33 +390,25 @@ impl Engine {
 
     /// Updates the pre-buffer settings for the next load.
     ///
-    /// For live streams, pass `is_live = true` to disable initial buffering
-    /// so playback starts immediately. The user can still manually pre-buffer
-    /// by pausing the stream. For regular media, pass `is_live = false` to
-    /// use the configured `pre_buffer_seconds`.
+    /// For live streams, playback buffers a short window so it can start or
+    /// resume quickly while staying within the UI's live-edge window. For
+    /// regular media, the configured `pre_buffer_seconds` is used.
     pub fn set_pre_buffer(&self, pre_buffer_seconds: u32, is_live: bool) -> Result<(), Error> {
-        if is_live {
-            self.core
-                .set_property("cache-pause-initial", "no")
-                .logged("disable the live pre-buffer")?;
-            self.core
-                .set_property("demuxer-readahead-secs", "0")
-                .logged("disable the live readahead")?;
-            self.core
-                .set_property("cache-pause-wait", "0")
-                .logged("disable the live cache wait")?;
+        let seconds = if is_live { LIVE_PRE_BUFFER_SECONDS } else { pre_buffer_seconds };
+        let pre_buffer = seconds.to_string();
+        self.core.set_property("cache-pause-initial", "yes").logged(if is_live {
+            "set the live initial pre-buffer"
         } else {
-            let pre_buffer = pre_buffer_seconds.to_string();
-            self.core
-                .set_property("cache-pause-initial", "yes")
-                .logged("enable the initial pre-buffer")?;
-            self.core
-                .set_property("demuxer-readahead-secs", pre_buffer.as_str())
-                .logged("set the readahead buffer")?;
-            self.core
-                .set_property("cache-pause-wait", pre_buffer.as_str())
-                .logged("set the initial cache wait")?;
-        }
+            "enable the initial pre-buffer"
+        })?;
+        self.core.set_property("demuxer-readahead-secs", pre_buffer.as_str()).logged(
+            if is_live { "set the live readahead buffer" } else { "set the readahead buffer" },
+        )?;
+        self.core.set_property("cache-pause-wait", pre_buffer.as_str()).logged(if is_live {
+            "set the live cache wait"
+        } else {
+            "set the initial cache wait"
+        })?;
         Ok(())
     }
 

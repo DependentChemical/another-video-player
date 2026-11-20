@@ -31,13 +31,12 @@ impl VideoRenderer {
     /// The call has to happen while an OpenGL context is current, and that
     /// context has to stay current for every later use of the renderer.
     pub unsafe fn create(core: Arc<Mpv>, gl: GlProcAddress) -> Result<VideoRenderer, Error> {
-        let context = unsafe { OwnedRenderContext::new_opengl(core, false, gl) }.inspect_err(
-            |error| {
+        let context =
+            unsafe { OwnedRenderContext::new_opengl(core, false, gl) }.inspect_err(|error| {
                 app_logging::error(format!(
                     "libmpv could not create the OpenGL render context: {error}"
                 ));
-            },
-        )?;
+            })?;
         Ok(VideoRenderer { context })
     }
 
