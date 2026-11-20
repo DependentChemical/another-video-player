@@ -86,6 +86,22 @@ impl Settings {
         PreBufferSeconds(seconds)
     }
 
+    /// The configured log threshold, as written in `settings.json`.
+    ///
+    /// An explicit `value` wins over `default`; an absent or blank setting
+    /// falls back to `NOTICE`. The value is returned as written so the logging
+    /// crate can own the list of known level names.
+    pub fn log_level(&self) -> String {
+        self.document
+            .pointer("/Logging/level/value")
+            .and_then(Value::as_str)
+            .or_else(|| self.document.pointer("/Logging/level/default").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("NOTICE")
+            .to_ascii_uppercase()
+    }
+
     /// Chooses a playable stream using the matching site defaults or globals.
     pub fn select(&self, source: &MediaSource, url: &str) -> Result<Quality, Error> {
         let settings = self
@@ -552,5 +568,23 @@ mod tests {
         source.audio_streams.clear();
         let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"best","combined":"best"}}}}"#).expect("settings parse");
         assert!(matches!(settings.select(&source, "https://example.test"), Err(Error::NoStream)));
+    }
+
+    #[test]
+    fn the_log_level_uses_the_value_then_the_default_then_notice() {
+        let explicit = Settings::from_json(
+            r#"{"Video-Settings":{},"Logging":{"level":{"default":"WARNING","value":"debug"}}}"#,
+        )
+        .expect("settings parse");
+        assert_eq!(explicit.log_level(), "DEBUG");
+
+        let inherited = Settings::from_json(
+            r#"{"Video-Settings":{},"Logging":{"level":{"default":"ERROR","value":null}}}"#,
+        )
+        .expect("settings parse");
+        assert_eq!(inherited.log_level(), "ERROR");
+
+        let missing = Settings::from_json(r#"{"Video-Settings":{}}"#).expect("settings parse");
+        assert_eq!(missing.log_level(), "NOTICE");
     }
 }

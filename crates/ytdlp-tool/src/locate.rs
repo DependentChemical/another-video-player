@@ -1,8 +1,10 @@
-//! Finding a usable `yt-dlp` and describing how to run it.
-
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::Error;
 
@@ -59,14 +61,103 @@ impl YtDlp {
     }
 
     /// Asks `yt-dlp` for its version string, e.g. `2025.10.13`.
+    ///
+    /// A version probe must never hang: a broken executable that does not
+    /// answer is treated as unusable so it cannot block later work.
     pub fn version(&self) -> Result<String, Error> {
-        let output = self.command().arg("--version").output()?;
-        if !output.status.success() {
-            return Err(Error::NotUsable(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        self.version_with_cancel(None)
+    }
+
+    /// Asks `yt-dlp` for its version string, allowing cancellation by the
+    /// caller.
+    pub fn version_with_cancel(
+        &self,
+        cancel: Option<(&AtomicU32, &AtomicBool)>,
+    ) -> Result<String, Error> {
+        let mut command = self.command();
+        command.arg("--version");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().map_err(|error| {
+            app_logging::error(format!(
+                "yt-dlp could not be started for a version probe: program={} error={error}",
+                self.program.display()
             ));
+            error
+        })?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut out) = stdout {
+                let _ = out.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut err) = stderr {
+                let _ = err.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+        if let Some((pid, _)) = cancel {
+            pid.store(child.id(), Ordering::SeqCst);
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
+                app_logging::debug(format!(
+                    "cancelled the yt-dlp version probe: pid={}",
+                    child.id()
+                ));
+                terminate_child(&mut child, cancel);
+                clear_cancel_pid(cancel);
+                return Err(Error::NotUsable("the yt-dlp probe was cancelled".to_string()));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    app_logging::warning(format!(
+                        "the yt-dlp version probe timed out after 10s: pid={}",
+                        child.id()
+                    ));
+                    terminate_child(&mut child, cancel);
+                    clear_cancel_pid(cancel);
+                    return Err(Error::NotUsable(
+                        "timed out reading the yt-dlp version".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    app_logging::error(format!(
+                        "the yt-dlp version probe could not wait for pid={}: {error}",
+                        child.id()
+                    ));
+                    terminate_child(&mut child, cancel);
+                    clear_cancel_pid(cancel);
+                    return Err(Error::Io(error));
+                }
+            }
+        };
+
+        clear_cancel_pid(cancel);
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if !status.success() {
+            let message = String::from_utf8_lossy(&stderr).trim().to_string();
+            app_logging::warning(format!(
+                "the yt-dlp version probe failed: program={} status={status} stderr={message}",
+                self.program.display()
+            ));
+            return Err(Error::NotUsable(message));
+        }
+        let version = String::from_utf8_lossy(&stdout).trim().to_string();
+        app_logging::debug(format!(
+            "yt-dlp version probe: program={} version={version}",
+            self.program.display()
+        ));
+        Ok(version)
     }
 
     /// Whether the executable exists and answers `--version`.
@@ -107,9 +198,63 @@ impl ToolPaths {
     }
 }
 
+fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
+    if let Some((pid, _)) = cancel {
+        pid.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Stops a probe process and, on Windows, any process tree it spawned.
+fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
+    let _ = child.kill();
+    let id = cancel
+        .and_then(|(pid, _)| {
+            let id = pid.load(Ordering::SeqCst);
+            (id != 0).then_some(id)
+        })
+        .unwrap_or_else(|| child.id());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &id.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
+        let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
+    }
+    let _ = child.wait();
+}
+
 /// Looks for a managed `yt-dlp` first, then one on `PATH`.
 pub fn discover(paths: &ToolPaths) -> Option<YtDlp> {
-    managed(paths).or_else(from_path)
+    match managed(paths) {
+        Some(tool) => {
+            app_logging::debug(format!(
+                "using the managed yt-dlp: program={}",
+                tool.program.display()
+            ));
+            Some(tool)
+        }
+        None => {
+            let tool = from_path();
+            if let Some(tool) = &tool {
+                app_logging::debug(format!(
+                    "using a yt-dlp from PATH: program={}",
+                    tool.program.display()
+                ));
+            } else {
+                app_logging::notice("no yt-dlp was found on this system");
+            }
+            tool
+        }
+    }
 }
 
 /// The managed `yt-dlp`, if it has been downloaded before.

@@ -65,10 +65,13 @@ The ladder:
 
 | Layer | Crates | May depend on |
 | --- | --- | --- |
-| 0 — vocabulary | `media-model` | nothing |
-| 1 — capabilities | `database`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `web-session`, `ytdlp-tool` | `database`/`media-model` at most |
-| 2 — adapter | `video-surface`, `web-session-view` | one capability each |
+| 0 — foundation | `app-logging`, `media-model` | nothing |
+| 1 — capabilities | `database`, `image-process`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `updater`, `web-session`, `ytdlp-tool` | `app-logging`, plus `database`/`media-model`/`image-process` where needed |
+| 2 — adapter | `video-surface`, `web-session-view` | one capability each, plus `app-logging` |
 | 3 — composition root | `app-core` | everything |
+
+`app-logging` is shared infrastructure: it owns no application domain and
+lets any crate report to the single log file without depending on a sibling.
 
 `video-surface` is the single exception the ladder allows: the mpv render
 context belongs to the player, but it can only be created while a UI toolkit
@@ -126,6 +129,8 @@ This sequence mirrors the `dev-test` workflow and the release build pipeline.
 
 - `crates/app-core` — the composition root: the window, the wiring and the
   `flatline` binary. The only crate that knows the others exist.
+- `crates/app-logging` — the shared log: one async queue and a single
+  logfile with `DEBUG|NOTICE|WARNING|ERROR` levels for the whole program.
 - `crates/media-model` — the shared vocabulary: media sources, stream
   catalogs, qualities and playback plans.
 - `crates/database` — opens and configures `app.db` for the rest of the app.
@@ -139,6 +144,7 @@ This sequence mirrors the `dev-test` workflow and the release build pipeline.
   Slint window.
 - `crates/stream-resolver` — turns a URL into a catalog of streams and
   decides which streams to play.
+- `crates/updater` — checks for a newer Flatline release and installs it.
 - `crates/ytdlp-tool` — finds, installs and updates the `yt-dlp` executable.
 - `crates/storyboard` — cuts preview images out of a media with `ffmpeg`.
 - `crates/ui-kit` — the Slint components, the theme and the widgets.

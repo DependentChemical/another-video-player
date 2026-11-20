@@ -819,6 +819,16 @@ impl PlayerUi {
         self.window.on_fullscreen_toggled(handler);
     }
 
+    /// Called when the user presses the previous button.
+    pub fn on_previous_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_previous_requested(handler);
+    }
+
+    /// Called when the user presses the next button.
+    pub fn on_next_requested(&self, handler: impl Fn() + 'static) {
+        self.window.on_next_requested(handler);
+    }
+
     /// Called when the user asks to go back to the live edge.
     pub fn on_live_pressed(&self, handler: impl Fn() + 'static) {
         self.window.on_live_requested(handler);

@@ -11,7 +11,6 @@
 //! this workspace follows.
 
 pub mod app;
-pub mod diag;
 pub mod loading;
 pub mod paths;
 pub mod session;
@@ -21,7 +20,9 @@ pub mod timeline;
 
 use std::sync::Arc;
 
-pub use app::{App, Loaded, Message};
+use settings::Settings;
+
+pub use app::{App, Loaded, Message, PlaybackReason};
 pub use paths::AppPaths;
 pub use shell::Shell;
 pub use timeline::{LIVE_BUFFER, LIVE_WINDOW, LiveAxis, Timeline};
@@ -34,12 +35,37 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// When a URL is given, it is loaded right away.
 pub fn run(url: Option<&str>) -> Result<(), Error> {
     let paths = AppPaths::discover();
-    diag::init(&paths.log_file());
-    paths.ensure().map_err(|error| Error::Tools(error.to_string()))?;
+    let logging_level = Settings::load(paths.settings())
+        .ok()
+        .and_then(|settings| app_logging::Level::parse(&settings.log_level()))
+        .unwrap_or(app_logging::Level::Notice);
+    app_logging::init(paths.log_file(), logging_level);
+    app_logging::notice(format!(
+        "Flatline {VERSION} starting; root={} program={} portable={} log_level={}",
+        paths.root().display(),
+        paths.program().display(),
+        paths.is_portable(),
+        app_logging::level()
+    ));
+
+    paths.ensure().map_err(|error| {
+        app_logging::error(format!("the Flatline directories could not be prepared: {error}"));
+        Error::Tools(error.to_string())
+    })?;
 
     let tools = paths.tool_paths();
     let managed = ytdlp_tool::locate::managed(&tools);
     let ytdlp = managed.clone().unwrap_or_else(|| ytdlp_tool::locate::at(tools.managed_binary()));
+    match &managed {
+        Some(_) => app_logging::notice(format!(
+            "using the managed yt-dlp at {}",
+            ytdlp.program().display()
+        )),
+        None => app_logging::warning(format!(
+            "no managed yt-dlp was found; using {} and offering an install",
+            ytdlp.program().display()
+        )),
+    }
 
     let app = Arc::new(App::new(&ytdlp, &paths)?);
     app.start_update_checks(paths.clone());
@@ -54,7 +80,9 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
         None => shell.resume(),
     }
 
+    app_logging::notice("the window event loop is running");
     shell.run();
+    app_logging::notice("the window event loop returned; Flatline is exiting");
     Ok(())
 }
 

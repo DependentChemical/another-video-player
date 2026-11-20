@@ -1,5 +1,5 @@
 import { Theme } from "../theme.slint";
-import { FlatButton, FullscreenButton, GearButton, LiveButton, PlayPauseButton, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
+import { FlatButton, FullscreenButton, GearButton, LiveButton, PauseIcon, PlayIcon, PreviousIcon, NextIcon, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
 import { BufferedRange } from "types.slint";
 
 export component PlayerControls inherits Rectangle {
@@ -26,6 +26,8 @@ export component PlayerControls inherits Rectangle {
     callback controls-hovered(bool);
     callback interacting-changed(bool);
     callback sources-toggled();
+    callback previous-requested();
+    callback next-requested();
 
     width: root.width;
     height: Theme.controls-height;
@@ -59,13 +61,99 @@ export component PlayerControls inherits Rectangle {
             spacing: 12px;
             cross-axis-alignment: center;
 
-            PlayPauseButton {
-                width: 44px;
+            // Grouped Previous / PlayPause / Next buttons as a single pill.
+            playback-controls := Rectangle {
                 height: 32px;
-                playing: root.playing;
-                pointer-activity => { root.pointer-activity(); }
-                clicked => {
-                    root.play-toggled();
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                clip: true;
+                background: Theme.panel;
+
+                HorizontalLayout {
+                    spacing: 0px;
+
+                    Rectangle {
+                        width: 44px;
+                        background: previous-touch.pressed ? Theme.elevated : (previous-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        PreviousIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        previous-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.previous-requested();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 1px;
+                        background: Theme.border;
+                    }
+
+                    Rectangle {
+                        width: 44px;
+                        background: play-touch.pressed ? Theme.elevated : (play-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        if !root.playing: PlayIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+                        if root.playing: PauseIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        play-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.play-toggled();
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 1px;
+                        background: Theme.border;
+                    }
+
+                    Rectangle {
+                        width: 44px;
+                        background: next-touch.pressed ? Theme.elevated : (next-touch.has-hover ? Theme.elevated : Theme.panel);
+
+                        NextIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 16px;
+                            height: 16px;
+                        }
+
+                        next-touch := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.move { root.pointer-activity(); }
+                            }
+                            moved => { root.pointer-activity(); }
+                            clicked => {
+                                root.next-requested();
+                            }
+                        }
+                    }
                 }
             }
 

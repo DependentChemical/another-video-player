@@ -1,7 +1,8 @@
-[workspace]
+﻿[workspace]
 resolver = "3"
 members = [
     "crates/app-core",
+    "crates/app-logging",
     "crates/database",
     "crates/image-process",
     "crates/library",
@@ -22,7 +23,7 @@ members = [
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.4.39"
+version = "0.4.42"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -30,6 +31,7 @@ authors = ["Flatline contributors"]
 
 [workspace.dependencies]
 # --- internal crates (see AGENTS.md "Crate isolation") -------------------------
+app-logging = { path = "crates/app-logging" }
 database = { path = "crates/database" }
 image-process = { path = "crates/image-process" }
 library = { path = "crates/library" }

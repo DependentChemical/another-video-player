@@ -129,6 +129,8 @@ export component MainWindow inherits Window {
     callback pointer-activity();
     callback controls-hovered(bool);
     callback interacting-changed(bool);
+    callback previous-requested();
+    callback next-requested();
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-queue-next-requested();
@@ -287,6 +289,8 @@ export component MainWindow inherits Window {
         volume-toggled => { root.volume-toggled(); }
         fullscreen-toggled => { root.fullscreen-toggled(); }
         live-requested => { root.live-requested(); }
+        previous-requested => { root.previous-requested(); }
+        next-requested => { root.next-requested(); }
         pointer-activity => { root.pointer-activity(); }
         controls-hovered(hovered) => { root.controls-hovered(hovered); }
         interacting-changed(interacting) => { root.interacting-changed(interacting); }

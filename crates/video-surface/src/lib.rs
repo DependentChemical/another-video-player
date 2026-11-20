@@ -14,9 +14,12 @@
 pub mod gl;
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use playback_engine::{Engine, VideoRenderer};
 use slint::{GraphicsAPI, RenderingState};
+
+const DRAW_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Everything that can go wrong while attaching the renderer.
 #[derive(Debug)]
@@ -59,6 +62,7 @@ pub fn attach(
     request_redraw: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), AttachError> {
     let mut renderer: Option<VideoRenderer> = None;
+    let mut last_draw_error: Option<Instant> = None;
     let request_redraw = std::sync::Arc::new(request_redraw);
 
     window
@@ -78,6 +82,7 @@ pub fn attach(
                     // the renderer needs.
                     match unsafe { engine.create_renderer(gl::resolver()) } {
                         Ok(mut created) => {
+                            app_logging::debug("the libmpv OpenGL renderer was created");
                             let request_redraw = std::sync::Arc::clone(&request_redraw);
                             created.set_update_callback(move || {
                                 request_redraw();
@@ -85,7 +90,9 @@ pub fn attach(
                             renderer = Some(created);
                         }
                         Err(error) => {
-                            eprintln!("flatline: the video renderer is unavailable: {error}");
+                            app_logging::error(format!(
+                                "the video renderer is unavailable: {error}"
+                            ));
                         }
                     }
                 }
@@ -93,12 +100,28 @@ pub fn attach(
                     if let Some(renderer) = renderer.as_mut() {
                         let (width, height) = video_area();
                         if let Err(error) = renderer.draw(width, height) {
-                            eprintln!("flatline: drawing a frame failed: {error}");
+                            let now = Instant::now();
+                            let due = last_draw_error
+                                .is_none_or(|last| now.duration_since(last) >= DRAW_ERROR_LOG_INTERVAL);
+                            if due {
+                                last_draw_error = Some(now);
+                                app_logging::warning(format!(
+                                    "drawing a video frame failed at {width}x{height}: {error}"
+                                ));
+                            } else {
+                                app_logging::debug(format!(
+                                    "drawing a video frame failed again at {width}x{height}: {error}"
+                                ));
+                            }
+                        } else {
+                            last_draw_error = None;
                         }
                     }
                 }
                 RenderingState::RenderingTeardown => {
+                    app_logging::debug("the libmpv OpenGL renderer was torn down");
                     renderer = None;
+                    last_draw_error = None;
                 }
                 _ => {}
             }

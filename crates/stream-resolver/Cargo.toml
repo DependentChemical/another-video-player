@@ -9,6 +9,7 @@ authors.workspace = true
 
 # Layer 1: standalone capability. Depends on the shared vocabulary only.
 [dependencies]
+app-logging = { workspace = true }
 media-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -9,4 +9,5 @@ authors.workspace = true
 
 # Layer 1: standalone capability. Knows nothing about any other Flatline crate.
 [dependencies]
+app-logging = { workspace = true }
 rsmpv = { workspace = true }
