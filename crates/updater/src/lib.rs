@@ -39,23 +39,39 @@ struct Asset {
 
 /// Checks GitHub for a newer release and selects this platform's ZIP asset.
 pub fn check(current: &str) -> Result<Option<Update>, Error> {
+    app_logging::debug(format!(
+        "requesting the latest Flatline release: current={current} url={RELEASE}"
+    ));
     let release: Release = ureq::get(RELEASE)
         .header("User-Agent", USER_AGENT)
         .call()
-        .map_err(|error| Error::Request(error.to_string()))?
+        .map_err(|error| {
+            app_logging::warning(format!("the Flatline release request failed: {error}"));
+            Error::Request(error.to_string())
+        })?
         .body_mut()
         .read_json()
-        .map_err(|error| Error::Request(error.to_string()))?;
+        .map_err(|error| {
+            app_logging::warning(format!("the Flatline release response was invalid: {error}"));
+            Error::Request(error.to_string())
+        })?;
     let version = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    app_logging::debug(format!("comparing Flatline versions: current={current} latest={version}"));
     if !newer(version, current) {
         return Ok(None);
     }
     let suffix = if cfg!(windows) { "windows-x64.zip" } else { "linux-x86_64.zip" };
-    let asset = release
-        .assets
-        .into_iter()
-        .find(|asset| asset.name.ends_with(suffix))
-        .ok_or_else(|| Error::MissingAsset(suffix.to_string()))?;
+    let asset =
+        release.assets.into_iter().find(|asset| asset.name.ends_with(suffix)).ok_or_else(|| {
+            app_logging::warning(format!(
+                "the Flatline release has no {suffix} package: version={version}"
+            ));
+            Error::MissingAsset(suffix.to_string())
+        })?;
+    app_logging::notice(format!(
+        "Flatline update detected: current={current} latest={version} asset={} url={}",
+        asset.name, asset.browser_download_url
+    ));
     Ok(Some(Update {
         version: version.to_string(),
         notes: release.body,
@@ -77,10 +93,22 @@ pub fn install<F>(
 where
     F: FnMut(f64) + Send + 'static,
 {
+    app_logging::notice(format!(
+        "downloading the Flatline update package: version={} url={} directory={}",
+        update.version,
+        update.download_url,
+        directory.display()
+    ));
     let response = ureq::get(&update.download_url)
         .header("User-Agent", USER_AGENT)
         .call()
-        .map_err(|error| Error::Request(error.to_string()))?;
+        .map_err(|error| {
+            app_logging::error(format!(
+                "the Flatline update download request failed: version={} error={error}",
+                update.version
+            ));
+            Error::Request(error.to_string())
+        })?;
     let archive = directory.join(".flatline-update.zip");
     let mut output = std::fs::File::create(&archive).map_err(io_error)?;
     let content_length = response
@@ -106,6 +134,11 @@ where
     }
     output.flush().map_err(io_error)?;
     on_progress(1.0);
+    app_logging::debug(format!(
+        "Flatline update package downloaded: version={} bytes={downloaded} archive={}",
+        update.version,
+        archive.display()
+    ));
     let staging = directory.join(".flatline-update-staging");
     if staging.exists() {
         std::fs::remove_dir_all(&staging).map_err(io_error)?;
@@ -144,6 +177,13 @@ where
         }
     }
     let helper = write_helper(directory, &staging, &archive, executable)?;
+    app_logging::notice(format!(
+        "starting the Flatline update helper: version={} helper={} staging={} executable={}",
+        update.version,
+        helper.display(),
+        staging.display(),
+        executable.display()
+    ));
     launch_helper(&helper)?;
     Ok(())
 }

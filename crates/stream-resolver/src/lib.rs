@@ -156,6 +156,7 @@ impl Resolver {
         url: &str,
         cancel: Option<(&AtomicU32, &AtomicBool)>,
     ) -> Result<MediaSource, Error> {
+        app_logging::notice(format!("resolving url with yt-dlp: url={url}"));
         let mut command = self.spec.command();
         // yt-dlp on Windows writes stderr in the system ANSI codepage, so
         // non-ASCII characters like the apostrophe in "you're" arrive as
@@ -170,19 +171,57 @@ impl Resolver {
             .arg("--socket-timeout")
             .arg("20");
         if let Some(cookies) = self.cookies_for_url(url) {
+            app_logging::debug(format!(
+                "passing cookies to yt-dlp: url={url} cookies={}",
+                cookies.display()
+            ));
             command.arg("--cookies").arg(cookies);
         }
         command.arg(url);
+        let args =
+            command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        app_logging::debug(format!(
+            "running yt-dlp: program={} interpreter={:?} args={args:?}",
+            self.spec.program.display(),
+            self.spec.interpreter
+        ));
         let output = run_command(command, RESOLUTION_TIMEOUT, cancel)?;
 
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
-            return Err(Error::Failed {
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
+            let code = output.status.code();
+            app_logging::error(format!(
+                "yt-dlp failed: url={url} status={} code={code:?} stdout_bytes={} stderr={stderr}",
+                output.status,
+                output.stdout.len()
+            ));
+            return Err(Error::Failed { code, stderr });
         }
 
-        parse_catalog(&String::from_utf8_lossy(&output.stdout))
+        app_logging::debug(format!(
+            "yt-dlp finished: url={url} status={} stdout_bytes={} stderr={}",
+            output.status,
+            output.stdout.len(),
+            if stderr.is_empty() { "<empty>" } else { &stderr }
+        ));
+        match parse_catalog(&String::from_utf8_lossy(&output.stdout)) {
+            Ok(source) => {
+                app_logging::notice(format!(
+                    "resolved url: url={url} title=\"{}\" video_streams={} audio_streams={} live={}",
+                    source.title,
+                    source.video_streams.len(),
+                    source.audio_streams.len(),
+                    source.is_live
+                ));
+                Ok(source)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "yt-dlp output could not be parsed: url={url} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// The cookie file to pass for this URL, when one exists.
@@ -210,10 +249,19 @@ fn run_command(
     cancel: Option<(&AtomicU32, &AtomicBool)>,
 ) -> Result<Output, Error> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(Error::Spawn)?;
+    let mut child = command.spawn().map_err(|error| {
+        app_logging::error(format!("yt-dlp could not be started: {error}"));
+        Error::Spawn(error)
+    })?;
+    app_logging::debug(format!(
+        "yt-dlp started: pid={} timeout={}s",
+        child.id(),
+        timeout.as_secs()
+    ));
     let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         _ => {
+            app_logging::error("yt-dlp output pipes were missing; stopping the process");
             terminate_child(&mut child, cancel);
             clear_cancel_pid(cancel);
             return Err(Error::MissingOutputPipe);
@@ -228,6 +276,10 @@ fn run_command(
 
     let status = loop {
         if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
+            app_logging::warning(format!(
+                "cancelling yt-dlp pid={}: superseded by newer work",
+                child.id()
+            ));
             terminate_child(&mut child, cancel);
             clear_cancel_pid(cancel);
             return Err(Error::Cancelled);
@@ -236,21 +288,37 @@ fn run_command(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
+                app_logging::error(format!(
+                    "yt-dlp timed out after {}s; terminating pid={}",
+                    timeout.as_secs(),
+                    child.id()
+                ));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
                 return Err(Error::Timeout(timeout.as_secs()));
             }
             Err(error) => {
+                app_logging::error(format!(
+                    "yt-dlp pid={} could not be waited on: {error}",
+                    child.id()
+                ));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
                 return Err(Error::Spawn(error));
             }
         }
     };
+    app_logging::debug(format!("yt-dlp pid={} exited with {status}", child.id()));
 
     clear_cancel_pid(cancel);
-    let stdout = join_output(stdout_reader)?;
-    let stderr = join_output(stderr_reader)?;
+    let stdout = join_output(stdout_reader).map_err(|error| {
+        app_logging::error(format!("yt-dlp stdout could not be read: {error}"));
+        error
+    })?;
+    let stderr = join_output(stderr_reader).map_err(|error| {
+        app_logging::error(format!("yt-dlp stderr could not be read: {error}"));
+        error
+    })?;
     Ok(Output { status, stdout, stderr })
 }
 
@@ -266,6 +334,7 @@ pub fn cancel_active_process(pid: &AtomicU32, cancelled: &AtomicBool) {
     cancelled.store(true, Ordering::SeqCst);
     let id = pid.load(Ordering::SeqCst);
     if id != 0 {
+        app_logging::debug(format!("terminating the active yt-dlp process: pid={id}"));
         terminate_pid(id);
     }
 }

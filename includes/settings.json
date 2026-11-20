@@ -44,5 +44,16 @@
       "default": 10,
       "value": null
     }
+  },
+  "Logging": {
+    "display-name": "Logging",
+    "level": {
+      "display-name": "Log Level",
+      "description": "Lowest severity written to flatline.log. DEBUG records everything, NOTICE adds playback and queue events, WARNING adds recoverable failures, ERROR only records failures.",
+      "type": "select",
+      "options": ["DEBUG", "NOTICE", "WARNING", "ERROR"],
+      "default": "NOTICE",
+      "value": "DEBUG"
+    }
   }
 }

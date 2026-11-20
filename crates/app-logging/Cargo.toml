@@ -1,0 +1,11 @@
+[package]
+name = "app-logging"
+description = "Flatline's single asynchronous log queue and log file writer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 0: shared infrastructure. It knows nothing about any other crate.
+[dependencies]

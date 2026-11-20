@@ -9,6 +9,7 @@ authors.workspace = true
 
 # Layer 1: release discovery and application update operations.
 [dependencies]
+app-logging = { workspace = true }
 serde = { workspace = true }
 ureq = { workspace = true }
 zip = { workspace = true }

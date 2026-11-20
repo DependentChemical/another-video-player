@@ -129,7 +129,7 @@ impl Shell {
                         native_window.set_taskbar_icon(Some(icon));
                     });
                     if applied.is_none() {
-                        crate::diag::note(
+                        app_logging::debug(
                             "the native window was not ready when its icon was applied",
                         );
                     }
@@ -833,17 +833,22 @@ fn tick(
     for message in app.poll() {
         match message {
             Message::Resolved(Ok(media)) => {
-                let crate::app::ResolvedMedia { url, thumbnail, resolved_at, source } = media;
+                let crate::app::ResolvedMedia { url, thumbnail, resolved_at, reason, source } =
+                    media;
+                app_logging::debug(format!(
+                    "handling a resolved video: url={url} reason={}",
+                    reason.as_str()
+                ));
                 let Some(loaded) =
-                    app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at)
+                    app.consume_resolved(&url, source, thumbnail.as_deref(), resolved_at, reason)
                 else {
                     if !app.expects_resolved_url(&url) {
-                        crate::diag::note(
+                        app_logging::debug(
                             "discarded a resolved video that is no longer relevant to playback",
                         );
                         continue;
                     }
-                    crate::diag::note(
+                    app_logging::debug(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
                     // The spinner belongs to that discarded result; without
@@ -854,6 +859,10 @@ fn tick(
                     ui.show_toast("The resolved video is no longer in the active queue");
                     continue;
                 };
+                app_logging::debug(format!(
+                    "the player is ready for url={url} title=\"{}\"",
+                    loaded.title
+                ));
                 ui.set_media_title(&loaded.title);
                 ui.set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                 ui.set_sources(&loaded.sources);
@@ -875,11 +884,12 @@ fn tick(
             }
             Message::Resolved(Err((url, error))) => {
                 if !app.expects_resolved_url(&url) {
-                    crate::diag::note(
-                        "ignored a resolver error that is no longer relevant to playback",
-                    );
+                    app_logging::debug(format!(
+                        "ignored a resolver error that is no longer relevant: url={url} error={error}"
+                    ));
                     continue;
                 }
+                app_logging::warning(format!("resolution failed: url={url} error={error}"));
                 loading.resolve_failed(error.clone());
                 // Schedule a retry for resolver errors
                 if app.resolving_url().as_deref() == Some(url.as_str()) {
@@ -940,7 +950,9 @@ fn tick(
                 ui.close_update();
                 let text = format!("yt-dlp updated to {version}");
                 if !loading.tool_updated(&text) {
-                    crate::diag::note(&text);
+                    app_logging::debug(format!(
+                        "yt-dlp update was applied while no load was waiting: {text}"
+                    ));
                 }
                 ui.show_toast(&text);
             }
@@ -1028,6 +1040,15 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
             EngineEvent::EndFile { reason, error } => {
                 let failure = (reason == EndReason::Error)
                     .then(|| error.unwrap_or_else(|| "playback failed".to_string()));
+                match (&reason, &failure) {
+                    (EndReason::Eof, _) => {
+                        app_logging::notice("playback reached the end of the file")
+                    }
+                    (EndReason::Error, Some(error)) => {
+                        app_logging::error(format!("libmpv reported a playback error: {error}"))
+                    }
+                    (reason, _) => app_logging::debug(format!("playback ended: reason={reason:?}")),
+                }
                 loading.file_ended(failure.clone());
                 // Reset history position when video finishes normally (not error/stop)
                 if reason == EndReason::Eof {
@@ -1042,11 +1063,13 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
                     }
                 }
             }
-            EngineEvent::Log { level, text } => {
-                if level == "error" {
-                    crate::diag::note(&format!("mpv: {text}"));
+            EngineEvent::Log { level, text } => match level.as_str() {
+                "error" | "fatal" => {
+                    app_logging::warning(format!("libmpv [{level}]: {text}"));
                 }
-            }
+                "warn" => app_logging::debug(format!("libmpv [{level}]: {text}")),
+                _ => app_logging::debug(format!("libmpv [{level}]: {text}")),
+            },
             EngineEvent::Shutdown => {}
         }
     }

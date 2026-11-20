@@ -20,7 +20,7 @@ fn main() {
     }
 
     if let Err(error) = app_core::run(argument.as_deref()) {
-        app_core::diag::note(&error.to_string());
+        app_logging::error(format!("the player stopped with an error: {error}"));
         std::process::exit(1);
     }
 }

@@ -148,6 +148,21 @@ impl From<rsmpv::Error> for Error {
     }
 }
 
+/// Adds a log line to every mpv operation that can fail.
+trait LogMpv<T> {
+    /// Logs the failure and converts it into the engine's error type.
+    fn logged(self, operation: &str) -> Result<T, Error>;
+}
+
+impl<T> LogMpv<T> for Result<T, rsmpv::Error> {
+    fn logged(self, operation: &str) -> Result<T, Error> {
+        self.map_err(|error| {
+            app_logging::error(format!("libmpv could not {operation}: {error}"));
+            Error::Mpv(error)
+        })
+    }
+}
+
 /// A running mpv player.
 ///
 /// The handle is shared, so the engine can be used from the thread that
@@ -170,53 +185,75 @@ impl Engine {
     /// `pre_buffer_seconds` controls how many seconds of content are buffered
     /// before playback starts. A value of 0 disables the initial wait.
     pub fn new(cache_dir: impl AsRef<Path>, pre_buffer_seconds: u32) -> Result<Engine, Error> {
-        let cache_dir = cache_dir.as_ref();
-        std::fs::create_dir_all(cache_dir).map_err(Error::Cache)?;
-        let cache_dir = cache_dir.to_string_lossy();
+        let cache_dir_path = cache_dir.as_ref();
+        app_logging::debug(format!(
+            "creating the libmpv engine: cache_dir={} pre_buffer_seconds={pre_buffer_seconds}",
+            cache_dir_path.display()
+        ));
+        let result = (|| -> Result<Engine, Error> {
+            std::fs::create_dir_all(cache_dir_path).map_err(|error| {
+                app_logging::error(format!(
+                    "the stream buffer directory could not be created: path={} error={error}",
+                    cache_dir_path.display()
+                ));
+                Error::Cache(error)
+            })?;
+            let cache_dir = cache_dir_path.to_string_lossy();
+            let pre_buffer = pre_buffer_seconds.to_string();
 
-        let pre_buffer = pre_buffer_seconds.to_string();
+            let mpv = rsmpv::Mpv::builder()?
+                .set_property("vo", "libmpv")?
+                .set_property("config", "no")?
+                .set_property("terminal", "no")?
+                .set_property("idle", "yes")?
+                .set_property("keep-open", "yes")?
+                .set_property("hwdec", "auto-safe")?
+                .set_property("audio-display", "no")?
+                .set_property("osd-level", "0")?
+                .set_property("input-default-bindings", "no")?
+                .set_property("input-vo-keyboard", "no")?
+                .set_property("title", "Flatline")?
+                .set_property("volume-max", MAX_VOLUME)?
+                // Keep reading the stream ahead even while playback is paused, and
+                // write the packets to Flatline's own folder so the downloaded
+                // parts survive a seek instead of being discarded.
+                .set_property("cache", "yes")?
+                .set_property("cache-on-disk", "yes")?
+                .set_property("demuxer-cache-dir", cache_dir.as_ref())?
+                .set_property("cache-secs", CACHE_SECONDS)?
+                .set_property("demuxer-max-bytes", DEMUXER_MAX_BYTES)?
+                .set_property("demuxer-max-back-bytes", DEMUXER_MAX_BYTES)?
+                // Wait for at least pre_buffer_seconds of content before starting
+                // playback. `cache-pause-initial` (default yes) pauses initially until
+                // the readahead buffer is filled; `demuxer-readahead-secs` sets the
+                // target fill level in seconds.
+                .set_property("cache-pause-initial", "yes")?
+                .set_property("demuxer-readahead-secs", pre_buffer.as_str())?
+                .set_property("cache-pause-wait", pre_buffer.as_str())?
+                .build()?;
 
-        let mpv = rsmpv::Mpv::builder()?
-            .set_property("vo", "libmpv")?
-            .set_property("config", "no")?
-            .set_property("terminal", "no")?
-            .set_property("idle", "yes")?
-            .set_property("keep-open", "yes")?
-            .set_property("hwdec", "auto-safe")?
-            .set_property("audio-display", "no")?
-            .set_property("osd-level", "0")?
-            .set_property("input-default-bindings", "no")?
-            .set_property("input-vo-keyboard", "no")?
-            .set_property("title", "Flatline")?
-            .set_property("volume-max", MAX_VOLUME)?
-            // Keep reading the stream ahead even while playback is paused, and
-            // write the packets to Flatline's own folder so the downloaded
-            // parts survive a seek instead of being discarded.
-            .set_property("cache", "yes")?
-            .set_property("cache-on-disk", "yes")?
-            .set_property("demuxer-cache-dir", cache_dir.as_ref())?
-            .set_property("cache-secs", CACHE_SECONDS)?
-            .set_property("demuxer-max-bytes", DEMUXER_MAX_BYTES)?
-            .set_property("demuxer-max-back-bytes", DEMUXER_MAX_BYTES)?
-            // Wait for at least pre_buffer_seconds of content before starting
-            // playback. `cache-pause-initial` (default yes) pauses initially until
-            // the readahead buffer is filled; `demuxer-readahead-secs` sets the
-            // target fill level in seconds.
-            .set_property("cache-pause-initial", "yes")?
-            .set_property("demuxer-readahead-secs", pre_buffer.as_str())?
-            .set_property("cache-pause-wait", pre_buffer.as_str())?
-            .build()?;
+            // mpv does not deliver file lifecycle events until they are requested.
+            for event in [
+                rsmpv::sys::MPV_EVENT_START_FILE,
+                rsmpv::sys::MPV_EVENT_FILE_LOADED,
+                rsmpv::sys::MPV_EVENT_END_FILE,
+            ] {
+                mpv.request_event(event, true)?;
+            }
 
-        // mpv does not deliver file lifecycle events until they are requested.
-        for event in [
-            rsmpv::sys::MPV_EVENT_START_FILE,
-            rsmpv::sys::MPV_EVENT_FILE_LOADED,
-            rsmpv::sys::MPV_EVENT_END_FILE,
-        ] {
-            mpv.request_event(event, true)?;
+            Ok(Engine { core: std::sync::Arc::new(mpv) })
+        })();
+        match &result {
+            Ok(_) => app_logging::notice(format!(
+                "libmpv engine ready: cache_dir={} pre_buffer_seconds={pre_buffer_seconds}",
+                cache_dir_path.display()
+            )),
+            Err(error) => app_logging::error(format!(
+                "the libmpv engine could not be created: cache_dir={} error={error}",
+                cache_dir_path.display()
+            )),
         }
-
-        Ok(Engine { core: std::sync::Arc::new(mpv) })
+        result
     }
 
     /// Opens a media, replacing whatever was playing before.
@@ -240,38 +277,44 @@ impl Engine {
                 rsmpv::Node::String(audio.clone()),
             )]));
         }
-        self.core.command_node(&rsmpv::Node::Array(arguments))?;
+        app_logging::debug(format!(
+            "libmpv loadfile: media={} audio={:?}",
+            request.media, request.audio
+        ));
+        self.core.command_node(&rsmpv::Node::Array(arguments)).logged("load a media")?;
         Ok(())
     }
 
     /// Stops playback and unloads the current media.
     pub fn stop(&self) -> Result<(), Error> {
-        self.core.command(&["stop"])?;
+        self.core.command(&["stop"]).logged("stop playback")?;
         Ok(())
     }
 
     /// Continues playback.
     pub fn play(&self) -> Result<(), Error> {
-        self.core.set_property("pause", false)?;
+        self.core.set_property("pause", false).logged("resume playback")?;
         Ok(())
     }
 
     /// Pauses playback.
     pub fn pause(&self) -> Result<(), Error> {
-        self.core.set_property("pause", true)?;
+        self.core.set_property("pause", true).logged("pause playback")?;
         Ok(())
     }
 
     /// Switches between playing and paused.
     pub fn toggle_pause(&self) -> Result<(), Error> {
-        let paused = self.core.get_property::<bool>("pause")?;
-        self.core.set_property("pause", !paused)?;
+        let paused = self.core.get_property::<bool>("pause").logged("read the pause state")?;
+        self.core.set_property("pause", !paused).logged("toggle playback")?;
         Ok(())
     }
 
     /// Seeks to an absolute position in seconds.
     pub fn seek(&self, seconds: f64) -> Result<(), Error> {
-        self.core.command(&["seek", &seconds.to_string(), "absolute"])?;
+        self.core
+            .command(&["seek", &seconds.to_string(), "absolute"])
+            .logged("seek to an absolute position")?;
         Ok(())
     }
 
@@ -280,7 +323,9 @@ impl Engine {
     /// A negative offset goes back in time. This is what a live stream needs
     /// when the user wants to replay a moment that just passed.
     pub fn seek_relative(&self, seconds: f64) -> Result<(), Error> {
-        self.core.command(&["seek", &seconds.to_string(), "relative"])?;
+        self.core
+            .command(&["seek", &seconds.to_string(), "relative"])
+            .logged("seek relative to the current position")?;
         Ok(())
     }
 
@@ -293,7 +338,9 @@ impl Engine {
         if let Some(edge) = self.seekable_end() {
             self.seek(edge)?;
         } else {
-            self.core.command(&["seek", "1000000000", "relative"])?;
+            self.core
+                .command(&["seek", "1000000000", "relative"])
+                .logged("seek to the live edge")?;
         }
         Ok(())
     }
@@ -325,13 +372,13 @@ impl Engine {
     /// this percent to a linear gain with `(volume / 100)^3`; callers that want
     /// a linear-gain slider have to undo that curve before calling.
     pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
-        self.core.set_property("volume", clamp_volume(volume))?;
+        self.core.set_property("volume", clamp_volume(volume)).logged("set the volume")?;
         Ok(())
     }
 
     /// Mutes or unmutes the player.
     pub fn set_muted(&self, muted: bool) -> Result<(), Error> {
-        self.core.set_property("mute", muted)?;
+        self.core.set_property("mute", muted).logged("change the mute state")?;
         Ok(())
     }
 
@@ -343,14 +390,26 @@ impl Engine {
     /// use the configured `pre_buffer_seconds`.
     pub fn set_pre_buffer(&self, pre_buffer_seconds: u32, is_live: bool) -> Result<(), Error> {
         if is_live {
-            self.core.set_property("cache-pause-initial", "no")?;
-            self.core.set_property("demuxer-readahead-secs", "0")?;
-            self.core.set_property("cache-pause-wait", "0")?;
+            self.core
+                .set_property("cache-pause-initial", "no")
+                .logged("disable the live pre-buffer")?;
+            self.core
+                .set_property("demuxer-readahead-secs", "0")
+                .logged("disable the live readahead")?;
+            self.core
+                .set_property("cache-pause-wait", "0")
+                .logged("disable the live cache wait")?;
         } else {
             let pre_buffer = pre_buffer_seconds.to_string();
-            self.core.set_property("cache-pause-initial", "yes")?;
-            self.core.set_property("demuxer-readahead-secs", pre_buffer.as_str())?;
-            self.core.set_property("cache-pause-wait", pre_buffer.as_str())?;
+            self.core
+                .set_property("cache-pause-initial", "yes")
+                .logged("enable the initial pre-buffer")?;
+            self.core
+                .set_property("demuxer-readahead-secs", pre_buffer.as_str())
+                .logged("set the readahead buffer")?;
+            self.core
+                .set_property("cache-pause-wait", pre_buffer.as_str())
+                .logged("set the initial cache wait")?;
         }
         Ok(())
     }
@@ -405,22 +464,51 @@ impl Engine {
     pub fn poll_event(&self) -> Option<EngineEvent> {
         let event = self.core.poll_event()?;
         Some(match event {
-            rsmpv::Event::StartFile { .. } => EngineEvent::StartFile,
-            rsmpv::Event::FileLoaded => EngineEvent::FileLoaded,
-            rsmpv::Event::EndFile { reason, error, .. } => EngineEvent::EndFile {
-                reason: match reason {
+            rsmpv::Event::StartFile { .. } => {
+                app_logging::debug("libmpv started loading a file");
+                EngineEvent::StartFile
+            }
+            rsmpv::Event::FileLoaded => {
+                app_logging::debug("libmpv finished loading the file");
+                EngineEvent::FileLoaded
+            }
+            rsmpv::Event::EndFile { reason, error, .. } => {
+                let reason = match reason {
                     rsmpv::EndFileReason::Eof => EndReason::Eof,
                     rsmpv::EndFileReason::Stop => EndReason::Stop,
                     rsmpv::EndFileReason::Quit => EndReason::Quit,
                     rsmpv::EndFileReason::Error => EndReason::Error,
                     _ => EndReason::Other,
-                },
-                error: error.map(|error| error.to_string()),
-            },
-            rsmpv::Event::LogMessage(message) => {
-                EngineEvent::Log { level: message.level, text: message.text.trim_end().to_string() }
+                };
+                let error = error.map(|error| error.to_string());
+                match (&reason, &error) {
+                    (EndReason::Error, Some(error)) => {
+                        app_logging::error(format!("libmpv ended playback with an error: {error}"))
+                    }
+                    (EndReason::Error, None) => {
+                        app_logging::error("libmpv ended playback with an unspecified error")
+                    }
+                    _ => app_logging::debug(format!("libmpv ended playback: reason={reason:?}")),
+                }
+                EngineEvent::EndFile { reason, error }
             }
-            rsmpv::Event::Shutdown => EngineEvent::Shutdown,
+            rsmpv::Event::LogMessage(message) => {
+                let level = message.level;
+                let text = message.text.trim_end().to_string();
+                match level.as_str() {
+                    "fatal" | "error" => app_logging::warning(format!("libmpv [{level}]: {text}")),
+                    "warn" => app_logging::debug(format!("libmpv [{level}]: {text}")),
+                    "info" | "v" | "debug" | "trace" => {
+                        app_logging::debug(format!("libmpv [{level}]: {text}"))
+                    }
+                    _ => app_logging::debug(format!("libmpv [{level}]: {text}")),
+                }
+                EngineEvent::Log { level, text }
+            }
+            rsmpv::Event::Shutdown => {
+                app_logging::notice("libmpv shut down");
+                EngineEvent::Shutdown
+            }
             _ => return None,
         })
     }
@@ -441,7 +529,10 @@ impl Engine {
     pub unsafe fn create_renderer(&self, gl: GlProcAddress) -> Result<VideoRenderer, Error> {
         // SAFETY: the caller guarantees that an OpenGL context is current,
         // which is the obligation of the constructor below.
-        unsafe { VideoRenderer::create(self.core.clone(), gl) }
+        unsafe { VideoRenderer::create(self.core.clone(), gl) }.map_err(|error| {
+            app_logging::error(format!("libmpv could not create the video renderer: {error}"));
+            error
+        })
     }
 }
 

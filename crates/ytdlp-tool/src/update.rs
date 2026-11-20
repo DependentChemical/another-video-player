@@ -80,13 +80,22 @@ pub struct ToolUpdate {
 pub fn check(current: &str) -> Result<Option<ToolUpdate>, Error> {
     let release = latest_release()?;
     let latest = release.version().to_string();
+    app_logging::debug(format!("comparing yt-dlp versions: current={current} latest={latest}"));
     if !is_newer(&latest, current) {
         return Ok(None);
     }
     let Some(asset) = release.asset_for_platform() else {
+        app_logging::warning(format!(
+            "the latest yt-dlp release has no asset for {:?}: latest={latest}",
+            Platform::current()
+        ));
         return Err(Error::UnsupportedPlatform);
     };
     let download_url = asset.browser_download_url.clone();
+    app_logging::notice(format!(
+        "yt-dlp update detected: current={current} latest={latest} asset={} url={download_url}",
+        asset.name
+    ));
     Ok(Some(ToolUpdate { current: current.to_string(), latest, notes: release.body, download_url }))
 }
 
@@ -98,9 +107,17 @@ pub fn latest_available() -> Result<ToolUpdate, Error> {
     let release = latest_release()?;
     let latest = release.version().to_string();
     let Some(asset) = release.asset_for_platform() else {
+        app_logging::warning(format!(
+            "the latest yt-dlp release has no asset for {:?}: latest={latest}",
+            Platform::current()
+        ));
         return Err(Error::UnsupportedPlatform);
     };
     let download_url = asset.browser_download_url.clone();
+    app_logging::notice(format!(
+        "offering yt-dlp install: latest={latest} asset={} url={download_url}",
+        asset.name
+    ));
     Ok(ToolUpdate {
         current: "not installed".to_string(),
         latest,
@@ -115,8 +132,20 @@ pub fn latest_available() -> Result<ToolUpdate, Error> {
 /// The path of the downloaded executable is returned.
 pub fn install_latest(paths: &ToolPaths) -> Result<PathBuf, Error> {
     let release = latest_release()?;
-    let asset = release.asset_for_platform().ok_or(Error::UnsupportedPlatform)?;
+    let asset = release.asset_for_platform().ok_or_else(|| {
+        app_logging::warning(format!(
+            "the latest yt-dlp release has no asset for {:?}: version={}",
+            Platform::current(),
+            release.version()
+        ));
+        Error::UnsupportedPlatform
+    })?;
     let destination = paths.managed_binary();
+    app_logging::notice(format!(
+        "installing yt-dlp {} into {}",
+        release.version(),
+        destination.display()
+    ));
     download(&asset.browser_download_url, &destination)?;
     Ok(destination)
 }
@@ -127,18 +156,34 @@ pub fn install_latest(paths: &ToolPaths) -> Result<PathBuf, Error> {
 /// that the folder works without a network connection.
 pub fn download_for_platform(platform: Platform, destination: &Path) -> Result<PathBuf, Error> {
     let release = latest_release()?;
-    let asset = release.asset_for(platform).ok_or(Error::UnsupportedPlatform)?;
+    let asset = release.asset_for(platform).ok_or_else(|| {
+        app_logging::warning(format!(
+            "yt-dlp release has no asset for {platform:?}: version={}",
+            release.version()
+        ));
+        Error::UnsupportedPlatform
+    })?;
+    app_logging::notice(format!(
+        "downloading yt-dlp {} for {platform:?} into {}",
+        release.version(),
+        destination.display()
+    ));
     download(&asset.browser_download_url, destination)?;
     Ok(destination.to_path_buf())
 }
 
 /// Asks GitHub for the newest published release.
 pub fn latest_release() -> Result<Release, Error> {
-    let mut response = ureq::get(RELEASES_API)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| Error::Http(e.to_string()))?;
-    response.body_mut().read_json::<Release>().map_err(|e| Error::Parse(e.to_string()))
+    app_logging::debug(format!("requesting the latest yt-dlp release: url={RELEASES_API}"));
+    let mut response =
+        ureq::get(RELEASES_API).header("User-Agent", USER_AGENT).call().map_err(|e| {
+            app_logging::warning(format!("the yt-dlp release request failed: {e}"));
+            Error::Http(e.to_string())
+        })?;
+    response.body_mut().read_json::<Release>().map_err(|e| {
+        app_logging::warning(format!("the yt-dlp release response was invalid: {e}"));
+        Error::Parse(e.to_string())
+    })
 }
 
 /// Downloads a file and puts it in place atomically.
@@ -166,10 +211,14 @@ where
         fs::create_dir_all(parent)?;
     }
 
-    let response = ureq::get(url)
-        .header("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| Error::Http(e.to_string()))?;
+    app_logging::notice(format!(
+        "downloading yt-dlp: url={url} destination={}",
+        destination.display()
+    ));
+    let response = ureq::get(url).header("User-Agent", USER_AGENT).call().map_err(|e| {
+        app_logging::error(format!("the yt-dlp download request failed: url={url} error={e}"));
+        Error::Http(e.to_string())
+    })?;
 
     let content_length = response
         .headers()
@@ -177,6 +226,7 @@ where
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    app_logging::debug(format!("yt-dlp download started: url={url} bytes={content_length}"));
 
     let temporary = temporary_path(destination);
     {
@@ -197,11 +247,18 @@ where
             }
         }
         file.sync_all()?;
+        app_logging::debug(format!(
+            "yt-dlp download body finished: url={url} bytes={downloaded} expected={content_length}"
+        ));
     }
 
     on_progress(1.0);
     replace(&temporary, destination)?;
     make_executable(destination)?;
+    app_logging::notice(format!(
+        "yt-dlp download complete: url={url} destination={}",
+        destination.display()
+    ));
     Ok(())
 }
 
@@ -221,6 +278,11 @@ pub fn replace(from: &Path, to: &Path) -> Result<(), Error> {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_file(from);
+            app_logging::error(format!(
+                "could not move {} into place at {}: {error}",
+                from.display(),
+                to.display()
+            ));
             Err(Error::Io(error))
         }
     }

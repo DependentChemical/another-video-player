@@ -5,16 +5,15 @@
 //! the interface through a channel, so the background work never has to
 //! touch the toolkit.
 
+use library::{Queue, ThumbnailCache};
+use media_model::{MediaSource, PlaybackPlan, Quality, Service};
+use playback_engine::{Engine, LoadRequest};
+use settings::Settings;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use library::{Queue, ThumbnailCache};
-use media_model::{MediaSource, PlaybackPlan, Quality, Service};
-use playback_engine::{Engine, LoadRequest};
-use settings::Settings;
 use stream_resolver::{CommandSpec, Resolver};
 use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
@@ -84,6 +83,35 @@ pub enum RetryKind {
     SourceSelection,
 }
 
+/// Why playback of a queue entry was started.
+///
+/// The reason travels with the resolved media so the log line that reports
+/// what is playing can say whether the user asked for it or whether Flatline
+/// advanced on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackReason {
+    /// The user asked for this media, either from the URL bar or the queue.
+    Manual,
+    /// The previous media ended and the queue advanced on its own.
+    Automatic,
+    /// The queue that was left over from an earlier run is being resumed.
+    Resume,
+    /// A previous attempt failed and this is the scheduled retry.
+    Retry,
+}
+
+impl PlaybackReason {
+    /// The stable label written into the log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlaybackReason::Manual => "manual",
+            PlaybackReason::Automatic => "automatic",
+            PlaybackReason::Resume => "startup-resume",
+            PlaybackReason::Retry => "retry",
+        }
+    }
+}
+
 /// A URL that was resolved and is ready to play.
 #[derive(Debug, Clone)]
 pub struct ResolvedMedia {
@@ -93,6 +121,8 @@ pub struct ResolvedMedia {
     pub thumbnail: Option<String>,
     /// The time the stream URLs were resolved.
     pub resolved_at: i64,
+    /// Why this media is being played.
+    pub reason: PlaybackReason,
     /// The resolved source.
     pub source: MediaSource,
 }
@@ -338,6 +368,11 @@ pub struct App {
 impl App {
     /// Creates the application around a `yt-dlp` installation.
     pub fn new(ytdlp: &YtDlp, paths: &AppPaths) -> Result<App, Error> {
+        app_logging::notice(format!(
+            "creating the application around yt-dlp {} with state in {}",
+            ytdlp.program().display(),
+            paths.root().display()
+        ));
         let stream_buffer = paths.stream_buffer();
         // Crash or unclean shutdown may have left cache files behind.
         // Clear them before creating the engine so mpv never sees stale data.
@@ -347,10 +382,16 @@ impl App {
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let pre_buffer_seconds = settings.pre_buffer_seconds().0;
+        app_logging::notice(format!(
+            "settings loaded from {}; pre-buffer={pre_buffer_seconds}s log_level={}",
+            paths.settings().display(),
+            app_logging::level()
+        ));
         let engine = Engine::new(&stream_buffer, pre_buffer_seconds)
             .map_err(|error| Error::Engine(error.to_string()))?;
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
+        app_logging::notice(format!("the library opened at {}", paths.database().display()));
         let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -410,6 +451,10 @@ impl App {
         if url.is_empty() {
             return;
         }
+        app_logging::notice(format!(
+            "manual load requested: url={url} current_media={}",
+            self.has_media()
+        ));
         // A manual request preempts any active or queued `yt-dlp` work so it
         // is handled immediately.
         let epoch = self.preempt_ytdlp();
@@ -418,7 +463,7 @@ impl App {
             self.resolve_pending(url, epoch);
         } else {
             self.prepare_current(&url, "", None, None, None);
-            self.consume_current_with_epoch(epoch);
+            self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
         }
     }
 
@@ -451,14 +496,22 @@ impl App {
         }
     }
 
-    fn resolve_play_with_epoch(&self, url: String, epoch: u64) {
+    fn resolve_play_with_epoch(&self, url: String, epoch: u64, reason: PlaybackReason) {
         {
             let mut state = self.state.lock().expect("the state is not poisoned");
             if self.is_ytdlp_stale(epoch) {
+                app_logging::debug(format!(
+                    "discarding a playback resolve that was superseded: url={url} reason={} epoch={epoch}",
+                    reason.as_str()
+                ));
                 return;
             }
             state.resolving_url = Some(url.clone());
         }
+        app_logging::notice(format!(
+            "resolving playback source: url={url} reason={}",
+            reason.as_str()
+        ));
 
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
@@ -487,19 +540,36 @@ impl App {
             if epoch_state.load(Ordering::SeqCst) != epoch
                 || matches!(result, Err(stream_resolver::Error::Cancelled))
             {
+                app_logging::debug(format!(
+                    "discarding a cancelled playback resolve: url={url} reason={}",
+                    reason.as_str()
+                ));
                 return;
             }
             let message = match result {
                 Ok(source) => {
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
+                    app_logging::debug(format!(
+                        "playback source resolved: url={url} title=\"{}\" streams={} reason={}",
+                        source.title,
+                        source.video_streams.len() + source.audio_streams.len(),
+                        reason.as_str()
+                    ));
                     Message::Resolved(Ok(ResolvedMedia {
                         url: url.clone(),
                         thumbnail,
                         resolved_at: unix_time(),
+                        reason,
                         source,
                     }))
                 }
-                Err(error) => Message::Resolved(Err((url, error.to_string()))),
+                Err(error) => {
+                    app_logging::warning(format!(
+                        "playback source could not be resolved: url={url} reason={} error={error}",
+                        reason.as_str()
+                    ));
+                    Message::Resolved(Err((url, error.to_string())))
+                }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
         });
@@ -511,6 +581,7 @@ impl App {
     /// The actual `yt-dlp` runs are serialized through the gate, but the gate is
     /// never held while waiting for a sign-in window.
     fn resolve_pending(&self, url: String, epoch: u64) {
+        app_logging::debug(format!("resolving a pending video in the background: url={url}"));
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
@@ -523,6 +594,9 @@ impl App {
 
         runtime.spawn_blocking(move || {
             if epoch_state.load(Ordering::SeqCst) != epoch {
+                app_logging::debug(format!(
+                    "discarding a pending resolve that was superseded: url={url}"
+                ));
                 return;
             }
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
@@ -541,12 +615,17 @@ impl App {
             if epoch_state.load(Ordering::SeqCst) != epoch
                 || matches!(result, Err(stream_resolver::Error::Cancelled))
             {
+                app_logging::debug(format!("discarding a cancelled pending resolve: url={url}"));
                 return;
             }
             let message = match result {
                 Ok(source) => {
                     let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     let thumbnail = thumbnail_id.as_deref().and_then(|id| cache.mid_path(id));
+                    app_logging::debug(format!(
+                        "pending video resolved: url={url} title=\"{}\"",
+                        source.title
+                    ));
                     Message::Pending(Ok(PendingMedia {
                         url,
                         title: source.title.clone(),
@@ -556,7 +635,12 @@ impl App {
                         resolved_at: unix_time(),
                     }))
                 }
-                Err(error) => Message::Pending(Err(error.to_string())),
+                Err(error) => {
+                    app_logging::warning(format!(
+                        "pending video could not be resolved: url={url} error={error}"
+                    ));
+                    Message::Pending(Err(error.to_string()))
+                }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
         });
@@ -564,6 +648,10 @@ impl App {
 
     /// Stores the pending media so the user can decide what to do with it.
     pub fn set_pending(&self, pending: PendingMedia) {
+        app_logging::debug(format!(
+            "pending video is waiting for the user: url={} title=\"{}\"",
+            pending.url, pending.title
+        ));
         *self.pending.lock().expect("the pending media is not poisoned") = Some(pending);
     }
 
@@ -574,6 +662,10 @@ impl App {
     /// entry, so "Play now" never destroys a curated list.
     pub fn play_pending(&self) -> Option<(String, Loaded)> {
         let pending = self.pending.lock().expect("the pending media is not poisoned").take()?;
+        app_logging::notice(format!(
+            "user chose to play the pending video now: url={} title=\"{}\"",
+            pending.url, pending.title
+        ));
         self.preempt_ytdlp();
         self.interrupt_playback();
         let thumbnail = pending.thumbnail_id.as_deref();
@@ -590,12 +682,18 @@ impl App {
             ) {
                 Ok(entry) => entry,
                 Err(error) => {
-                    crate::diag::note(&format!("the playlist could not be written: {error}"));
+                    app_logging::error(format!(
+                        "the playlist could not be written while playing pending media: url={} error={error}",
+                        pending.url
+                    ));
                     return None;
                 }
             };
             if let Err(error) = self.queue.set_current(entry.id) {
-                crate::diag::note(&format!("the playlist could not be written: {error}"));
+                app_logging::error(format!(
+                    "the playlist entry could not be made current: url={} error={error}",
+                    pending.url
+                ));
                 return None;
             }
         } else {
@@ -607,8 +705,13 @@ impl App {
                 uploader.as_deref(),
             );
         }
-        let loaded =
-            self.consume_resolved(&pending.url, pending.source, thumbnail, pending.resolved_at)?;
+        let loaded = self.consume_resolved(
+            &pending.url,
+            pending.source,
+            thumbnail,
+            pending.resolved_at,
+            PlaybackReason::Manual,
+        )?;
         Some((pending.url, loaded))
     }
 
@@ -628,6 +731,12 @@ impl App {
         else {
             return false;
         };
+        app_logging::notice(format!(
+            "user queued the pending video {}: url={} title=\"{}\"",
+            if next { "next" } else { "at the end" },
+            pending.url,
+            pending.title
+        ));
         let thumbnail = pending.thumbnail_id.as_deref();
         let thumbnail_url = pending.source.thumbnail.clone();
         let uploader = pending.source.uploader.clone();
@@ -651,7 +760,10 @@ impl App {
         let entry = match result {
             Ok(entry) => entry,
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                app_logging::error(format!(
+                    "the active queue could not be written for {}: {error}",
+                    pending.url
+                ));
                 return false;
             }
         };
@@ -662,14 +774,21 @@ impl App {
                 Some(pending.resolved_at),
             )
         {
-            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
+            app_logging::warning(format!(
+                "the resolved queue source could not be saved for {}: {error}",
+                pending.url
+            ));
         }
         true
     }
 
     /// Forgets the pending media without doing anything with it.
     pub fn dismiss_pending(&self) {
-        self.pending.lock().expect("the pending media is not poisoned").take();
+        if let Some(pending) =
+            self.pending.lock().expect("the pending media is not poisoned").take()
+        {
+            app_logging::debug(format!("the pending video was dismissed: url={}", pending.url));
+        }
     }
 
     /// Puts a freshly resolved media in the active queue before it is loaded.
@@ -681,14 +800,17 @@ impl App {
         thumbnail_url: Option<&str>,
         uploader: Option<&str>,
     ) {
+        app_logging::debug(format!("replacing the active queue with url={url} title=\"{title}\""));
         self.interrupt_playback();
         if let Err(error) = self.queue.replace_with(url, title, thumbnail, thumbnail_url, uploader)
         {
-            crate::diag::note(&format!("the active queue could not be written: {error}"));
+            app_logging::error(format!(
+                "the active queue could not be written for url={url}: {error}"
+            ));
         }
         // Drop thumbnails no longer referenced by the queue, plus their files.
         if let Err(error) = self.cache.release_unreferenced_thumbnails() {
-            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
+            app_logging::warning(format!("the thumbnail cache could not be cleared: {error}"));
         }
     }
 
@@ -699,14 +821,24 @@ impl App {
     /// have changed since the entry was added.
     pub fn advance(&self) -> bool {
         match self.queue.advance() {
-            Ok(Some(_)) => {
+            Ok(Some(entry)) => {
+                app_logging::notice(format!(
+                    "queue advanced automatically: url={} title=\"{}\" reason=automatic",
+                    entry.url, entry.title
+                ));
                 self.clear_retry();
-                self.consume_current_with_epoch(self.ytdlp_epoch.load(Ordering::SeqCst));
+                self.consume_current_with_epoch(
+                    self.ytdlp_epoch.load(Ordering::SeqCst),
+                    PlaybackReason::Automatic,
+                );
                 true
             }
-            Ok(None) => false,
+            Ok(None) => {
+                app_logging::debug("the active queue ended with no next entry");
+                false
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be advanced: {error}"));
                 false
             }
         }
@@ -717,28 +849,39 @@ impl App {
     /// This moves the current mark backward and resolves the entry it lands on.
     pub fn previous(&self) -> bool {
         let epoch = self.preempt_ytdlp();
+        app_logging::notice("manual queue action: previous");
         match self.queue.current() {
             Ok(Some(current)) => match self.queue.previous_before(current.position) {
                 Ok(Some(previous)) => {
+                    app_logging::notice(format!(
+                        "manual queue movement: previous from url={} title=\"{}\" to url={} title=\"{}\"",
+                        current.url, current.title, previous.url, previous.title
+                    ));
                     if let Err(error) = self.queue.set_current(previous.id) {
-                        crate::diag::note(&format!(
-                            "the active queue could not be written: {error}"
+                        app_logging::error(format!(
+                            "the previous queue entry could not be made current: {error}"
                         ));
                         return false;
                     }
                     self.interrupt_playback();
-                    self.consume_current_with_epoch(epoch);
+                    self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
                     true
                 }
-                Ok(None) => false,
+                Ok(None) => {
+                    app_logging::debug("manual previous found no entry before the current one");
+                    false
+                }
                 Err(error) => {
-                    crate::diag::note(&format!("the active queue could not be read: {error}"));
+                    app_logging::error(format!("the active queue could not be read: {error}"));
                     false
                 }
             },
-            Ok(None) => false,
+            Ok(None) => {
+                app_logging::debug("manual previous found no current queue entry");
+                false
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 false
             }
         }
@@ -749,28 +892,39 @@ impl App {
     /// This moves the current mark forward and resolves the entry it lands on.
     pub fn next(&self) -> bool {
         let epoch = self.preempt_ytdlp();
+        app_logging::notice("manual queue action: next");
         match self.queue.current() {
             Ok(Some(current)) => match self.queue.next_after(current.position) {
                 Ok(Some(next)) => {
+                    app_logging::notice(format!(
+                        "manual queue movement: next from url={} title=\"{}\" to url={} title=\"{}\"",
+                        current.url, current.title, next.url, next.title
+                    ));
                     if let Err(error) = self.queue.set_current(next.id) {
-                        crate::diag::note(&format!(
-                            "the active queue could not be written: {error}"
+                        app_logging::error(format!(
+                            "the next queue entry could not be made current: {error}"
                         ));
                         return false;
                     }
                     self.interrupt_playback();
-                    self.consume_current_with_epoch(epoch);
+                    self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
                     true
                 }
-                Ok(None) => false,
+                Ok(None) => {
+                    app_logging::debug("manual next found no entry after the current one");
+                    false
+                }
                 Err(error) => {
-                    crate::diag::note(&format!("the active queue could not be read: {error}"));
+                    app_logging::error(format!("the active queue could not be read: {error}"));
                     false
                 }
             },
-            Ok(None) => false,
+            Ok(None) => {
+                app_logging::debug("manual next found no current queue entry");
+                false
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 false
             }
         }
@@ -784,13 +938,20 @@ impl App {
         let epoch = self.preempt_ytdlp();
         self.clear_retry();
         match self.queue.current() {
-            Ok(Some(_)) => {
-                self.consume_current_with_epoch(epoch);
+            Ok(Some(entry)) => {
+                app_logging::notice(format!(
+                    "resuming the queue left by an earlier run: url={} title=\"{}\" reason=startup-resume",
+                    entry.url, entry.title
+                ));
+                self.consume_current_with_epoch(epoch, PlaybackReason::Resume);
                 true
             }
-            Ok(None) => false,
+            Ok(None) => {
+                app_logging::debug("there is no queue to resume");
+                false
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 false
             }
         }
@@ -801,7 +962,7 @@ impl App {
         match self.queue.entries() {
             Ok(entries) => entries,
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 Vec::new()
             }
         }
@@ -812,7 +973,7 @@ impl App {
         match self.queue.playlists() {
             Ok(playlists) => playlists,
             Err(error) => {
-                crate::diag::note(&format!("the playlists could not be read: {error}"));
+                app_logging::error(format!("the playlists could not be read: {error}"));
                 Vec::new()
             }
         }
@@ -838,19 +999,33 @@ impl App {
     /// selected, it just has nothing to play yet.
     pub fn select_playlist(&self, playlist_id: &str) -> bool {
         let epoch = self.preempt_ytdlp();
+        app_logging::notice(format!("user selected playlist id={playlist_id}"));
         if let Err(error) = self.queue.select_playlist(playlist_id) {
-            crate::diag::note(&format!("the playlist could not be selected: {error}"));
+            app_logging::error(format!(
+                "the playlist could not be selected: id={playlist_id} error={error}"
+            ));
             return false;
         }
         self.interrupt_playback();
         let resumed = match self.queue.current() {
-            Ok(Some(_)) => {
-                self.consume_current_with_epoch(epoch);
+            Ok(Some(entry)) => {
+                app_logging::notice(format!(
+                    "playing the current entry of the selected playlist: url={} title=\"{}\" reason=manual",
+                    entry.url, entry.title
+                ));
+                self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
                 true
             }
-            Ok(None) => false,
+            Ok(None) => {
+                app_logging::debug(format!(
+                    "the selected playlist has no current entry: id={playlist_id}"
+                ));
+                false
+            }
             Err(error) => {
-                crate::diag::note(&format!("the playlist could not be read: {error}"));
+                app_logging::error(format!(
+                    "the selected playlist could not be read: id={playlist_id} error={error}"
+                ));
                 false
             }
         };
@@ -873,7 +1048,11 @@ impl App {
 
     /// Creates a user playlist.
     pub fn create_playlist(&self, name: &str) -> Result<library::PlaylistInfo, String> {
-        self.queue.create_playlist(name).map_err(|error| error.to_string())
+        app_logging::notice(format!("user created playlist \"{name}\""));
+        self.queue.create_playlist(name).map_err(|error| {
+            app_logging::error(format!("the playlist \"{name}\" could not be created: {error}"));
+            error.to_string()
+        })
     }
 
     /// Copies an entry of the active playlist into `playlist_id`.
@@ -884,17 +1063,27 @@ impl App {
         let entry = match self.queue.entries() {
             Ok(entries) => entries.into_iter().find(|entry| entry.id == entry_id),
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 None
             }
         };
         let Some(entry) = entry else {
+            app_logging::warning(format!(
+                "the queue entry to copy was not found: entry_id={entry_id} playlist_id={playlist_id}"
+            ));
             return false;
         };
+        app_logging::notice(format!(
+            "user added a video to playlist: url={} title=\"{}\" playlist_id={playlist_id} action=copy",
+            entry.url, entry.title
+        ));
         match self.queue.push_entry_to_playlist(playlist_id, &entry) {
             Ok(_) => true,
             Err(error) => {
-                crate::diag::note(&format!("the playlist could not be written: {error}"));
+                app_logging::error(format!(
+                    "the video could not be added to the playlist: url={} playlist_id={playlist_id} error={error}",
+                    entry.url
+                ));
                 false
             }
         }
@@ -927,11 +1116,18 @@ impl App {
         };
         match self.queue.push_entry_to_playlist(playlist_id, &entry) {
             Ok(_) => {
+                app_logging::notice(format!(
+                    "user added the pending video to playlist: url={} title=\"{}\" playlist_id={playlist_id}",
+                    pending.url, pending.title
+                ));
                 slot.take();
                 true
             }
             Err(error) => {
-                crate::diag::note(&format!("the playlist could not be written: {error}"));
+                app_logging::error(format!(
+                    "the pending video could not be added to the playlist: url={} playlist_id={playlist_id} error={error}",
+                    pending.url
+                ));
                 false
             }
         }
@@ -964,7 +1160,7 @@ impl App {
                 })
                 .collect::<Vec<_>>(),
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 return;
             }
         };
@@ -995,6 +1191,7 @@ impl App {
             }
 
             let count = legacy.len();
+            app_logging::notice(format!("migrating {count} legacy thumbnails into the cache"));
             let _ = outbox
                 .lock()
                 .map(|sender| sender.send(Box::new(Message::ThumbnailMigrationStarted { count })));
@@ -1006,13 +1203,13 @@ impl App {
                     match cache.register_legacy(&url, &path) {
                         Ok(new_id) => {
                             if let Err(error) = queue.set_thumbnail(position, Some(&new_id)) {
-                                crate::diag::note(&format!(
+                                app_logging::warning(format!(
                                     "the active queue entry could not be updated: {error}"
                                 ));
                             }
                         }
                         Err(error) => {
-                            crate::diag::note(&format!(
+                            app_logging::warning(format!(
                                 "a legacy thumbnail could not be migrated: {error}"
                             ));
                         }
@@ -1023,6 +1220,7 @@ impl App {
 
             // Anything still not referenced by the queue is dropped.
             let _ = cache.release_unreferenced_thumbnails();
+            app_logging::notice(format!("thumbnail migration finished: processed={processed}"));
 
             let _ = outbox.lock().map(|sender| {
                 sender.send(Box::new(Message::ThumbnailMigrationFinished { processed }))
@@ -1041,7 +1239,7 @@ impl App {
         let entries = match self.queue.entries() {
             Ok(entries) => entries,
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 return;
             }
         };
@@ -1051,6 +1249,7 @@ impl App {
         }
 
         let count = due.len();
+        app_logging::debug(format!("refreshing {count} queue thumbnails in the background"));
         let cache = self.cache.clone();
         let queue = self.queue.clone();
         let outbox = Arc::clone(&self.outbox);
@@ -1068,14 +1267,11 @@ impl App {
                 .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
 
             for (position, url, thumbnail_url) in due {
-                if ytdlp_epoch.load(Ordering::SeqCst) != ytdlp_epoch.load(Ordering::SeqCst) {
-                    // nothing, just keep style minimal
-                }
                 // Try direct fetch first (no yt-dlp slot needed).
                 match cache.fetch(&url, Some(&thumbnail_url)) {
                     Ok(id) => {
                         if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                            crate::diag::note(&format!(
+                            app_logging::warning(format!(
                                 "the active queue entry could not be updated: {error}"
                             ));
                         }
@@ -1083,7 +1279,7 @@ impl App {
                         continue;
                     }
                     Err(error) => {
-                        crate::diag::note(&format!(
+                        app_logging::debug(format!(
                             "a queue thumbnail direct download failed for {url}: {error}; trying yt-dlp refresh"
                         ));
                     }
@@ -1120,19 +1316,19 @@ impl App {
                             match cache.fetch(&url, Some(new_thumb)) {
                                 Ok(id) => {
                                     if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                                        crate::diag::note(&format!(
+                                        app_logging::warning(format!(
                                             "the active queue entry could not be updated: {error}"
                                         ));
                                     }
                                 }
                                 Err(error) => {
-                                    crate::diag::note(&format!(
+                                    app_logging::warning(format!(
                                         "a queue thumbnail could not be refreshed after yt-dlp: {error}"
                                     ));
                                 }
                             }
                         } else {
-                            crate::diag::note(&format!(
+                            app_logging::debug(format!(
                                 "yt-dlp did not provide a thumbnail for {url}"
                             ));
                         }
@@ -1142,7 +1338,7 @@ impl App {
                         break;
                     }
                     Err(error) => {
-                        crate::diag::note(&format!(
+                        app_logging::warning(format!(
                             "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
                         ));
                     }
@@ -1157,7 +1353,7 @@ impl App {
         match self.queue.history_all() {
             Ok(entries) => entries,
             Err(error) => {
-                crate::diag::note(&format!("the history could not be read: {error}"));
+                app_logging::error(format!("the history could not be read: {error}"));
                 Vec::new()
             }
         }
@@ -1170,14 +1366,23 @@ impl App {
     /// of the previous media cannot advance the queue past it.
     pub fn play_queue_entry(&self, id: i64) -> bool {
         let epoch = self.preempt_ytdlp();
+        app_logging::notice(format!("manual queue action: play entry id={id}"));
         match self.queue.set_current(id) {
             Ok(()) => {
+                if let Ok(Some(entry)) = self.queue.current() {
+                    app_logging::notice(format!(
+                        "manual playback of a queue entry: url={} title=\"{}\" reason=manual",
+                        entry.url, entry.title
+                    ));
+                }
                 self.interrupt_playback();
-                self.consume_current_with_epoch(epoch);
+                self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
                 true
             }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be written: {error}"));
+                app_logging::error(format!(
+                    "the active queue entry id={id} could not be made current: {error}"
+                ));
                 false
             }
         }
@@ -1185,6 +1390,7 @@ impl App {
 
     /// Stops the current playback and clears transient state tied to it.
     fn interrupt_playback(&self) {
+        app_logging::debug("interrupting the current playback and clearing transient state");
         let _ = self.engine.stop();
         self.clear_retry();
         let mut state = self.state.lock().expect("the state is not poisoned");
@@ -1206,10 +1412,21 @@ impl App {
     /// stopped.
     pub fn remove_queue_entry(&self, id: i64) -> QueueRemoval {
         match self.queue.remove_entry(id) {
-            Ok(Some(entry)) => self.finish_removal(entry),
-            Ok(None) => QueueRemoval::default(),
+            Ok(Some(entry)) => {
+                app_logging::notice(format!(
+                    "user removed a queue entry: entry_id={id} url={} title=\"{}\" was_current={}",
+                    entry.url, entry.title, entry.current
+                ));
+                self.finish_removal(entry)
+            }
+            Ok(None) => {
+                app_logging::warning(format!("the queue entry to remove was not found: id={id}"));
+                QueueRemoval::default()
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue entry could not be removed: {error}"));
+                app_logging::error(format!(
+                    "the active queue entry id={id} could not be removed: {error}"
+                ));
                 QueueRemoval::default()
             }
         }
@@ -1221,10 +1438,23 @@ impl App {
     /// when the moved entry was the one playing.
     pub fn move_entry_to_playlist(&self, entry_id: i64, playlist_id: &str) -> Option<QueueRemoval> {
         match self.queue.move_entry_to_playlist(entry_id, playlist_id) {
-            Ok(Some(entry)) => Some(self.finish_removal(entry)),
-            Ok(None) => None,
+            Ok(Some(entry)) => {
+                app_logging::notice(format!(
+                    "user moved a video to another playlist: entry_id={entry_id} url={} title=\"{}\" playlist_id={playlist_id} was_current={}",
+                    entry.url, entry.title, entry.current
+                ));
+                Some(self.finish_removal(entry))
+            }
+            Ok(None) => {
+                app_logging::warning(format!(
+                    "the queue entry to move was not found: entry_id={entry_id} playlist_id={playlist_id}"
+                ));
+                None
+            }
             Err(error) => {
-                crate::diag::note(&format!("the playlist entry could not be moved: {error}"));
+                app_logging::error(format!(
+                    "the playlist entry could not be moved: entry_id={entry_id} playlist_id={playlist_id} error={error}"
+                ));
                 None
             }
         }
@@ -1236,26 +1466,40 @@ impl App {
         if let Some(thumbnail_id) = removed.thumbnail_id()
             && let Err(error) = self.cache.release_thumbnail(thumbnail_id)
         {
-            crate::diag::note(&format!("the thumbnail cache could not be cleared: {error}"));
+            app_logging::warning(format!("the thumbnail cache could not be cleared: {error}"));
         }
 
         if !removed.current {
+            app_logging::debug(format!(
+                "removed a non-current queue entry: url={} title=\"{}\"",
+                removed.url, removed.title
+            ));
             return QueueRemoval { removed: true, advanced: false };
         }
 
         match self.queue.next_after(removed.position) {
             Ok(Some(next)) => {
                 if let Err(error) = self.queue.set_current(next.id) {
-                    crate::diag::note(&format!(
+                    app_logging::error(format!(
                         "the next queue entry could not be made current: {error}"
                     ));
                     return QueueRemoval { removed: true, advanced: false };
                 }
+                app_logging::notice(format!(
+                    "the removed entry was playing; advancing automatically to url={} title=\"{}\" reason=automatic",
+                    next.url, next.title
+                ));
                 self.clear_retry();
-                self.consume_current_with_epoch(self.ytdlp_epoch.load(Ordering::SeqCst));
+                self.consume_current_with_epoch(
+                    self.ytdlp_epoch.load(Ordering::SeqCst),
+                    PlaybackReason::Automatic,
+                );
                 QueueRemoval { removed: true, advanced: true }
             }
             Ok(None) => {
+                app_logging::notice(
+                    "the removed entry was playing and nothing follows it; stopping playback",
+                );
                 self.preempt_ytdlp();
                 let _ = self.engine.stop();
                 self.clear_retry();
@@ -1263,7 +1507,7 @@ impl App {
                 QueueRemoval { removed: true, advanced: false }
             }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 QueueRemoval { removed: true, advanced: false }
             }
         }
@@ -1275,10 +1519,11 @@ impl App {
     /// Positions are reassigned 0..n-1 in the new order; the current mark
     /// follows its entry because it is tracked by id.
     pub fn reorder_queue(&self, ordered_ids: &[i64]) -> bool {
+        app_logging::notice(format!("user reordered the active queue: entry_ids={ordered_ids:?}"));
         match self.queue.reorder(ordered_ids) {
             Ok(()) => true,
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be reordered: {error}"));
+                app_logging::error(format!("the active queue could not be reordered: {error}"));
                 false
             }
         }
@@ -1288,11 +1533,18 @@ impl App {
     ///
     /// The URL is read from the queue, so callers cannot supply a player URL.
     pub fn consume_current(&self) {
-        self.consume_current_with_epoch(self.ytdlp_epoch.load(Ordering::SeqCst));
+        self.consume_current_with_epoch(
+            self.ytdlp_epoch.load(Ordering::SeqCst),
+            PlaybackReason::Manual,
+        );
     }
 
-    fn consume_current_with_epoch(&self, epoch: u64) {
+    fn consume_current_with_epoch(&self, epoch: u64, reason: PlaybackReason) {
         if self.is_ytdlp_stale(epoch) {
+            app_logging::debug(format!(
+                "discarding a queue consume that was superseded: reason={} epoch={epoch}",
+                reason.as_str()
+            ));
             return;
         }
         match self.queue.current() {
@@ -1302,20 +1554,30 @@ impl App {
                     && unix_time().saturating_sub(resolved_at) <= RESOLVED_SOURCE_MAX_AGE
                     && let Ok(source) = serde_json::from_str::<MediaSource>(json)
                 {
+                    app_logging::debug(format!(
+                        "using the cached resolved source for url={} age={}s reason={}",
+                        entry.url,
+                        unix_time().saturating_sub(resolved_at),
+                        reason.as_str()
+                    ));
                     let message = Message::Resolved(Ok(ResolvedMedia {
                         url: entry.url,
                         thumbnail: entry.thumbnail,
                         resolved_at,
+                        reason,
                         source,
                     }));
                     let _ = self.outbox.lock().map(|sender| sender.send(Box::new(message)));
                 } else {
-                    self.resolve_play_with_epoch(entry.url, epoch);
+                    self.resolve_play_with_epoch(entry.url, epoch, reason);
                 }
             }
-            Ok(None) => self.report("the active queue has nothing to play".to_string()),
+            Ok(None) => {
+                app_logging::warning("the active queue has nothing to play");
+                self.report("the active queue has nothing to play".to_string());
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 self.report(format!("the active queue could not be read: {error}"));
             }
         }
@@ -1328,12 +1590,18 @@ impl App {
         source: MediaSource,
         thumbnail: Option<&str>,
         resolved_at: i64,
+        reason: PlaybackReason,
     ) -> Option<Loaded> {
         let current = match self.queue.current() {
             Ok(Some(entry)) if entry.url == url => entry,
-            Ok(_) => return None,
+            Ok(_) => {
+                app_logging::debug(format!(
+                    "discarding a resolved source that is no longer current: url={url}"
+                ));
+                return None;
+            }
             Err(error) => {
-                crate::diag::note(&format!("the active queue could not be read: {error}"));
+                app_logging::error(format!("the active queue could not be read: {error}"));
                 return None;
             }
         };
@@ -1344,19 +1612,19 @@ impl App {
             source.thumbnail.as_deref(),
             source.uploader.as_deref(),
         ) {
-            crate::diag::note(&format!("the active queue entry could not be updated: {error}"));
+            app_logging::warning(format!("the active queue entry could not be updated: {error}"));
         }
         if let Ok(json) = serde_json::to_string(&source)
             && let Err(error) =
                 self.queue.set_resolved_source(current.position, Some(&json), Some(resolved_at))
         {
-            crate::diag::note(&format!("the resolved queue source could not be saved: {error}"));
+            app_logging::warning(format!("the resolved queue source could not be saved: {error}"));
         }
         let thumbnail_path = current
             .thumbnail_id()
             .and_then(|id| self.cache.full_path(id))
             .and_then(|path| path.to_str().map(|s| s.to_string()));
-        Some(self.accept_current_source(source, url, &current, thumbnail_path.as_deref()))
+        Some(self.accept_current_source(source, url, &current, thumbnail_path.as_deref(), reason))
     }
 
     /// Builds playback state for the source already authorized by the queue.
@@ -1366,6 +1634,7 @@ impl App {
         url: &str,
         current: &library::QueueEntry,
         thumbnail: Option<&str>,
+        reason: PlaybackReason,
     ) -> Loaded {
         let sources = source_lists(&source);
         let default_plan = self
@@ -1405,6 +1674,22 @@ impl App {
         let plan = plan_from_selection(&source, &video, &audio, &muxed).or(default_plan);
         let (video, audio, muxed) = plan.as_ref().map(selection_of).unwrap_or_default();
 
+        app_logging::notice(format!(
+            "starting playback: url={url} title=\"{}\" reason={} live={} video={:?} audio={:?} muxed={:?}",
+            source.title,
+            reason.as_str(),
+            source.is_live,
+            video,
+            audio,
+            muxed
+        ));
+        app_logging::debug(format!(
+            "source catalog: url={url} video_streams={} audio_streams={} uploader={:?}",
+            source.video_streams.len(),
+            source.audio_streams.len(),
+            source.uploader
+        ));
+
         let loaded = Loaded {
             title: source.title.clone(),
             duration: source.duration,
@@ -1437,7 +1722,7 @@ impl App {
         {
             history_position = None;
             if let Err(error) = self.queue.history_reset_position(&id_hash) {
-                crate::diag::note(&format!("failed to reset history position: {error}"));
+                app_logging::warning(format!("failed to reset history position: {error}"));
             }
         }
 
@@ -1467,12 +1752,23 @@ impl App {
         match plan {
             Some(plan) => {
                 if let Err(error) = self.start(&plan, loaded.is_live) {
+                    app_logging::error(format!(
+                        "libmpv could not load the playback plan: url={url} error={error}"
+                    ));
                     self.handle_playback_error(url.to_string(), error);
                 } else if let Err(error) = self.engine.play() {
+                    app_logging::error(format!(
+                        "libmpv could not start playback: url={url} error={error}"
+                    ));
                     self.handle_playback_error(url.to_string(), error.to_string());
+                } else {
+                    app_logging::debug(format!("libmpv accepted the playback plan: url={url}"));
                 }
             }
-            None => self.handle_source_selection_error(url.to_string()),
+            None => {
+                app_logging::warning(format!("no playable stream matched the settings: url={url}"));
+                self.handle_source_selection_error(url.to_string());
+            }
         }
         loaded
     }
@@ -1526,11 +1822,17 @@ impl App {
         if state.retry.exhausted() {
             state.retry.clear();
             drop(state);
+            app_logging::error(format!(
+                "giving up after {attempt} retries: kind={kind:?} error={message}"
+            ));
             self.report(format!("{message} (gave up after {attempt} retries)"));
             return;
         }
         let delay = state.retry.next_delay_seconds().unwrap_or(2);
         drop(state);
+        app_logging::warning(format!(
+            "scheduling retry {attempt}: kind={kind:?} delay={delay}s error={message}"
+        ));
         self.report_retry(message, delay, report_kind);
     }
 
@@ -1557,17 +1859,18 @@ impl App {
 
         if let (Some(url), Some(kind)) = (url, kind) {
             let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
+            app_logging::notice(format!("retrying now: kind={kind:?} url={url} reason=retry"));
             Some(match kind {
                 RetryErrorKind::Resolver => {
-                    self.resolve_play_with_epoch(url, epoch);
+                    self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
                     RetryKind::Resolver
                 }
                 RetryErrorKind::Playback => {
-                    self.consume_current_with_epoch(epoch);
+                    self.consume_current_with_epoch(epoch, PlaybackReason::Retry);
                     RetryKind::Playback
                 }
                 RetryErrorKind::SourceSelection => {
-                    self.resolve_play_with_epoch(url, epoch);
+                    self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
                     RetryKind::SourceSelection
                 }
             })
@@ -1822,6 +2125,11 @@ impl App {
         let handle = self.runtime.handle().clone();
         handle.spawn_blocking(move || match updater::check(crate::VERSION) {
             Ok(Some(update)) => {
+                app_logging::notice(format!(
+                    "Flatline update available: current={} latest={}",
+                    crate::VERSION,
+                    update.version
+                ));
                 let should_notify = {
                     let mut guard = app.notified_app_update.lock().expect("poisoned");
                     if guard.as_deref() == Some(update.version.as_str()) {
@@ -1837,8 +2145,14 @@ impl App {
                         .map(|sender| sender.send(Box::new(Message::AppUpdateAvailable(update))));
                 }
             }
-            Ok(None) => crate::diag::note("Flatline is up to date"),
-            Err(error) => crate::diag::note(&format!("the Flatline update check failed: {error}")),
+            Ok(None) => app_logging::debug(format!(
+                "Flatline is up to date: current={} latest=none",
+                crate::VERSION
+            )),
+            Err(error) => app_logging::warning(format!(
+                "the Flatline update check failed: current={} error={error}",
+                crate::VERSION
+            )),
         });
     }
 
@@ -1873,6 +2187,10 @@ impl App {
             }
             match ytdlp_tool::update::check(&current) {
                 Ok(Some(update)) => {
+                    app_logging::notice(format!(
+                        "yt-dlp update available: current={current} latest={}",
+                        update.latest
+                    ));
                     let should_notify = {
                         let mut guard = app.notified_tool_update.lock().expect("poisoned");
                         if guard.as_deref() == Some(update.latest.as_str()) {
@@ -1888,10 +2206,10 @@ impl App {
                         });
                     }
                 }
-                Ok(None) => crate::diag::note(&format!("yt-dlp {current} is up to date")),
-                Err(error) => {
-                    crate::diag::note(&format!("the yt-dlp update check failed: {error}"))
-                }
+                Ok(None) => app_logging::debug(format!("yt-dlp {current} is up to date")),
+                Err(error) => app_logging::warning(format!(
+                    "the yt-dlp update check failed: current={current} error={error}"
+                )),
             }
         });
     }
@@ -1902,12 +2220,18 @@ impl App {
         self.runtime.handle().spawn_blocking(move || {
             match ytdlp_tool::update::latest_available() {
                 Ok(update) => {
+                    app_logging::notice(format!(
+                        "yt-dlp is missing; offering install of latest={}",
+                        update.latest
+                    ));
                     let _ = outbox
                         .lock()
                         .map(|sender| sender.send(Box::new(Message::ToolUpdateAvailable(update))));
                 }
                 Err(error) => {
-                    crate::diag::note(&format!("the yt-dlp release could not be fetched: {error}"));
+                    app_logging::error(format!(
+                        "the yt-dlp release could not be fetched while installing a missing tool: {error}"
+                    ));
                 }
             }
         });
@@ -1922,18 +2246,35 @@ impl App {
     ) {
         let outbox = Arc::clone(&self.outbox);
         self.runtime.handle().spawn_blocking(move || {
+            app_logging::notice(format!(
+                "downloading Flatline update: version={} directory={}",
+                update.version,
+                directory.display()
+            ));
             let progress_outbox = Arc::clone(&outbox);
             let result = updater::install(&update, &directory, &executable, move |progress| {
                 let _ = progress_outbox
                     .lock()
                     .map(|sender| sender.send(Box::new(Message::AppUpdateProgress(progress))));
             });
-            if let Err(error) = result {
-                let message = error.to_string();
-                crate::diag::note(&format!("the Flatline update failed: {message}"));
-                let _ = outbox
-                    .lock()
-                    .map(|sender| sender.send(Box::new(Message::AppUpdateFailed(message))));
+            match result {
+                Ok(()) => {
+                    app_logging::notice(format!(
+                        "Flatline update prepared: version={} executable={}",
+                        update.version,
+                        executable.display()
+                    ));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    app_logging::error(format!(
+                        "the Flatline update failed: version={} error={message}",
+                        update.version
+                    ));
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::AppUpdateFailed(message))));
+                }
             }
         });
     }
@@ -1946,6 +2287,10 @@ impl App {
         let cookies = self.session.cookies_dir().to_path_buf();
         let paths = self.paths.clone();
         self.runtime.handle().spawn_blocking(move || {
+            app_logging::notice(format!(
+                "downloading yt-dlp update: latest={} url={}",
+                update.latest, update.download_url
+            ));
             let tools = paths.tool_paths();
             let staged = tools.staged_binary();
             let managed = tools.managed_binary();
@@ -1964,7 +2309,10 @@ impl App {
             if let Err(error) = download {
                 let _ = std::fs::remove_file(&staged);
                 let message = error.to_string();
-                crate::diag::note(&format!("the yt-dlp update failed: {message}"));
+                app_logging::error(format!(
+                    "the yt-dlp update download failed: latest={} error={message}",
+                    update.latest
+                ));
                 let _ = outbox
                     .lock()
                     .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
@@ -1979,6 +2327,9 @@ impl App {
                 Ok(guard) => guard,
                 Err(_) => {
                     let _ = std::fs::remove_file(&staged);
+                    app_logging::error(
+                        "the yt-dlp update could not be applied: the yt-dlp gate was poisoned",
+                    );
                     let _ = outbox.lock().map(|sender| {
                         sender.send(Box::new(Message::ToolUpdateFailed(
                             "the yt-dlp update could not be applied".to_string(),
@@ -1991,7 +2342,10 @@ impl App {
             if let Err(error) = ytdlp_tool::update::replace(&staged, &managed) {
                 let _ = std::fs::remove_file(&staged);
                 let message = error.to_string();
-                crate::diag::note(&format!("the yt-dlp update could not be applied: {message}"));
+                app_logging::error(format!(
+                    "the yt-dlp update could not be applied: latest={} error={message}",
+                    update.latest
+                ));
                 let _ = outbox
                     .lock()
                     .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
@@ -2003,6 +2357,11 @@ impl App {
                 *resolver = Resolver::new(command_spec(&tool, &cookies));
             }
             drop(_guard);
+            app_logging::notice(format!(
+                "yt-dlp update applied: latest={} managed={}",
+                update.latest,
+                managed.display()
+            ));
 
             let _ = outbox
                 .lock()
@@ -2079,7 +2438,7 @@ impl App {
             uploader.as_deref(),
             position,
         ) {
-            crate::diag::note(&format!("failed to save history position: {error}"));
+            app_logging::warning(format!("failed to save history position: {error}"));
         } else {
             // Update last save time
             if let Ok(mut state) = self.state.lock() {
@@ -2097,7 +2456,7 @@ impl App {
         drop(state);
 
         if let Err(error) = self.queue.history_reset_position(&id_hash) {
-            crate::diag::note(&format!("failed to reset history position: {error}"));
+            app_logging::warning(format!("failed to reset history position: {error}"));
         }
     }
 
@@ -2173,7 +2532,7 @@ fn clear_stream_buffer(directory: &Path) {
             std::fs::remove_file(&path)
         };
         if let Err(error) = result {
-            crate::diag::note(&format!("a stream buffer file could not be removed: {error}"));
+            app_logging::warning(format!("a stream buffer file could not be removed: {error}"));
         }
     }
 }
@@ -2444,17 +2803,44 @@ fn run_ytdlp_resolve<T>(
     run: impl FnOnce() -> Result<T, stream_resolver::Error>,
 ) -> Result<T, stream_resolver::Error> {
     use stream_resolver::Error as ResolveError;
-    let _guard = gate.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = match gate.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            app_logging::warning("the yt-dlp queue gate was poisoned; continuing");
+            error.into_inner()
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            app_logging::debug("waiting for the yt-dlp queue to become available");
+            match gate.lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    app_logging::warning("the yt-dlp queue gate was poisoned; continuing");
+                    error.into_inner()
+                }
+            }
+        }
+    };
+    app_logging::debug("the yt-dlp queue is acquired for a resolve");
     if epoch_state.load(Ordering::SeqCst) != epoch {
+        app_logging::debug("dropping a queued yt-dlp resolve because it was superseded");
         return Err(ResolveError::Cancelled);
     }
     pid.store(0, Ordering::SeqCst);
     cancel.store(false, Ordering::SeqCst);
     if epoch_state.load(Ordering::SeqCst) != epoch {
         cancel.store(true, Ordering::SeqCst);
+        app_logging::debug("dropping a queued yt-dlp resolve because it was superseded");
         return Err(ResolveError::Cancelled);
     }
-    run()
+    let result = run();
+    match &result {
+        Ok(_) => app_logging::debug("the queued yt-dlp resolve finished successfully"),
+        Err(ResolveError::Cancelled) => {
+            app_logging::debug("the queued yt-dlp resolve was cancelled")
+        }
+        Err(error) => app_logging::warning(format!("the queued yt-dlp resolve failed: {error}")),
+    }
+    result
 }
 
 /// Everything that can go wrong while running the application.
