@@ -1,9 +1,8 @@
-//! Finding a usable `yt-dlp` and describing how to run it.
-
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,6 +65,15 @@ impl YtDlp {
     /// A version probe must never hang: a broken executable that does not
     /// answer is treated as unusable so it cannot block later work.
     pub fn version(&self) -> Result<String, Error> {
+        self.version_with_cancel(None)
+    }
+
+    /// Asks `yt-dlp` for its version string, allowing cancellation by the
+    /// caller.
+    pub fn version_with_cancel(
+        &self,
+        cancel: Option<(&AtomicU32, &AtomicBool)>,
+    ) -> Result<String, Error> {
         let mut command = self.command();
         command.arg("--version");
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -86,25 +94,36 @@ impl YtDlp {
             }
             bytes
         });
+        if let Some((pid, _)) = cancel {
+            pid.store(child.id(), Ordering::SeqCst);
+        }
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
+            if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
+                terminate_child(&mut child, cancel);
+                clear_cancel_pid(cancel);
+                return Err(Error::NotUsable("the yt-dlp probe was cancelled".to_string()));
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
                 Ok(None) => {
-                    terminate_child(&mut child);
+                    terminate_child(&mut child, cancel);
+                    clear_cancel_pid(cancel);
                     return Err(Error::NotUsable(
                         "timed out reading the yt-dlp version".to_string(),
                     ));
                 }
                 Err(error) => {
-                    terminate_child(&mut child);
+                    terminate_child(&mut child, cancel);
+                    clear_cancel_pid(cancel);
                     return Err(Error::Io(error));
                 }
             }
         };
 
+        clear_cancel_pid(cancel);
         let stdout = stdout_reader.join().unwrap_or_default();
         let stderr = stderr_reader.join().unwrap_or_default();
         if !status.success() {
@@ -151,19 +170,36 @@ impl ToolPaths {
     }
 }
 
+fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
+    if let Some((pid, _)) = cancel {
+        pid.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Stops a probe process and, on Windows, any process tree it spawned.
-fn terminate_child(child: &mut std::process::Child) {
+fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
     let _ = child.kill();
+    let id = cancel
+        .and_then(|(pid, _)| {
+            let id = pid.load(Ordering::SeqCst);
+            (id != 0).then_some(id)
+        })
+        .unwrap_or_else(|| child.id());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .args(["/PID", &id.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
+        let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
     }
     let _ = child.wait();
 }
