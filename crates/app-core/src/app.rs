@@ -2366,7 +2366,7 @@ impl App {
             }
 
             let _ = status_outbox.lock().map(|sender| {
-                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying updateâ€¦".to_string())))
             });
 
             let _guard = match gate.lock() {
@@ -2511,13 +2511,21 @@ impl App {
     /// Manual seeks can land inside a segment to let the user watch it once;
     /// normal playback skips enabled segments automatically.
     pub fn apply_sponsorblock_skips(&self) {
+        if self.engine.is_idle() {
+            return;
+        }
         let position = self.engine.position();
         if !position.is_finite() {
             return;
         }
+        let duration = self.engine.duration();
         let mut state = self.state.lock().expect("the state is not poisoned");
         if state.is_live || state.sponsorblock_segments.is_empty() {
             state.sponsorblock_suppressed = None;
+            return;
+        }
+        // Wait until the media is seekable before issuing auto-skip seeks.
+        if !duration.is_finite() || duration <= 0.0 {
             return;
         }
 
@@ -2538,20 +2546,44 @@ impl App {
                 break;
             }
         }
-        if let Some((start, end, _)) = &skip {
-            state.sponsorblock_suppressed = Some((*start, *end));
+        let Some((start, end, category)) = skip else {
+            return;
+        };
+
+        // Avoid seeking exactly to EOF and wait for a seekable range so mpv
+        // does not reject early/startup auto-skips (e.g. command error -12).
+        let mut target = end.min((duration - 0.10).max(0.0)).max(0.0);
+        if let Some(edge) = self.engine.seekable_end()
+            && edge.is_finite()
+            && edge > position + 0.10
+        {
+            target = target.min(edge);
         }
+        if target <= position + 0.05 {
+            if end >= duration - 0.10 {
+                state.sponsorblock_suppressed = Some((start, end));
+            }
+            return;
+        }
+
+        // Suppress first to avoid repeated seek attempts while mpv processes it.
+        state.sponsorblock_suppressed = Some((start, end));
         drop(state);
 
-        if let Some((_, end, category)) = skip {
-            app_logging::debug(format!(
-                "skipping SponsorBlock segment during playback: category={category} from={position:.3}s to={end:.3}s"
+        app_logging::debug(format!(
+            "skipping SponsorBlock segment during playback: category={category} from={position:.3}s to={target:.3}s"
+        ));
+        if let Err(error) = self.engine.seek(target) {
+            app_logging::warning(format!(
+                "failed to auto-skip SponsorBlock segment: category={category} target={target:.3}s error={error}"
             ));
-            if let Err(error) = self.engine.seek(end.max(0.0)) {
-                self.report(error.to_string());
-            } else {
-                self.toast(format!("Skipped {}", sponsorblock_skip_label(&category)));
+            // Allow a later retry once the player can seek this range.
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            if state.sponsorblock_suppressed == Some((start, end)) {
+                state.sponsorblock_suppressed = None;
             }
+        } else {
+            self.toast(format!("Skipped {}", sponsorblock_skip_label(&category)));
         }
     }
 
@@ -2759,7 +2791,7 @@ fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool)
 fn video_label(stream: &media_model::VideoStream) -> String {
     match (stream.width, stream.height) {
         (Some(_), Some(height)) if height >= 720 => format!("{height}p"),
-        (Some(width), Some(height)) => format!("{width}×{height}"),
+        (Some(width), Some(height)) => format!("{width}Ã—{height}"),
         (None, Some(height)) => format!("{height}p"),
         _ => stream.format_id.clone(),
     }
@@ -2769,7 +2801,7 @@ fn video_label(stream: &media_model::VideoStream) -> String {
 fn video_detail(stream: &media_model::VideoStream) -> String {
     let mut parts = Vec::new();
     if let (Some(width), Some(height)) = (stream.width, stream.height) {
-        parts.push(format!("{width}×{height}"));
+        parts.push(format!("{width}Ã—{height}"));
     }
     if let Some(fps) = stream.fps
         && fps > 0.0
@@ -2785,7 +2817,7 @@ fn video_detail(stream: &media_model::VideoStream) -> String {
     if !stream.ext.is_empty() {
         parts.push(stream.ext.clone());
     }
-    parts.join(" · ")
+    parts.join(" Â· ")
 }
 
 /// The prominent label of an audio stream: its bitrate.
@@ -2815,7 +2847,7 @@ fn audio_detail(stream: &media_model::AudioStream) -> String {
         parts.push(note.clone());
     }
     parts.push(stream.format_id.clone());
-    parts.join(" · ")
+    parts.join(" Â· ")
 }
 
 /// Turns a bitrate in kilobits per second into a human line.
@@ -3197,7 +3229,7 @@ mod tests {
     fn labels_carry_the_size_the_user_asked_for() {
         let lists = source_lists(&source());
         assert_eq!(lists.video[0].label, "1080p");
-        assert!(lists.video[0].detail.contains("1920×1080"));
+        assert!(lists.video[0].detail.contains("1920Ã—1080"));
         assert!(lists.audio[0].label.contains("128"));
     }
 
