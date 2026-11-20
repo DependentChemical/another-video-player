@@ -182,7 +182,7 @@ pub struct QueueRemoval {
 }
 
 /// How long a persisted resolver result may be reused before it is refreshed.
-const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
+const RESOLVED_SOURCE_MAX_AGE: i64 = 30;
 
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.

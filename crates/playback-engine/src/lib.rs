@@ -261,7 +261,6 @@ impl Engine {
         }
         result
     }
-
     /// Applies HTTP headers/cookies extracted for a stream to mpv before loading.
     ///
     /// Headers are sent as `http-header-fields` (CRLF joined). If `User-Agent` is present
@@ -295,9 +294,10 @@ impl Engine {
         if let Some(c) = cookies
             && !c.is_empty()
             && !has_cookie_header
+            && let Some(cookie_header) = cookies_to_header(c)
         {
             joined.push_str("Cookie: ");
-            joined.push_str(c);
+            joined.push_str(&cookie_header);
             joined.push_str("\r\n");
         }
 
@@ -625,6 +625,33 @@ fn buffered_ranges_from_cache(state: &rsmpv::Node) -> Vec<BufferedRange> {
             }
         })
         .collect()
+}
+
+/// Converts a yt-dlp style cookie string (which may include attributes like
+/// `Domain=`, `Path=`, `Secure`, `Expires=`) into a proper `Cookie:` header value
+/// containing only `name=value` pairs.
+fn cookies_to_header(raw: &str) -> Option<String> {
+    let pairs: Vec<String> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if lower.starts_with("domain=")
+                || lower.starts_with("path=")
+                || lower.starts_with("expires=")
+                || lower.starts_with("max-age=")
+                || lower.starts_with("samesite=")
+                || lower == "secure"
+                || lower == "httponly"
+                || lower.starts_with("priority=")
+            {
+                return None;
+            }
+            if part.contains('=') { Some(part.to_string()) } else { None }
+        })
+        .collect();
+    if pairs.is_empty() { None } else { Some(pairs.join("; ")) }
 }
 
 #[cfg(test)]
