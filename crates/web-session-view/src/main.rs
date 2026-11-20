@@ -63,6 +63,10 @@ fn arguments() -> Result<Arguments, String> {
 
 /// Runs the sign-in and reports the outcome through the exit code.
 fn main() -> ExitCode {
+    static SOURCES: &[&dyn web_session::Source] =
+        &[&source_youtube::SOURCE, &source_twitch::SOURCE];
+    web_session::Sources::new(SOURCES).install();
+
     let arguments = match arguments() {
         Ok(arguments) => arguments,
         Err(problem) => {

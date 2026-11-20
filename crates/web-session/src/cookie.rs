@@ -1,9 +1,8 @@
 //! Reading and writing the cookies a service session needs.
 //!
-//! The only format `yt-dlp` understands is the Netscape cookie file. This
-//! module owns that format, the domain filtering that keeps a cookie file
-//! scoped to one service and the small amount of knowledge needed to tell
-//! whether a browser profile is signed in.
+//! Cookie storage is generic; per-source details (domains, auth cookies,
+//! file naming) are provided by the active source registry when installed,
+//! with built-in defaults for the known services to preserve behavior.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -35,10 +34,7 @@ pub struct Cookie {
 
 /// The name of the cookie file a service uses below the cookies directory.
 pub fn cookie_file_name(service: Service) -> &'static str {
-    match service {
-        Service::YouTube => "cookies-youtube.txt",
-        Service::Twitch => "cookies-twitch.txt",
-    }
+    crate::registry::source(service).cookie_file_name()
 }
 
 /// The cookie file a service uses inside `directory`.
@@ -47,23 +43,11 @@ pub fn cookie_file(directory: &Path, service: Service) -> PathBuf {
 }
 
 /// Every cookie the profile holds for the service and its sign-in domains.
-///
-/// The whole set is kept, not a hand-picked list: services rotate their
-/// authentication cookies and drop the ones nobody told them about, so a
-/// narrow selection is the quickest way to break a working sign-in.
 pub fn for_service(service: Service, cookies: &[Cookie]) -> Vec<Cookie> {
     cookies.iter().filter(|cookie| domain_belongs_to(service, &cookie.domain)).cloned().collect()
 }
 
 /// Whether a browser profile holds a cookie that marks it as signed in.
-///
-/// This is deliberately a cookie check and not a page check: it needs no
-/// navigation, no JavaScript and no network round trip, so it is the fastest
-/// answer a webview can give.
-///
-/// The cookie has to belong to the service itself. YouTube signs in through
-/// Google, so a profile can hold a Google session without ever having been
-/// signed in to YouTube — that profile still needs the sign-in window.
 pub fn signed_in(service: Service, cookies: &[Cookie]) -> bool {
     cookies.iter().any(|cookie| {
         is_auth_cookie(service, &cookie.name) && own_domain_belongs_to(service, &cookie.domain)
@@ -73,24 +57,10 @@ pub fn signed_in(service: Service, cookies: &[Cookie]) -> bool {
 /// Whether `name` is one of the cookies that can only exist on a signed-in
 /// profile.
 pub fn is_auth_cookie(service: Service, name: &str) -> bool {
-    let names: &[&str] = match service {
-        Service::YouTube => &[
-            "SAPISID",
-            "__Secure-1PAPISID",
-            "__Secure-3PAPISID",
-            "__Secure-1PSID",
-            "__Secure-3PSID",
-        ],
-        Service::Twitch => &["auth-token", "auth_token"],
-    };
-    names.iter().any(|candidate| candidate.eq_ignore_ascii_case(name))
+    auth_cookie_names(service).iter().any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 /// Whether a cookie domain belongs to the service.
-///
-/// YouTube's sign-in bounces through Google, so the Google cookies have to
-/// travel with the YouTube ones. The extra domains are matched with a dot
-/// boundary, never with a plain substring.
 pub fn domain_belongs_to(service: Service, domain: &str) -> bool {
     let domain = domain.trim_start_matches('.').to_ascii_lowercase();
     base_domains(service)
@@ -99,39 +69,22 @@ pub fn domain_belongs_to(service: Service, domain: &str) -> bool {
 }
 
 /// Whether a cookie domain belongs to the service itself.
-///
-/// This is the narrower question [`domain_belongs_to`] answers: a sign-in
-/// cookie only counts when the service itself set it.
 pub fn own_domain_belongs_to(service: Service, domain: &str) -> bool {
     let domain = domain.trim_start_matches('.').to_ascii_lowercase();
     own_domains(service).iter().any(|base| domain == *base || domain.ends_with(&format!(".{base}")))
 }
 
 /// The domains of the service that cover their subdomains.
-///
-/// A browser writes a cookie on one of these with a leading dot, because the
-/// server asked for the whole tree. The webview no longer says which cookies
-/// those are, so the service decides it here.
 pub fn base_domains(service: Service) -> &'static [&'static str] {
-    match service {
-        Service::YouTube => &["youtube.com", "youtu.be", "youtube-nocookie.com", "google.com"],
-        Service::Twitch => &["twitch.tv", "ttvnw.net", "jtvnw.net", "twitchcdn.net"],
-    }
+    crate::registry::source(service).base_domains()
 }
 
 /// The domains of the service itself.
 pub fn own_domains(service: Service) -> &'static [&'static str] {
-    match service {
-        Service::YouTube => &["youtube.com", "youtu.be", "youtube-nocookie.com"],
-        Service::Twitch => &["twitch.tv"],
-    }
+    crate::registry::source(service).own_domains()
 }
 
 /// The domain a cookie is written with in the Netscape format.
-///
-/// A cookie on the base domain of a service covers its subdomains and is
-/// written with a leading dot; a cookie on a single host does not. This is
-/// what a browser writes and what `yt-dlp` writes when it saves a file.
 pub fn netscape_domain(service: Service, domain: &str) -> String {
     let bare = domain.trim_start_matches('.');
     if base_domains(service).iter().any(|base| bare.eq_ignore_ascii_case(base)) {
@@ -142,9 +95,6 @@ pub fn netscape_domain(service: Service, domain: &str) -> String {
 }
 
 /// Serializes cookies in the Netscape format `yt-dlp` reads.
-///
-/// Windows gets CRLF line endings because that is what `yt-dlp` expects
-/// there; every other platform gets LF.
 pub fn netscape_text(cookies: &[Cookie]) -> String {
     let newline = if cfg!(windows) { "\r\n" } else { "\n" };
     let mut text = String::new();
@@ -170,9 +120,6 @@ pub fn write_file(path: &Path, cookies: &[Cookie]) -> io::Result<()> {
     let temporary = temporary_path(path);
     std::fs::write(&temporary, text)?;
     restrict_permissions(&temporary)?;
-    // `rename` does not replace an existing file on Windows, so the old file
-    // is removed first. The temporary file is complete by then, which keeps
-    // a reader from ever seeing a half written cookie file.
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -180,9 +127,6 @@ pub fn write_file(path: &Path, cookies: &[Cookie]) -> io::Result<()> {
 }
 
 /// Reads cookies from a Netscape cookie file.
-///
-/// Malformed lines are ignored so a partially written or foreign file does
-/// not break the check that depends on it.
 pub fn read_file(path: &Path) -> io::Result<Vec<Cookie>> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -200,6 +144,10 @@ pub fn parse_netscape(text: &str) -> Vec<Cookie> {
 /// Whether the cookie file holds a signed-in session for the service.
 pub fn signed_in_file(service: Service, path: &Path) -> bool {
     read_file(path).is_ok_and(|cookies| signed_in(service, &cookies))
+}
+
+fn auth_cookie_names(service: Service) -> &'static [&'static str] {
+    crate::registry::source(service).auth_cookie_names()
 }
 
 fn read_reader(reader: impl BufRead) -> Vec<Cookie> {
@@ -239,7 +187,6 @@ fn read_reader(reader: impl BufRead) -> Vec<Cookie> {
     cookies
 }
 
-/// One tab separated line in the Netscape format.
 fn netscape_line(cookie: &Cookie) -> String {
     let domain = clean_field(&cookie.domain);
     let domain = if cookie.http_only { format!("#HttpOnly_{domain}") } else { domain };
@@ -261,18 +208,15 @@ fn netscape_line(cookie: &Cookie) -> String {
     .join("\t")
 }
 
-/// Removes the characters that would break a tab separated cookie line.
 fn clean_field(value: &str) -> String {
     value.chars().filter(|character| !matches!(character, '\t' | '\r' | '\n')).collect()
 }
 
-/// The sibling file a cookie file is written to before it is renamed.
 fn temporary_path(path: &Path) -> PathBuf {
     let name = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
-/// Cookie files are credentials, so only the owner may read them.
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -281,7 +225,6 @@ fn restrict_permissions(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, permissions)
 }
 
-/// Windows has no POSIX permission bits; the file inherits the user profile ACL.
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
@@ -367,8 +310,6 @@ mod tests {
 
     #[test]
     fn the_netscape_domain_keeps_the_two_columns_of_a_line_in_step() {
-        // The cookie jar of yt-dlp insists that the second column agrees
-        // with the leading dot of the first one.
         let domain = netscape_domain(Service::YouTube, "youtube.com");
         let cookies = vec![Cookie { domain, ..cookie("youtube.com", "SID", "x") }];
         let line = netscape_text(&cookies);
@@ -392,7 +333,6 @@ mod tests {
 
     #[test]
     fn a_google_session_alone_is_not_a_youtube_session() {
-        // Signing in to Google does not sign in to YouTube.
         assert!(!signed_in(Service::YouTube, &[cookie(".google.com", "SAPISID", "x")]));
         assert!(signed_in(Service::YouTube, &[cookie(".youtube.com", "SAPISID", "x")]));
     }
@@ -417,8 +357,6 @@ mod tests {
     fn session_cookies_get_an_empty_expiry_zero() {
         let cookies = vec![Cookie { expires: None, ..cookie(".twitch.tv", "auth-token", "token") }];
         let line = netscape_text(&cookies);
-        // A domain that starts with a dot covers its subdomains, so the
-        // second column says so too.
         assert!(line.contains(".twitch.tv\tTRUE\t/\tTRUE\t0\tauth-token\ttoken"));
     }
 

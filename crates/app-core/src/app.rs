@@ -2731,22 +2731,20 @@ fn format_bitrate(kilobits: u64) -> String {
 /// Every service gets its own cookie file, and a file is only passed when it
 /// contains authentication cookies for that service.
 fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
-    let spec = match ytdlp.interpreter() {
+    let mut spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    let youtube = web_session::cookie_file(cookies, Service::YouTube);
-    let twitch = web_session::cookie_file(cookies, Service::Twitch);
-    let spec = if web_session::cookie::signed_in_file(Service::YouTube, &youtube) {
-        spec.with_cookies(Service::YouTube, youtube)
-    } else {
-        spec
-    };
-    if web_session::cookie::signed_in_file(Service::Twitch, &twitch) {
-        spec.with_cookies(Service::Twitch, twitch)
-    } else {
-        spec
+    let services: Vec<Service> = web_session::Sources::installed()
+        .map(|sources| sources.all().iter().map(|source| source.service()).collect())
+        .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
+    for service in services {
+        let path = web_session::cookie_file(cookies, service);
+        if web_session::cookie::signed_in_file(service, &path) {
+            spec = spec.with_cookies(service, path);
+        }
     }
+    spec
 }
 
 /// Resolves a URL with `yt-dlp`, serializing each process run through `gate`.

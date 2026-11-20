@@ -1,0 +1,18 @@
+[package]
+name = "source-youtube"
+description = "YouTube-specific session and cookie behavior for Flatline."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Layer 1: source-specific capability. Provides deviations for YouTube only.
+[dependencies]
+media-model = { workspace = true }
+web-session = { workspace = true }
+url = { workspace = true }
+
+[lib]
+name = "source_youtube"
+path = "src/lib.rs"

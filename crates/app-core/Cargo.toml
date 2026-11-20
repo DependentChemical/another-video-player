@@ -19,6 +19,8 @@ settings = { workspace = true }
 ui-kit = { workspace = true }
 video-surface = { workspace = true }
 web-session = { workspace = true }
+source-youtube = { workspace = true }
+source-twitch = { workspace = true }
 ytdlp-tool = { workspace = true }
 updater = { workspace = true }
 slint = { workspace = true }

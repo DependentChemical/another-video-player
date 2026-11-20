@@ -66,8 +66,8 @@ The ladder:
 | Layer | Crates | May depend on |
 | --- | --- | --- |
 | 0 — foundation | `app-logging`, `media-model` | nothing |
-| 1 — capabilities | `database`, `image-process`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `updater`, `web-session`, `ytdlp-tool` | `app-logging`, plus `database`/`media-model`/`image-process` where needed |
-| 2 — adapter | `video-surface`, `web-session-view` | one capability each, plus `app-logging` |
+| 1 — capabilities | `database`, `image-process`, `library`, `playback-engine`, `settings`, `stream-resolver`, `storyboard`, `ui-kit`, `updater`, `web-session`, `ytdlp-tool`, `source-youtube`, `source-twitch` | `app-logging`, plus `database`/`media-model`/`image-process`/`web-session` where needed |
+| 2 — adapter | `video-surface`, `web-session-view` | one capability each, plus `app-logging` and source plugins where needed |
 | 3 — composition root | `app-core` | everything |
 
 `app-logging` is shared infrastructure: it owns no application domain and
@@ -152,6 +152,10 @@ This sequence mirrors the `dev-test` workflow and the release build pipeline.
   keeps the Netscape cookie file `yt-dlp` reads.
 - `crates/web-session-view` — the `flatline-session` helper: a Tauri webview
   that signs the user in and exports the cookies.
+- `crates/sources/source-youtube` — YouTube-specific session/cookie and URL
+  deviations, registered as an internal source plugin.
+- `crates/sources/source-twitch` — Twitch-specific session/cookie and URL
+  deviations, registered as an internal source plugin.
 - `xtask` — the build task: dependency provisioning, the isolation check
   and packaging.
 - `.flatline/` — downloaded dependencies. Not part of the repository.

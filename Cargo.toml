@@ -17,13 +17,15 @@ members = [
     "crates/web-session-view",
     "crates/ytdlp-tool",
     "crates/updater",
+    "crates/sources/source-youtube",
+    "crates/sources/source-twitch",
     "xtask",
 ]
 # `cargo run` / `cargo build` at the workspace root operate on the primary crate.
 default-members = ["crates/app-core"]
 
 [workspace.package]
-version = "0.4.48"
+version = "0.4.49"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -43,6 +45,8 @@ stream-resolver = { path = "crates/stream-resolver" }
 ui-kit = { path = "crates/ui-kit" }
 video-surface = { path = "crates/video-surface" }
 web-session = { path = "crates/web-session" }
+source-youtube = { path = "crates/sources/source-youtube" }
+source-twitch = { path = "crates/sources/source-twitch" }
 ytdlp-tool = { path = "crates/ytdlp-tool" }
 updater = { path = "crates/updater" }
 

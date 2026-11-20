@@ -1,13 +1,12 @@
 //! The sites Flatline knows how to sign in to.
 //!
-//! A service is part of the shared vocabulary because two unrelated
-//! capabilities need the same answer: the resolver decides which cookie file
-//! belongs to a URL, and the session capability decides which sign-in page
-//! to open. Neither has to know the other exists.
+//! A service is part of the shared vocabulary because capabilities need a
+//! stable identity for a source. Host-to-service matching is provided by
+//! source plugins via `web-session` when installed; when no registry is
+//! available, this falls back to returning `None` for URL matching while
+//! keeping service names/labels stable.
 
 use std::fmt;
-
-use url::Url;
 
 /// A site whose answers can require an authenticated session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -21,7 +20,13 @@ pub enum Service {
 impl Service {
     /// The service a URL belongs to, when Flatline supports signing in there.
     pub fn from_url(url: &str) -> Option<Service> {
-        let parsed = Url::parse(url).ok()?;
+        // Delegated to source plugins when available to avoid duplicating
+        // host rules in the vocabulary layer.
+        // Note: this is a soft dependency boundary via function pointer-like
+        // behavior is not possible here; callers that need plugin-aware
+        // matching should go through `web_session::registry::service_from_url`.
+        // Keep a minimal fallback for crates that only depend on media-model.
+        let parsed = url::Url::parse(url).ok()?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return None;
         }

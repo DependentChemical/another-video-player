@@ -1,44 +1,49 @@
-//! Recognising the answers that mean "sign in first".
+﻿//! Recognising the answers that mean "sign in first".
 //!
-//! `yt-dlp` reports an authentication problem as a sentence, so this module
-//! is deliberately a list of sentences rather than an error code. Matching
-//! is case-insensitive because the text is copied from different sites and
-//! different `yt-dlp` versions.
+//! Challenge detection is generic with per-source phrase extensions provided
+//! by the active registry. When no registry is installed, built-in defaults
+//! preserve existing behavior.
 
 use media_model::Service;
 
-/// The phrases that mean the resolver needs a signed-in session.
-const CHALLENGE_PHRASES: &[&str] = &[
+/// Generic phrases that mean the resolver needs a signed-in session.
+const GENERIC_PHRASES: &[&str] = &[
     "sign in to confirm you're not a bot",
     "sign in to confirm you’re not a bot",
     "please sign in",
     "requires authentication",
     "insufficient access",
-    "oauth may be required",
-    "subscriber-only",
-    "only available to subscribers",
-    "unauthorized_entitlements",
-    "vod_manifest_restricted",
 ];
 
 /// Whether a resolver error means the cookies need to be refreshed.
 pub fn is_auth_challenge(message: &str) -> bool {
-    // yt-dlp on Windows may emit the apostrophe in a non-UTF-8 codepage,
-    // which `from_utf8_lossy` turns into U+FFFD. Normalising both the
-    // message and the phrases keeps the match working regardless.
-    let normalize =
-        |text: &str| text.replace(['\u{FFFD}', '\u{2019}', '\u{2018}'], "'").to_ascii_lowercase();
     let lowercase = normalize(message);
-    CHALLENGE_PHRASES.iter().any(|phrase| lowercase.contains(&normalize(phrase)))
+    for phrase in GENERIC_PHRASES {
+        if lowercase.contains(&normalize(phrase)) {
+            return true;
+        }
+    }
+    for source in crate::registry::all() {
+        for phrase in source.challenge_phrases() {
+            if lowercase.contains(&normalize(phrase)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Whether a resolver error is worth a sign-in attempt for this service.
-///
-/// A generic "please sign in" on an unrelated site is not something either
-/// service can fix, so the URL has to belong to a service before a session is
-/// opened.
 pub fn challenge_service(url: &str, message: &str) -> Option<Service> {
-    Service::from_url(url).filter(|_| is_auth_challenge(message))
+    let service = crate::registry::service_from_url(url).or_else(|| Service::from_url(url))?;
+    if !is_auth_challenge(message) {
+        return None;
+    }
+    Some(service)
+}
+
+fn normalize(text: &str) -> String {
+    text.replace(['\u{FFFD}', '\u{2019}', '\u{2018}'], "'").to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -68,7 +73,6 @@ mod tests {
 
     #[test]
     fn replacement_characters_from_a_non_utf8_codepage_still_match() {
-        // A Windows ANSI apostrophe read as UTF-8 becomes U+FFFD.
         assert!(is_auth_challenge("Sign in to confirm you\u{FFFD}re not a bot"));
         assert!(is_auth_challenge("Sign in to confirm you\u{2019}re not a bot"));
     }
