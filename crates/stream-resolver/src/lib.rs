@@ -198,7 +198,7 @@ impl Resolver {
 ///
 /// The output is drained on two threads while the process runs, so a child
 /// that fills its pipe can never deadlock. When the deadline passes the child
-/// is killed and the timeout is returned immediately; the readers are left
+/// is terminated and the timeout is returned immediately; the readers are left
 /// to finish on their own, because a descendant that inherited the pipe may
 /// otherwise keep `join` blocked forever.
 fn run_command(mut command: Command, timeout: Duration) -> Result<Output, Error> {
@@ -207,8 +207,7 @@ fn run_command(mut command: Command, timeout: Duration) -> Result<Output, Error>
     let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         _ => {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
             return Err(Error::MissingOutputPipe);
         }
     };
@@ -221,13 +220,11 @@ fn run_command(mut command: Command, timeout: Duration) -> Result<Output, Error>
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(&mut child);
                 return Err(Error::Timeout(timeout.as_secs()));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(&mut child);
                 return Err(Error::Spawn(error));
             }
         }
@@ -236,6 +233,26 @@ fn run_command(mut command: Command, timeout: Duration) -> Result<Output, Error>
     let stdout = join_output(stdout_reader)?;
     let stderr = join_output(stderr_reader)?;
     Ok(Output { status, stdout, stderr })
+}
+
+/// Stops a resolver process and, on Windows, any process tree it spawned.
+///
+/// `yt-dlp` may leave helpers behind after a hang or timeout, and a lingering
+/// process can keep the next invocation from running correctly.
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.wait();
 }
 
 /// Reads one child output stream to completion.

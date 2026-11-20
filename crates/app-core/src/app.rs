@@ -444,47 +444,50 @@ impl App {
     }
 
     /// Resolves the URL read from the active queue in the background.
+    ///
+    /// Each `yt-dlp` run is serialized through the gate, but the gate is held
+    /// only while a process runs so retries, sign-ins and waits never reserve
+    /// it.
     fn resolve_play(&self, url: String) {
-        // Track the URL being resolved for retry purposes
         self.state.lock().expect("the state is not poisoned").resolving_url = Some(url.clone());
 
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
-        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
+        let gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(&resolver, &session, &url, &sender)
+            let result = resolve_with_session(&resolver, &session, &gate, &url, &sender)
                 .map_err(|error| (url.clone(), error.to_string()))
                 .map(|source| {
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     ResolvedMedia { url: url.clone(), thumbnail, resolved_at: unix_time(), source }
                 });
-            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Resolved(result))));
         });
     }
 
     /// Resolves a URL in the background, caches its thumbnail and waits for
     /// the user to decide.
+    ///
+    /// The actual `yt-dlp` runs are serialized through the gate, but the gate is
+    /// never held while waiting for a sign-in window.
     fn resolve_pending(&self, url: String) {
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
-        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
+        let gate = Arc::clone(&self.ytdlp_gate);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(&resolver, &session, &url, &sender)
+            let result = resolve_with_session(&resolver, &session, &gate, &url, &sender)
                 .map_err(|error| error.to_string())
                 .map(|source| {
                     let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
@@ -498,7 +501,6 @@ impl App {
                         resolved_at: unix_time(),
                     }
                 });
-            drop(_guard);
             let _ = outbox.lock().map(|sender| sender.send(Box::new(Message::Pending(result))));
         });
     }
@@ -1021,14 +1023,18 @@ impl App {
                 }
                 // Fallback: re-resolve via yt-dlp to get a fresh thumbnail_url, then fetch
                 let sender = outbox.lock().expect("outbox poisoned").clone();
-                let _guard = ytdlp_gate.lock().expect("ytdlp gate poisoned");
                 let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
-                match resolve_with_session(&resolver, &session, &url, &sender) {
+                match resolve_with_session(&resolver, &session, &ytdlp_gate, &url, &sender) {
                     Ok(source) => {
-                        drop(_guard);
                         if let Some(new_thumb) = source.thumbnail.as_deref() {
                             // Update stored thumbnail_url if changed
-                            let _ = queue.update_details(position, &source.title, None, Some(new_thumb), source.uploader.as_deref());
+                            let _ = queue.update_details(
+                                position,
+                                &source.title,
+                                None,
+                                Some(new_thumb),
+                                source.uploader.as_deref(),
+                            );
                             match cache.fetch(&url, Some(new_thumb)) {
                                 Ok(id) => {
                                     if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
@@ -1050,7 +1056,6 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        drop(_guard);
                         crate::diag::note(&format!(
                             "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
                         ));
@@ -1661,6 +1666,7 @@ impl App {
 
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
+        let _guard = self.ytdlp_gate.lock().ok();
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
         *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
     }
@@ -1675,6 +1681,14 @@ impl App {
                 tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
             }
         });
+    }
+
+    /// Runs one `yt-dlp` process at a time for the whole application.
+    ///
+    /// The gate is never held while waiting to retry or to sign in, only while
+    /// `yt-dlp` itself is running or while its managed executable is replaced.
+    pub fn ytdlp_gate(&self) -> &Arc<Mutex<()>> {
+        &self.ytdlp_gate
     }
 
     fn poll_app_update_background(self: Arc<Self>) {
@@ -1706,12 +1720,15 @@ impl App {
     fn poll_tool_update_background(self: Arc<Self>, paths: AppPaths) {
         let outbox = Arc::clone(&self.outbox);
         let app = Arc::clone(&self);
+        let gate = Arc::clone(&self.ytdlp_gate);
         let handle = self.runtime.handle().clone();
         handle.spawn_blocking(move || {
             let tools = paths.tool_paths();
+            let _guard = gate.lock().ok();
             let current = ytdlp_tool::locate::managed(&tools)
                 .and_then(|tool| tool.version().ok())
                 .unwrap_or_default();
+            drop(_guard);
             if current.is_empty() {
                 return;
             }
@@ -2216,24 +2233,24 @@ fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
     }
 }
 
-/// Resolves a URL and asks the user to sign in when the service demands it.
+/// Resolves a URL with `yt-dlp`, serializing each process run through `gate`.
 ///
-/// A sign-in challenge pauses this resolve: the helper runs before the retry
-/// loop is told about the failure, so the user can finish or close the
-/// window first. The helper performs a background page-level session check and
-/// only shows the sign-in window when the service no longer accepts the
-/// session. A successful sign-in is followed by one fresh resolve; if the
-/// service still reports the same challenge the error is returned instead of a
-/// new prompt. URLs that do not belong to either service are never offered to
-/// ask again. If the user declines to sign in, cookie regeneration is skipped
-/// and the resolve continues with the same retry flow without new cookies.
+/// The gate is held only while `yt-dlp` is running, never while waiting for a
+/// sign-in window. A sign-in challenge pauses after the failed run, lets the
+/// user finish, then takes the gate again for one fresh resolve with the
+/// exported cookies.
 fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
+    gate: &Mutex<()>,
     url: &str,
     notice: &Sender<Box<Message>>,
 ) -> Result<MediaSource, String> {
-    let error = match resolver.resolve(url) {
+    let first = {
+        let _guard = gate.lock().ok();
+        resolver.resolve(url)
+    };
+    let error = match first {
         Ok(source) => return Ok(source),
         Err(error) => error.to_string(),
     };
@@ -2242,7 +2259,7 @@ fn resolve_with_session(
     };
     match session.sign_in(service, url, notice) {
         Ok(()) => {
-            // Retry once with the freshly exported, verified session cookies.
+            let _guard = gate.lock().ok();
             resolver.resolve(url).map_err(|error| error.to_string())
         }
         Err(crate::session::Error::Declined) => {

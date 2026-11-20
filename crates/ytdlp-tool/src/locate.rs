@@ -1,8 +1,11 @@
 //! Finding a usable `yt-dlp` and describing how to run it.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::Error;
 
@@ -59,14 +62,55 @@ impl YtDlp {
     }
 
     /// Asks `yt-dlp` for its version string, e.g. `2025.10.13`.
+    ///
+    /// A version probe must never hang: a broken executable that does not
+    /// answer is treated as unusable so it cannot block later work.
     pub fn version(&self) -> Result<String, Error> {
-        let output = self.command().arg("--version").output()?;
-        if !output.status.success() {
-            return Err(Error::NotUsable(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        let mut command = self.command();
+        command.arg("--version");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut out) = stdout {
+                let _ = out.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut err) = stderr {
+                let _ = err.read_to_end(&mut bytes);
+            }
+            bytes
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    terminate_child(&mut child);
+                    return Err(Error::NotUsable(
+                        "timed out reading the yt-dlp version".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    terminate_child(&mut child);
+                    return Err(Error::Io(error));
+                }
+            }
+        };
+
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if !status.success() {
+            return Err(Error::NotUsable(String::from_utf8_lossy(&stderr).trim().to_string()));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
     /// Whether the executable exists and answers `--version`.
@@ -105,6 +149,23 @@ impl ToolPaths {
         name.set_extension(suffix);
         name
     }
+}
+
+/// Stops a probe process and, on Windows, any process tree it spawned.
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.wait();
 }
 
 /// Looks for a managed `yt-dlp` first, then one on `PATH`.
