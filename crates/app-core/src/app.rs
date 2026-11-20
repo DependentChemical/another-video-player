@@ -182,7 +182,7 @@ pub struct QueueRemoval {
 }
 
 /// How long a persisted resolver result may be reused before it is refreshed.
-const RESOLVED_SOURCE_MAX_AGE: i64 = 30;
+const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.
@@ -2480,24 +2480,7 @@ impl App {
         self.engine
             .set_pre_buffer(pre_buffer_seconds, is_live)
             .map_err(|error| error.to_string())?;
-        // Apply request context (headers/cookies) from the chosen streams (yt-dlp parity).
-        let (http_headers, cookies) = if let Some(video) = &plan.video {
-            (video.http_headers.as_ref(), video.cookies.as_deref())
-        } else if let Some(audio) = &plan.audio {
-            (audio.http_headers.as_ref(), audio.cookies.as_deref())
-        } else {
-            (None, None)
-        };
-        if http_headers.is_some() || cookies.is_some() {
-            app_logging::debug(format!(
-                "applying stream request context to mpv: headers={} cookies={}",
-                http_headers.is_some(),
-                cookies.is_some()
-            ));
-        }
-        self.engine
-            .apply_stream_request(http_headers, cookies)
-            .map_err(|error| error.to_string())?;
+
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
@@ -2910,8 +2893,6 @@ mod tests {
             has_audio,
             protocol: None,
             note: None,
-            http_headers: None,
-            cookies: None,
         }
     }
 
@@ -2926,8 +2907,6 @@ mod tests {
             language: None,
             note: None,
             protocol: None,
-            http_headers: None,
-            cookies: None,
         }
     }
 
