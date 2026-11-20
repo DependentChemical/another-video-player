@@ -84,6 +84,11 @@ impl YtDlp {
             ));
             error
         })?;
+        app_logging::debug(format!(
+            "yt-dlp version probe started: program={} pid={}",
+            self.program.display(),
+            child.id()
+        ));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_reader = thread::spawn(move || {
@@ -107,24 +112,28 @@ impl YtDlp {
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
-                app_logging::debug(format!(
-                    "cancelled the yt-dlp version probe: pid={}",
-                    child.id()
-                ));
+                let probe_id = child.id();
+                app_logging::debug(format!("cancelled the yt-dlp version probe: pid={probe_id}"));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
+                app_logging::debug(format!(
+                    "yt-dlp version probe pid={probe_id} closed after cancellation"
+                ));
                 return Err(Error::NotUsable("the yt-dlp probe was cancelled".to_string()));
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
                 Ok(None) => {
+                    let probe_id = child.id();
                     app_logging::warning(format!(
-                        "the yt-dlp version probe timed out after 10s: pid={}",
-                        child.id()
+                        "the yt-dlp version probe timed out after 10s: pid={probe_id}"
                     ));
                     terminate_child(&mut child, cancel);
                     clear_cancel_pid(cancel);
+                    app_logging::debug(format!(
+                        "yt-dlp version probe pid={probe_id} closed after timeout"
+                    ));
                     return Err(Error::NotUsable(
                         "timed out reading the yt-dlp version".to_string(),
                     ));
@@ -147,15 +156,17 @@ impl YtDlp {
         if !status.success() {
             let message = String::from_utf8_lossy(&stderr).trim().to_string();
             app_logging::warning(format!(
-                "the yt-dlp version probe failed: program={} status={status} stderr={message}",
-                self.program.display()
+                "the yt-dlp version probe failed: program={} pid={} status={status} stderr={message}",
+                self.program.display(),
+                child.id()
             ));
             return Err(Error::NotUsable(message));
         }
         let version = String::from_utf8_lossy(&stdout).trim().to_string();
         app_logging::debug(format!(
-            "yt-dlp version probe: program={} version={version}",
-            self.program.display()
+            "yt-dlp version probe finished: program={} pid={} status={status} version={version}",
+            self.program.display(),
+            child.id()
         ));
         Ok(version)
     }
@@ -206,13 +217,16 @@ fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
 
 /// Stops a probe process and, on Windows, any process tree it spawned.
 fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
-    let _ = child.kill();
     let id = cancel
         .and_then(|(pid, _)| {
             let id = pid.load(Ordering::SeqCst);
             (id != 0).then_some(id)
         })
         .unwrap_or_else(|| child.id());
+    app_logging::debug(format!("stopping yt-dlp probe process: pid={id}"));
+    if let Err(error) = child.kill() {
+        app_logging::debug(format!("yt-dlp probe pid={id} could not be killed directly: {error}"));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -229,7 +243,16 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
         let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
         let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
     }
-    let _ = child.wait();
+    match child.wait() {
+        Ok(status) => {
+            app_logging::debug(format!("yt-dlp probe pid={id} closed with {status}"));
+        }
+        Err(error) => {
+            app_logging::warning(format!(
+                "yt-dlp probe pid={id} could not be reaped after termination: {error}"
+            ));
+        }
+    }
 }
 
 /// Looks for a managed `yt-dlp` first, then one on `PATH`.

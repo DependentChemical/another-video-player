@@ -11,7 +11,7 @@ mod parse;
 mod plan;
 
 /// A resolver process must not leave the UI waiting indefinitely.
-const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub use parse::parse_catalog;
 pub use plan::plan;
@@ -169,7 +169,7 @@ impl Resolver {
             .arg("--no-progress")
             .arg("--ignore-config")
             .arg("--socket-timeout")
-            .arg("20");
+            .arg("15");
         if let Some(cookies) = self.cookies_for_url(url) {
             app_logging::debug(format!(
                 "passing cookies to yt-dlp: url={url} cookies={}",
@@ -274,14 +274,15 @@ fn run_command(
     let stderr_reader = thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + timeout;
 
+    let child_id = child.id();
     let status = loop {
         if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
             app_logging::warning(format!(
-                "cancelling yt-dlp pid={}: superseded by newer work",
-                child.id()
+                "cancelling yt-dlp pid={child_id}: superseded by newer work"
             ));
             terminate_child(&mut child, cancel);
             clear_cancel_pid(cancel);
+            app_logging::debug(format!("yt-dlp pid={child_id} closed after cancellation"));
             return Err(Error::Cancelled);
         }
         match child.try_wait() {
@@ -289,18 +290,17 @@ fn run_command(
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
                 app_logging::error(format!(
-                    "yt-dlp timed out after {}s; terminating pid={}",
-                    timeout.as_secs(),
-                    child.id()
+                    "yt-dlp timed out after {}s; terminating pid={child_id}",
+                    timeout.as_secs()
                 ));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
+                app_logging::error(format!("yt-dlp pid={child_id} closed after timeout"));
                 return Err(Error::Timeout(timeout.as_secs()));
             }
             Err(error) => {
                 app_logging::error(format!(
-                    "yt-dlp pid={} could not be waited on: {error}",
-                    child.id()
+                    "yt-dlp pid={child_id} could not be waited on: {error}"
                 ));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
@@ -308,7 +308,7 @@ fn run_command(
             }
         }
     };
-    app_logging::debug(format!("yt-dlp pid={} exited with {status}", child.id()));
+    app_logging::debug(format!("yt-dlp pid={child_id} exited with {status}"));
 
     clear_cancel_pid(cancel);
     let stdout = join_output(stdout_reader).map_err(|error| {
@@ -334,8 +334,12 @@ pub fn cancel_active_process(pid: &AtomicU32, cancelled: &AtomicBool) {
     cancelled.store(true, Ordering::SeqCst);
     let id = pid.load(Ordering::SeqCst);
     if id != 0 {
-        app_logging::debug(format!("terminating the active yt-dlp process: pid={id}"));
+        app_logging::debug(format!(
+            "requesting termination of the active yt-dlp process: pid={id}"
+        ));
         terminate_pid(id);
+    } else {
+        app_logging::debug("no active yt-dlp process to terminate");
     }
 }
 
@@ -344,15 +348,27 @@ pub fn cancel_active_process(pid: &AtomicU32, cancelled: &AtomicBool) {
 /// `yt-dlp` may leave helpers behind after a hang, timeout or preemption, and
 /// a lingering process can keep the next invocation from running correctly.
 fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
-    let _ = child.kill();
     let id = cancel
         .and_then(|(pid, _)| {
             let id = pid.load(Ordering::SeqCst);
             (id != 0).then_some(id)
         })
         .unwrap_or_else(|| child.id());
+    app_logging::debug(format!("stopping yt-dlp process: pid={id}"));
+    if let Err(error) = child.kill() {
+        app_logging::debug(format!("yt-dlp pid={id} could not be killed directly: {error}"));
+    }
     terminate_pid(id);
-    let _ = child.wait();
+    match child.wait() {
+        Ok(status) => {
+            app_logging::debug(format!("yt-dlp pid={id} closed with {status}"));
+        }
+        Err(error) => {
+            app_logging::warning(format!(
+                "yt-dlp pid={id} could not be reaped after termination: {error}"
+            ));
+        }
+    }
 }
 
 /// Terminates a process tree by id.
@@ -361,17 +377,42 @@ pub fn terminate_pid(id: u32) {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
+        match std::process::Command::new("taskkill")
             .args(["/PID", &id.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {
+                app_logging::debug(format!("taskkill terminated yt-dlp tree: pid={id}"));
+            }
+            Ok(status) => {
+                app_logging::debug(format!(
+                    "taskkill did not confirm termination for yt-dlp pid={id}: {status}"
+                ));
+            }
+            Err(error) => {
+                app_logging::warning(format!(
+                    "taskkill could not be started for yt-dlp pid={id}: {error}"
+                ));
+            }
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
-        let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
+        let term = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
+        let kill = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
+        match (term, kill) {
+            (Ok(term), Ok(kill)) if term.success() || kill.success() => {
+                app_logging::debug(format!("kill signalled yt-dlp process: pid={id}"));
+            }
+            _ => {
+                app_logging::debug(format!(
+                    "kill could not confirm termination for yt-dlp pid={id}"
+                ));
+            }
+        }
     }
 }
 
