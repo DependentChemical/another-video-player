@@ -30,6 +30,52 @@ pub struct Segment {
     pub end: f64,
 }
 
+/// A merged skip range covering one or more overlapping enabled segments.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkipRange {
+    /// Start time in seconds.
+    pub start: f64,
+    /// End time in seconds.
+    pub end: f64,
+    /// Representative category for user-facing labels, or `mixed`.
+    pub category: String,
+}
+
+/// Merges enabled segments into non-overlapping skip ranges.
+///
+/// Overlapping or adjacent enabled segments are combined so playback can skip
+/// them in a single seek. When a merged range spans multiple categories its
+/// category becomes `mixed`.
+pub fn merged_skip_ranges<F>(segments: &[Segment], mut enabled: F) -> Vec<SkipRange>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut filtered: Vec<Segment> =
+        segments.iter().filter(|segment| enabled(&segment.category)).cloned().collect();
+    filtered.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.end.total_cmp(&b.end)));
+
+    let mut merged: Vec<SkipRange> = Vec::new();
+    for segment in filtered {
+        if let Some(last) = merged.last_mut()
+            && segment.start <= last.end + 0.05
+        {
+            if segment.end > last.end {
+                last.end = segment.end;
+            }
+            if last.category != segment.category {
+                last.category = "mixed".to_string();
+            }
+            continue;
+        }
+        merged.push(SkipRange {
+            start: segment.start,
+            end: segment.end,
+            category: segment.category,
+        });
+    }
+    merged
+}
+
 /// Returns the segments for a YouTube URL, or an empty list when none apply.
 ///
 /// Network and parsing failures are treated as "no segments" so playback is
@@ -220,5 +266,40 @@ mod tests {
         let encoded = encode_query_component("[\"sponsor\",\"intro\"]");
         assert!(encoded.contains("%5B"));
         assert!(encoded.contains("%22sponsor%22"));
+    }
+
+    #[test]
+    fn merged_skip_ranges_combines_overlaps_and_adjacent_segments() {
+        let segments = vec![
+            Segment { category: "interaction".into(), start: 0.0, end: 2.299 },
+            Segment { category: "intro".into(), start: 0.0, end: 9.349 },
+            Segment { category: "selfpromo".into(), start: 9.36, end: 12.0 },
+            Segment { category: "outro".into(), start: 105.833, end: 136.081 },
+        ];
+        let ranges = merged_skip_ranges(&segments, |_| true);
+        assert_eq!(
+            ranges,
+            vec![
+                SkipRange { start: 0.0, end: 12.0, category: "mixed".into() },
+                SkipRange { start: 105.833, end: 136.081, category: "outro".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_skip_ranges_respects_disabled_categories() {
+        let segments = vec![
+            Segment { category: "interaction".into(), start: 0.0, end: 2.299 },
+            Segment { category: "intro".into(), start: 0.0, end: 9.349 },
+            Segment { category: "outro".into(), start: 105.833, end: 136.081 },
+        ];
+        let ranges = merged_skip_ranges(&segments, |category| category != "intro");
+        assert_eq!(
+            ranges,
+            vec![
+                SkipRange { start: 0.0, end: 2.299, category: "interaction".into() },
+                SkipRange { start: 105.833, end: 136.081, category: "outro".into() },
+            ]
+        );
     }
 }

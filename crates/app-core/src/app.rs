@@ -2508,14 +2508,15 @@ impl App {
 
     /// Applies SponsorBlock skips for the current playback position.
     ///
-    /// Manual seeks can land inside a segment to let the user watch it once;
-    /// normal playback skips enabled segments automatically.
+    /// Manual seeks can land inside a skip range to let the user watch it once;
+    /// normal playback skips enabled ranges automatically. Overlapping enabled
+    /// segments are merged so the range is skipped in a single seek.
     pub fn apply_sponsorblock_skips(&self) {
         if self.engine.is_idle() {
             return;
         }
         let position = self.engine.position();
-        if !position.is_finite() {
+        if !position.is_finite() || position < 0.0 {
             return;
         }
         let duration = self.engine.duration();
@@ -2524,85 +2525,93 @@ impl App {
             state.sponsorblock_suppressed = None;
             return;
         }
-        // Wait until the media is seekable before issuing auto-skip seeks.
+        // Wait until the media duration is known and the player is seekable.
         if !duration.is_finite() || duration <= 0.0 {
             return;
         }
 
+        let segments = state.sponsorblock_segments.clone();
+        let ranges = source_youtube::sponsorblock::merged_skip_ranges(&segments, |category| {
+            self.settings.sponsorblock_skip(category)
+        });
+        if ranges.is_empty() {
+            state.sponsorblock_suppressed = None;
+            return;
+        }
+
         if let Some((start, end)) = state.sponsorblock_suppressed {
+            // While the user-selected (or in-progress) range is playing, do not
+            // auto-skip. Once playback leaves it, normal skip rules resume so a
+            // later scrub back before the range will skip it again.
             if position + 0.05 >= start && position < end - 0.05 {
                 return;
             }
             state.sponsorblock_suppressed = None;
         }
 
-        let mut skip = None;
-        for segment in &state.sponsorblock_segments {
-            if !self.settings.sponsorblock_skip(&segment.category) {
-                continue;
-            }
-            if position + 0.05 >= segment.start && position < segment.end - 0.05 {
-                skip = Some((segment.start, segment.end, segment.category.clone()));
-                break;
-            }
-        }
-        let Some((start, end, category)) = skip else {
+        let Some(range) = ranges
+            .iter()
+            .find(|range| position + 0.05 >= range.start && position < range.end - 0.05)
+            .cloned()
+        else {
             return;
         };
 
-        // Avoid seeking exactly to EOF and wait for a seekable range so mpv
-        // does not reject early/startup auto-skips (e.g. command error -12).
-        let mut target = end.min((duration - 0.10).max(0.0)).max(0.0);
-        if let Some(edge) = self.engine.seekable_end()
-            && edge.is_finite()
-            && edge > position + 0.10
-        {
-            target = target.min(edge);
+        // Skip to the merged range end in one seek. Wait until the target is
+        // within mpv's reported seekable range to avoid ignored/failed seeks
+        // (e.g. during startup or for segments starting at 0:00).
+        let desired = range.end.min((duration - 0.05).max(0.0));
+        let Some(edge) = self.engine.seekable_end() else {
+            return;
+        };
+        if !edge.is_finite() || edge < desired - 0.05 {
+            return;
         }
+        let target = desired.min(edge).max(0.0);
         if target <= position + 0.05 {
-            if end >= duration - 0.10 {
-                state.sponsorblock_suppressed = Some((start, end));
-            }
             return;
         }
 
-        // Suppress first to avoid repeated seek attempts while mpv processes it.
-        state.sponsorblock_suppressed = Some((start, end));
+        let fully_skippable = target >= range.end - 0.05;
+        // Suppress while the seek is in flight; only keep suppression if we
+        // could not jump past the whole merged range (e.g. near EOF).
+        state.sponsorblock_suppressed =
+            if fully_skippable { None } else { Some((range.start, range.end)) };
         drop(state);
 
         app_logging::debug(format!(
-            "skipping SponsorBlock segment during playback: category={category} from={position:.3}s to={target:.3}s"
+            "skipping SponsorBlock segment during playback: category={} from={position:.3}s to={target:.3}s",
+            range.category
         ));
         if let Err(error) = self.engine.seek(target) {
             app_logging::warning(format!(
-                "failed to auto-skip SponsorBlock segment: category={category} target={target:.3}s error={error}"
+                "failed to auto-skip SponsorBlock segment: category={} target={target:.3}s error={error}",
+                range.category
             ));
-            // Allow a later retry once the player can seek this range.
             let mut state = self.state.lock().expect("the state is not poisoned");
-            if state.sponsorblock_suppressed == Some((start, end)) {
+            if state.sponsorblock_suppressed == Some((range.start, range.end)) {
                 state.sponsorblock_suppressed = None;
             }
-        } else {
-            self.toast(format!("Skipped {}", sponsorblock_skip_label(&category)));
+        } else if fully_skippable {
+            self.toast(format!("Skipped {}", sponsorblock_skip_label(&range.category)));
         }
     }
 
-    /// Remembers a manually selected segment range so it can play once.
+    /// Remembers a manually selected skip range so it can play once.
     fn suppress_sponsorblock_at(&self, target: f64) {
         let mut state = self.state.lock().expect("the state is not poisoned");
-        if state.is_live || state.sponsorblock_segments.is_empty() {
+        if state.is_live || state.sponsorblock_segments.is_empty() || !target.is_finite() {
             state.sponsorblock_suppressed = None;
             return;
         }
-        state.sponsorblock_suppressed = state
-            .sponsorblock_segments
+        let segments = state.sponsorblock_segments.clone();
+        let ranges = source_youtube::sponsorblock::merged_skip_ranges(&segments, |category| {
+            self.settings.sponsorblock_skip(category)
+        });
+        state.sponsorblock_suppressed = ranges
             .iter()
-            .find(|segment| {
-                self.settings.sponsorblock_skip(&segment.category)
-                    && target + 0.05 >= segment.start
-                    && target < segment.end - 0.05
-            })
-            .map(|segment| (segment.start, segment.end));
+            .find(|range| target + 0.05 >= range.start && target < range.end - 0.05)
+            .map(|range| (range.start, range.end));
     }
 
     /// Takes the messages the background work produced.
