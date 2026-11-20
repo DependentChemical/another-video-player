@@ -262,6 +262,59 @@ impl Engine {
         result
     }
 
+    /// Applies HTTP headers/cookies extracted for a stream to mpv before loading.
+    ///
+    /// Headers are sent as `http-header-fields` (CRLF joined). If `User-Agent` is present
+    /// it is also set explicitly. If cookies are present and not already provided via a
+    /// `Cookie` header, they are appended as a `Cookie:` header line.
+    pub fn apply_stream_request(
+        &self,
+        http_headers: Option<&std::collections::BTreeMap<String, String>>,
+        cookies: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut joined = String::new();
+        let mut user_agent: Option<&str> = None;
+        let mut referer: Option<&str> = None;
+        let mut has_cookie_header = false;
+
+        if let Some(headers) = http_headers {
+            for (k, v) in headers {
+                joined.push_str(k);
+                joined.push_str(": ");
+                joined.push_str(v);
+                joined.push_str("\r\n");
+                if k.eq_ignore_ascii_case("User-Agent") {
+                    user_agent = Some(v.as_str());
+                } else if k.eq_ignore_ascii_case("Referer") {
+                    referer = Some(v.as_str());
+                } else if k.eq_ignore_ascii_case("Cookie") {
+                    has_cookie_header = true;
+                }
+            }
+        }
+        if let Some(c) = cookies
+            && !c.is_empty()
+            && !has_cookie_header
+        {
+            joined.push_str("Cookie: ");
+            joined.push_str(c);
+            joined.push_str("\r\n");
+        }
+
+        if !joined.is_empty() {
+            self.core
+                .set_property("http-header-fields", joined)
+                .logged("set http-header-fields")?;
+        }
+        if let Some(ua) = user_agent {
+            self.core.set_property("user-agent", ua).logged("set user-agent")?;
+        }
+        if let Some(r) = referer {
+            self.core.set_property("referrer", r).logged("set referrer")?;
+        }
+        Ok(())
+    }
+
     /// Opens a media, replacing whatever was playing before.
     ///
     /// When the request carries a separate audio stream, it is attached with
