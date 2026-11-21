@@ -166,6 +166,12 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
+            ui.on_url_edited(move |url| {
+                app.preview_url(url.to_string());
+            });
+        }
+        {
+            let app = Arc::clone(&app);
             let ui_for_pending = Rc::clone(&ui);
             let loading = Rc::clone(&loading);
             let source_lists = Rc::clone(&source_lists);
@@ -961,6 +967,9 @@ fn tick(
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {
+                ui.show_toast(&error);
+            }
+            Message::UrlPreviewFailed { url: _, error } => {
                 ui.show_toast(&error);
             }
             Message::SigningIn(service) => {

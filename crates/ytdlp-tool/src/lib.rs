@@ -21,8 +21,8 @@ mod fetch;
 use std::fmt;
 use std::path::Path;
 
-pub use fetch::{FetchRequest, FetchResult, is_update_required};
-pub use locate::{ToolPaths, YtDlp};
+pub use fetch::{FetchRequest, FetchResult, fetch_with_cancel, is_update_required};
+pub use locate::{ToolPaths, YtDlp, kill_all};
 pub use platform::Platform;
 pub use update::ToolUpdate;
 

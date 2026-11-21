@@ -824,6 +824,11 @@ impl PlayerUi {
         });
     }
 
+    /// Called when the URL bar text changes.
+    pub fn on_url_edited(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_url_edited(move |text| handler(text.to_string()));
+    }
+
     /// Called when the user applies a source selection.
     ///
     /// The arguments are the chosen video-only stream, audio-only stream and

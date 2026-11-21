@@ -193,6 +193,11 @@ fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
     }
 }
 
+/// Terminates a spawned child process and its process tree.
+pub fn terminate_child_process(child: &mut std::process::Child) {
+    terminate_child(child, None);
+}
+
 fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
     let id = cancel
         .and_then(|(pid, _)| {
@@ -222,6 +227,19 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
 
 /// Stops `yt-dlp` processes that an earlier Flatline run left behind.
 pub fn stop_leftovers(tool: &YtDlp) {
+    kill_matching(tool, true);
+}
+
+/// Stops every `yt-dlp` process for this managed executable.
+///
+/// Unlike [`stop_leftovers`], this does not spare processes parented by
+/// Flatline. It is used when a timeout or cancellation must guarantee that no
+/// resolver work keeps running in the background.
+pub fn kill_all(tool: &YtDlp) {
+    kill_matching(tool, false);
+}
+
+fn kill_matching(tool: &YtDlp, only_orphans: bool) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -231,15 +249,18 @@ pub fn stop_leftovers(tool: &YtDlp) {
         };
         let name = name.replace('\'', "''");
         let target = tool.program.to_string_lossy().replace('\'', "''");
+        let orphan_guard = if only_orphans {
+            "$parent = Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.ParentProcessId)\"; \
+             if (-not $parent -or ($parent.Name -ne 'flatline.exe' -and $parent.Name -ne $name)) {{ \
+                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue \
+             }}"
+        } else {
+            "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue"
+        };
         let script = format!(
             "$name='{name}'; $target='{target}'; \
              Get-CimInstance Win32_Process -Filter \"name='$name'\" | ForEach-Object {{ \
-                 if ($_.ExecutablePath -eq $target) {{ \
-                     $parent = Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.ParentProcessId)\"; \
-                     if (-not $parent -or ($parent.Name -ne 'flatline.exe' -and $parent.Name -ne $name)) {{ \
-                         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue \
-                     }} \
-                 }} \
+                 if ($_.ExecutablePath -eq $target) {{ {orphan_guard} }} \
              }}"
         );
         let _ = std::process::Command::new("powershell")
@@ -251,7 +272,19 @@ pub fn stop_leftovers(tool: &YtDlp) {
     }
     #[cfg(not(windows))]
     {
-        let _ = tool;
+        let Some(name) = tool.program.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if only_orphans {
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &tool.program.to_string_lossy()])
+                .status();
+        } else {
+            let _ = std::process::Command::new("pkill")
+                .args(["-9", "-f", &tool.program.to_string_lossy()])
+                .status();
+        }
+        let _ = name;
     }
 }
 

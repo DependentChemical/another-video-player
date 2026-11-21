@@ -1,5 +1,10 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{Error, RESOLUTION_TIMEOUT, YtDlp};
 
@@ -23,59 +28,149 @@ pub struct FetchResult {
     pub video: yt_dlp::model::Video,
 }
 
-/// Resolves a URL through the `yt-dlp` crate.
+/// Resolves a URL through the managed `yt-dlp` process.
 pub async fn fetch(request: FetchRequest) -> Result<FetchResult, Error> {
+    let never = Arc::new(AtomicBool::new(false));
+    let pid = Arc::new(AtomicU32::new(0));
+    fetch_with_cancel(request, never, pid).await
+}
+
+/// Resolves a URL through the managed `yt-dlp` process, allowing cancellation.
+pub async fn fetch_with_cancel(
+    request: FetchRequest,
+    cancel: Arc<AtomicBool>,
+    pid: Arc<AtomicU32>,
+) -> Result<FetchResult, Error> {
     let tool = request.tool.ok_or(Error::NotFound)?;
     let url = request.url.clone();
     let cookies = normalize_cookies(request.cookies);
     let args = normalize_args(request.args);
-    let downloader = build_downloader(&tool, &cookies, &args).await?;
+    let tool_for_task = tool.clone();
+    let cancel_flag = cancel.clone();
+    let pid_flag = pid.clone();
 
-    app_logging::notice(format!("resolving url with yt-dlp crate: url={url}"));
-    let result = downloader.fetch_video_infos(&url).await;
+    app_logging::notice(format!("resolving url with yt-dlp: url={url}"));
+    let task_url = url.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        run_fetch(&tool_for_task, &task_url, &cookies, &args, &cancel_flag, &pid_flag)
+    })
+    .await
+    .map_err(|error| Error::YtDlp(format!("yt-dlp task failed: {error}")))?;
+
     match result {
         Ok(video) => {
             app_logging::notice(format!(
-                "resolved url with yt-dlp crate: url={url} title=\"{}\" formats={}",
+                "resolved url with yt-dlp: url={url} title=\"{}\" formats={}",
                 video.title,
                 video.formats.len()
             ));
             Ok(FetchResult { video })
         }
         Err(error) => {
-            let mapped = map_ytdlp_error(error);
-            app_logging::error(format!(
-                "yt-dlp crate failed to resolve url: url={url} error={mapped}"
-            ));
-            Err(mapped)
+            app_logging::error(format!("yt-dlp failed to resolve url: url={url} error={error}"));
+            Err(error)
         }
     }
 }
 
-async fn build_downloader(
+fn run_fetch(
     tool: &YtDlp,
+    url: &str,
     cookies: &[(String, PathBuf)],
     args: &[String],
-) -> Result<yt_dlp::Downloader, Error> {
-    let output_dir = tool.paths().tools_output_dir();
-    let ffmpeg = dummy_ffmpeg_path(&output_dir);
-    let libraries = yt_dlp::client::deps::Libraries::new(tool.program().to_path_buf(), ffmpeg);
-
-    let mut builder = yt_dlp::DownloaderBuilder::new(libraries, output_dir);
-    builder = builder.with_timeout(RESOLUTION_TIMEOUT);
-    builder = builder.with_args(common_args(args));
-    if let Some((_, cookie)) = cookies.first() {
-        builder = builder.with_cookies(cookie.clone());
+    cancel: &AtomicBool,
+    pid: &AtomicU32,
+) -> Result<yt_dlp::model::Video, Error> {
+    let mut command = tool.command();
+    command.args(common_args(args));
+    for (_, cookie) in cookies {
+        command.arg("--cookies");
+        command.arg(cookie);
     }
+    command.arg("--dump-single-json");
+    command.arg("--no-check-formats");
+    command.arg("--");
+    command.arg(url);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut downloader = builder.build().await.map_err(map_ytdlp_error)?;
-    for (_, cookie) in cookies.iter().skip(1) {
-        let arg = format!("--cookies={}", cookie.display());
-        if !downloader.args().iter().any(|existing| existing == &arg) {
-            downloader.add_arg(arg);
+    let mut child = command.spawn().map_err(|error| {
+        Error::YtDlp(format!(
+            "yt-dlp could not be started for {}: {error}",
+            tool.program().display()
+        ))
+    })?;
+    pid.store(child.id(), Ordering::SeqCst);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_end(&mut bytes);
         }
+        bytes
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut err) = stderr {
+            let _ = err.read_to_end(&mut bytes);
+        }
+        bytes
+    });
+
+    let deadline = Instant::now() + RESOLUTION_TIMEOUT;
+    let status = loop {
+        if cancel.load(Ordering::SeqCst) {
+            crate::locate::terminate_child_process(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            crate::locate::kill_all(tool);
+            pid.store(0, Ordering::SeqCst);
+            return Err(Error::YtDlp("yt-dlp request was cancelled".to_string()));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                crate::locate::terminate_child_process(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                crate::locate::kill_all(tool);
+                pid.store(0, Ordering::SeqCst);
+                return Err(Error::YtDlp(format!(
+                    "yt-dlp did not respond within {} seconds",
+                    RESOLUTION_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                crate::locate::terminate_child_process(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                crate::locate::kill_all(tool);
+                pid.store(0, Ordering::SeqCst);
+                return Err(Error::YtDlp(format!("yt-dlp process failed: {error}")));
+            }
+        }
+    };
+    pid.store(0, Ordering::SeqCst);
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        let message = if message.is_empty() {
+            String::from_utf8_lossy(&stdout).trim().to_string()
+        } else {
+            message
+        };
+        let detail =
+            if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
+        return Err(Error::YtDlp(detail));
     }
-    Ok(downloader)
+
+    let value: serde_json::Value = serde_json::from_slice(&stdout)
+        .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
+    serde_json::from_value(value)
+        .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
 }
 
 fn common_args(extra: &[String]) -> Vec<String> {
@@ -84,7 +179,7 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "--no-progress".to_string(),
         "--ignore-config".to_string(),
         "--socket-timeout".to_string(),
-        "15".to_string(),
+        RESOLUTION_TIMEOUT.as_secs().to_string(),
     ];
     for arg in extra {
         if !args.iter().any(|existing| existing == arg) {
