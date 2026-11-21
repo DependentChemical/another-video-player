@@ -60,6 +60,11 @@ fn clamp_volume(volume: f64) -> f64 {
     volume.clamp(0.0, MAX_VOLUME)
 }
 
+/// Keeps a playback speed inside the range the interface exposes.
+fn clamp_speed(speed: f64) -> f64 {
+    speed.clamp(0.0, 2.0)
+}
+
 /// Why playback of a file ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
@@ -98,6 +103,41 @@ pub enum EngineEvent {
     },
     /// The player is going away.
     Shutdown,
+}
+
+/// The user agent used when the extractor does not provide one.
+///
+/// It mirrors a current desktop Chrome so a server that sniffs the agent does
+/// not reject the request merely because it is mpv.
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+
+/// Converts a raw cookie string into a `Cookie` header value.
+///
+/// Attributes such as `Domain` and `Path` are not header values and would be
+/// sent to the server as cookies if kept, so only `name=value` pairs survive.
+fn cookies_to_header(raw: &str) -> Option<String> {
+    let pairs: Vec<String> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if lower.starts_with("domain=")
+                || lower.starts_with("path=")
+                || lower.starts_with("expires=")
+                || lower.starts_with("max-age=")
+                || lower.starts_with("samesite=")
+                || lower == "secure"
+                || lower == "httponly"
+                || lower.starts_with("priority=")
+            {
+                return None;
+            }
+            part.contains('=').then(|| part.to_string())
+        })
+        .collect();
+    (!pairs.is_empty()).then(|| pairs.join("; "))
 }
 
 /// What should be played.
@@ -297,6 +337,52 @@ impl Engine {
         Ok(())
     }
 
+    /// Applies the request context extracted for a stream to mpv.
+    ///
+    /// yt-dlp signs URLs for a particular client, and the server rejects the
+    /// request unless the same headers arrive. The list is replaced on every
+    /// load so headers from the previous media cannot leak into the next one.
+    pub fn apply_stream_request(
+        &self,
+        http_headers: Option<&std::collections::BTreeMap<String, String>>,
+        cookies: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut fields = Vec::new();
+        let mut user_agent = None;
+        let mut referer = None;
+        let mut has_cookie = false;
+        if let Some(headers) = http_headers {
+            for (name, value) in headers {
+                if name.eq_ignore_ascii_case("User-Agent") {
+                    user_agent = Some(value.as_str());
+                } else if name.eq_ignore_ascii_case("Referer")
+                    || name.eq_ignore_ascii_case("Referrer")
+                {
+                    referer = Some(value.as_str());
+                } else if name.eq_ignore_ascii_case("Cookie") {
+                    has_cookie = true;
+                    fields.push(format!("{name}: {value}"));
+                } else {
+                    fields.push(format!("{name}: {value}"));
+                }
+            }
+        }
+        if !has_cookie
+            && let Some(raw) = cookies.filter(|c| !c.is_empty())
+            && let Some(cookie) = cookies_to_header(raw)
+        {
+            fields.push(format!("Cookie: {cookie}"));
+        }
+
+        let list = rsmpv::Node::Array(fields.into_iter().map(rsmpv::Node::String).collect());
+        self.core.set_property("http-header-fields", list).logged("set http-header-fields")?;
+        self.core
+            .set_property("user-agent", user_agent.unwrap_or(DEFAULT_USER_AGENT))
+            .logged("set user-agent")?;
+        self.core.set_property("referrer", referer.unwrap_or("")).logged("set referrer")?;
+        Ok(())
+    }
+
     /// Continues playback.
     pub fn play(&self) -> Result<(), Error> {
         self.core.set_property("pause", false).logged("resume playback")?;
@@ -380,6 +466,19 @@ impl Engine {
     pub fn set_volume(&self, volume: f64) -> Result<(), Error> {
         self.core.set_property("volume", clamp_volume(volume)).logged("set the volume")?;
         Ok(())
+    }
+
+    /// Sets the playback speed, where `1.0` is the normal rate.
+    ///
+    /// The value is clamped to `0.0..=2.0`, the range the interface exposes.
+    pub fn set_speed(&self, speed: f64) -> Result<(), Error> {
+        self.core.set_property("speed", clamp_speed(speed)).logged("set the playback speed")?;
+        Ok(())
+    }
+
+    /// The current playback speed, where `1.0` is the normal rate.
+    pub fn speed(&self) -> f64 {
+        self.core.get_property::<f64>("speed").unwrap_or(1.0)
     }
 
     /// Mutes or unmutes the player.
@@ -685,5 +784,12 @@ mod tests {
         assert_eq!(clamp_volume(-10.0), 0.0);
         assert_eq!(clamp_volume(50.0), 50.0);
         assert_eq!(clamp_volume(250.0), MAX_VOLUME);
+    }
+
+    #[test]
+    fn speed_is_clamped_to_the_player_range() {
+        assert_eq!(clamp_speed(-1.0), 0.0);
+        assert_eq!(clamp_speed(1.0), 1.0);
+        assert_eq!(clamp_speed(3.0), 2.0);
     }
 }

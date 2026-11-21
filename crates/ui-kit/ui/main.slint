@@ -15,7 +15,7 @@ import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
 import { PlaylistDialog } from "slint-ui/PlaylistDialog.slint";
 import { CreatePlaylistDialog } from "slint-ui/CreatePlaylistDialog.slint";
 import {
-    PlaylistItem, StreamItem, QueueItem, HistoryItem, BufferedRange
+    PlaylistItem, StreamItem, QueueItem, HistoryItem, BufferedRange, SponsorSegment
 } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
@@ -57,6 +57,10 @@ export component MainWindow inherits Window {
     in-out property <string> selected-muxed-id: "";
     // Whether the source picker is open. The host closes it on a new load.
     in-out property <bool> sources-open: false;
+    in-out property <bool> settings-open: false;
+    in-out property <bool> settings-speed-mode: false;
+    in property <float> playback-speed: 1.0;
+    in property <string> source-quality-label: "Auto";
     in property <bool> has-media: false;
     in property <image> video-thumbnail;
     // Whether the media that plays has no video track (audio only source).
@@ -66,6 +70,8 @@ export component MainWindow inherits Window {
     in property <float> duration: 0;
     // The parts of the axis that are already downloaded, as fractions.
     in property <[BufferedRange]> buffered-ranges: [];
+    // The marked segments, such as SponsorBlock spans, as fractions.
+    in property <[SponsorSegment]> sponsor-segments: [];
     in property <float> volume: 100;
     // The playback position, formatted for the user.
     in property <string> time-text: "0:00 / 0:00";
@@ -120,6 +126,7 @@ export component MainWindow inherits Window {
     // ------------------------------------------------------------ events --
     callback load-requested();
     callback sources-applied(string, string, string);
+    callback playback-speed-changed(float);
     callback play-toggled();
     callback seek-requested(float);
     callback volume-requested(float);
@@ -181,15 +188,25 @@ export component MainWindow inherits Window {
         root.draft-video = root.selected-video-id;
         root.draft-audio = root.selected-audio-id;
         root.draft-muxed = root.selected-muxed-id;
+        root.settings-open = false;
+        root.settings-speed-mode = false;
         root.sources-open = true;
     }
 
-    function toggle-sources() {
-        if (root.sources-open) {
-            root.sources-open = false;
+    function toggle-settings() {
+        if (root.settings-open) {
+            root.settings-open = false;
+            root.settings-speed-mode = false;
         } else {
-            root.open-sources();
+            root.sources-open = false;
+            root.settings-speed-mode = false;
+            root.settings-open = true;
         }
+    }
+
+    function close-settings() {
+        root.settings-open = false;
+        root.settings-speed-mode = false;
     }
 
     function toggle-video(id: string) {
@@ -275,12 +292,16 @@ export component MainWindow inherits Window {
         position: root.position;
         duration: root.duration;
         buffered-ranges: root.buffered-ranges;
+        sponsor-segments: root.sponsor-segments;
         volume: root.volume;
         time-text: root.time-text;
         live: root.live;
         at-live-edge: root.at-live-edge;
         fullscreen: root.fullscreen;
-        sources-open: root.sources-open;
+        settings-open: root.settings-open;
+        settings-speed-mode: root.settings-speed-mode;
+        source-quality-label: root.source-quality-label;
+        playback-speed: root.playback-speed;
         has-media: root.has-media;
         controls-visible: root.controls-visible;
         play-toggled => { root.play-toggled(); }
@@ -294,7 +315,11 @@ export component MainWindow inherits Window {
         pointer-activity => { root.pointer-activity(); }
         controls-hovered(hovered) => { root.controls-hovered(hovered); }
         interacting-changed(interacting) => { root.interacting-changed(interacting); }
-        sources-toggled => { root.toggle-sources(); }
+        settings-toggled => { root.toggle-settings(); }
+        settings-closed => { root.close-settings(); }
+        sources-requested => { root.open-sources(); }
+        speed-mode-requested => { root.settings-speed-mode = true; }
+        speed-changed(value) => { root.playback-speed-changed(value); }
     }
 
     // Sidebar drawer, above the video and its overlays.

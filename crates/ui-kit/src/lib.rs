@@ -485,6 +485,24 @@ impl PlayerUi {
         self.window.set_buffered_ranges(slint::ModelRc::new(slint::VecModel::from(ranges)));
     }
 
+    /// The marked spans on the scrubber, such as SponsorBlock segments.
+    ///
+    /// Each span is a fraction between zero and one of the shown axis, and the
+    /// colour identifies the kind of segment it represents.
+    pub fn set_sponsor_segments(&self, segments: &[(f64, f64, [u8; 3])]) {
+        let segments: Vec<SponsorSegment> = segments
+            .iter()
+            .filter_map(|&(start, end, [red, green, blue])| {
+                (end > start).then_some(SponsorSegment {
+                    start: start as f32,
+                    end: end as f32,
+                    color: slint::Color::from_rgb_u8(red, green, blue),
+                })
+            })
+            .collect();
+        self.window.set_sponsor_segments(slint::ModelRc::new(slint::VecModel::from(segments)));
+    }
+
     /// The volume slider position, from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.window.set_volume(volume as f32);
@@ -522,6 +540,32 @@ impl PlayerUi {
     /// Whether the source picker is open.
     pub fn sources_open(&self) -> bool {
         self.window.get_sources_open()
+    }
+
+    /// Whether the settings menu is open.
+    pub fn settings_open(&self) -> bool {
+        self.window.get_settings_open()
+    }
+
+    /// Whether a popup above the control bar is open.
+    pub fn controls_popup_open(&self) -> bool {
+        self.sources_open() || self.settings_open()
+    }
+
+    /// Closes the settings menu.
+    pub fn close_settings(&self) {
+        self.window.set_settings_open(false);
+        self.window.set_settings_speed_mode(false);
+    }
+
+    /// The playback speed shown in the settings menu.
+    pub fn set_playback_speed(&self, speed: f64) {
+        self.window.set_playback_speed(speed as f32);
+    }
+
+    /// The selected source quality shown in the settings menu.
+    pub fn set_source_quality_label(&self, label: &str) {
+        self.window.set_source_quality_label(label.into());
     }
 
     /// Shows a short note in the corner of the window.
@@ -847,6 +891,11 @@ impl PlayerUi {
     /// Called when an interaction with the control bar starts or ends.
     pub fn on_interacting_changed(&self, handler: impl Fn(bool) + 'static) {
         self.window.on_interacting_changed(handler);
+    }
+
+    /// Called when the user changes the playback speed.
+    pub fn on_playback_speed_changed(&self, handler: impl Fn(f64) + 'static) {
+        self.window.on_playback_speed_changed(move |speed| handler(speed as f64));
     }
 
     /// Called when the user asks to play the pending media right away.

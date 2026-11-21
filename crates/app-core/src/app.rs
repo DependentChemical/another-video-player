@@ -10,11 +10,11 @@ use media_model::{MediaSource, PlaybackPlan, Quality, Service};
 use playback_engine::{Engine, LoadRequest};
 use settings::Settings;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use stream_resolver::{CommandSpec, Resolver};
+use stream_resolver::Resolver;
 use ui_kit::{SourceLists, SourceOption};
 use ytdlp_tool::YtDlp;
 
@@ -149,6 +149,8 @@ pub struct PendingMedia {
     pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
+    /// The manual-work generation this resolve belongs to.
+    pub epoch: u64,
     /// SponsorBlock segments fetched for the media, kept only in memory.
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
@@ -195,6 +197,9 @@ const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
+
+/// Retry delay for all yt-dlp/network/player failures. Immediate by design.
+const RETRY_DELAY: Duration = Duration::from_secs(0);
 
 /// How long the background thumbnail pass waits between downloads, so it
 /// stays in the background and does not hammer the network.
@@ -299,19 +304,42 @@ enum RetryErrorKind {
 
 impl RetryState {
     /// Starts a retry for the given URL and error kind.
-    fn start(&mut self, url: String, kind: RetryErrorKind) {
-        if self.url.as_deref() != Some(url.as_str()) || self.error_kind != Some(kind) {
+    ///
+    /// Returns `false` when the same retry is already scheduled, so repeated
+    /// error events for one failed load neither push the retry back nor report
+    /// it again.
+    fn start(&mut self, url: String, kind: RetryErrorKind) -> bool {
+        if self.url.as_deref() == Some(url.as_str()) && self.error_kind == Some(kind) {
+            if self.next_retry.is_some() {
+                return false;
+            }
+        } else {
             self.url = Some(url);
             self.error_kind = Some(kind);
             self.attempt = 0;
         }
         self.schedule_next();
+        true
     }
 
-    /// Schedules the next retry with exponential backoff (2, 4, 8, 16... seconds).
+    /// Takes the retry that is due, clearing its timer until the next failure.
+    ///
+    /// Clearing the timer is what keeps a slow resolve from being retried again
+    /// while it is still running.
+    fn take_due(&mut self) -> Option<(String, RetryErrorKind)> {
+        if !self.is_ready() {
+            return None;
+        }
+        let url = self.url.clone()?;
+        let kind = self.error_kind?;
+        self.next_retry = None;
+        self.attempt += 1;
+        Some((url, kind))
+    }
+
+    /// Schedules the next retry immediately.
     fn schedule_next(&mut self) {
-        let delay = Duration::from_secs(2u64.pow(self.attempt.min(6) + 1).min(60));
-        self.next_retry = Some(Instant::now() + delay);
+        self.next_retry = Some(Instant::now() + RETRY_DELAY);
     }
 
     /// Checks if it's time to retry.
@@ -325,6 +353,7 @@ impl RetryState {
     }
 
     /// Increments the attempt counter and schedules the next retry.
+    #[cfg(test)]
     fn next_attempt(&mut self) {
         self.attempt += 1;
         self.schedule_next();
@@ -337,21 +366,12 @@ impl RetryState {
         self.attempt = 0;
         self.next_retry = None;
     }
-
-    /// Returns the delay until the next retry in seconds.
-    fn next_delay_seconds(&self) -> Option<u64> {
-        self.next_retry
-            .map(|t| t.saturating_duration_since(Instant::now()).as_secs_f64().ceil() as u64)
-    }
 }
 
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
     resolver: Arc<Mutex<Resolver>>,
-    ytdlp_gate: Arc<Mutex<()>>,
-    ytdlp_pid: Arc<AtomicU32>,
-    ytdlp_cancel: Arc<AtomicBool>,
     ytdlp_epoch: Arc<AtomicU64>,
     settings: Settings,
     session: Session,
@@ -390,7 +410,7 @@ impl App {
         // Clear them before creating the engine so mpv never sees stale data.
         clear_stream_buffer(&stream_buffer);
         let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
-        let resolver = Resolver::new(command_spec(ytdlp, &paths.cookies()));
+        let resolver = build_resolver(ytdlp, &paths.cookies());
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
         let pre_buffer_seconds = settings.pre_buffer_seconds().0;
@@ -415,9 +435,6 @@ impl App {
         let app = App {
             engine,
             resolver: Arc::new(Mutex::new(resolver)),
-            ytdlp_gate: Arc::new(Mutex::new(())),
-            ytdlp_pid: Arc::new(AtomicU32::new(0)),
-            ytdlp_cancel: Arc::new(AtomicBool::new(false)),
             ytdlp_epoch: Arc::new(AtomicU64::new(0)),
             settings,
             session,
@@ -471,7 +488,7 @@ impl App {
         // is handled immediately.
         let epoch = self.preempt_ytdlp();
         self.clear_retry();
-        if self.has_media() {
+        if self.is_playing() {
             self.resolve_pending(url, epoch);
         } else {
             self.prepare_current(&url, "", None, None, None);
@@ -482,6 +499,27 @@ impl App {
     /// Whether a media is loaded in the player.
     pub fn has_media(&self) -> bool {
         self.state.lock().expect("the state is not poisoned").source.is_some()
+    }
+
+    /// Whether the player holds media that is ready to play or paused.
+    ///
+    /// A media that is still opening, waiting for data or already failed is not
+    /// settled, so a new manual request replaces it instead of becoming pending.
+    pub fn is_playing(&self) -> bool {
+        if !self.has_media() || self.engine.is_idle() {
+            return false;
+        }
+        self.engine.is_active() || (self.engine.is_paused() && !self.engine.is_buffering())
+    }
+
+    /// Whether `url` is the URL of the current active queue entry.
+    pub fn is_current_queue_url(&self, url: &str) -> bool {
+        matches!(self.queue.current(), Ok(Some(entry)) if entry.url == url)
+    }
+
+    /// Whether `epoch` is still the current manual-work generation.
+    pub fn is_current_epoch(&self, epoch: u64) -> bool {
+        !self.is_ytdlp_stale(epoch)
     }
 
     /// Returns the URL currently being resolved, if any.
@@ -529,26 +567,13 @@ impl App {
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
-        let gate = Arc::clone(&self.ytdlp_gate);
-        let pid = Arc::clone(&self.ytdlp_pid);
-        let cancel = Arc::clone(&self.ytdlp_cancel);
         let epoch_state = Arc::clone(&self.ytdlp_epoch);
-        let runtime = self.runtime.handle().clone();
 
-        runtime.spawn_blocking(move || {
+        self.runtime.handle().spawn(async move {
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(
-                &resolver,
-                &session,
-                &gate,
-                &pid,
-                &cancel,
-                &epoch_state,
-                epoch,
-                &url,
-                &sender,
-            );
+            let result =
+                resolve_with_session(&resolver, &session, &epoch_state, epoch, &url, &sender).await;
             if epoch_state.load(Ordering::SeqCst) != epoch
                 || matches!(result, Err(stream_resolver::Error::Cancelled))
             {
@@ -605,13 +630,9 @@ impl App {
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
-        let gate = Arc::clone(&self.ytdlp_gate);
-        let pid = Arc::clone(&self.ytdlp_pid);
-        let cancel = Arc::clone(&self.ytdlp_cancel);
         let epoch_state = Arc::clone(&self.ytdlp_epoch);
-        let runtime = self.runtime.handle().clone();
 
-        runtime.spawn_blocking(move || {
+        self.runtime.handle().spawn(async move {
             if epoch_state.load(Ordering::SeqCst) != epoch {
                 app_logging::debug(format!(
                     "discarding a pending resolve that was superseded: url={url}"
@@ -620,17 +641,8 @@ impl App {
             }
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(
-                &resolver,
-                &session,
-                &gate,
-                &pid,
-                &cancel,
-                &epoch_state,
-                epoch,
-                &url,
-                &sender,
-            );
+            let result =
+                resolve_with_session(&resolver, &session, &epoch_state, epoch, &url, &sender).await;
             if epoch_state.load(Ordering::SeqCst) != epoch
                 || matches!(result, Err(stream_resolver::Error::Cancelled))
             {
@@ -658,6 +670,7 @@ impl App {
                         thumbnail,
                         thumbnail_id,
                         resolved_at: unix_time(),
+                        epoch,
                         sponsorblock_segments,
                     }))
                 }
@@ -1282,18 +1295,24 @@ impl App {
         let outbox = Arc::clone(&self.outbox);
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
-        let ytdlp_gate = Arc::clone(&self.ytdlp_gate);
-        let ytdlp_pid = Arc::clone(&self.ytdlp_pid);
-        let ytdlp_cancel = Arc::clone(&self.ytdlp_cancel);
         let ytdlp_epoch = Arc::clone(&self.ytdlp_epoch);
-        let runtime = self.runtime.handle().clone();
+        let handle = self.runtime.handle().clone();
+        let task_handle = handle.clone();
 
-        runtime.spawn_blocking(move || {
+        handle.spawn_blocking(move || {
             let _ = outbox
                 .lock()
                 .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
 
+            // A manual action bumps the epoch. Background work that started
+            // before it must stop instead of picking up the new epoch and
+            // competing with the media the user asked for.
+            let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
             for (position, url, thumbnail_url) in due {
+                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
+                    app_logging::debug("the thumbnail refresh yielded to manual work");
+                    break;
+                }
                 // Try direct fetch first (no yt-dlp slot needed).
                 match cache.fetch(&url, Some(&thumbnail_url)) {
                     Ok(id) => {
@@ -1314,22 +1333,19 @@ impl App {
 
                 // Fallback: re-resolve via yt-dlp. This is background work and
                 // yields immediately if manual playback preempts or supersedes it.
-                let epoch = ytdlp_epoch.load(Ordering::SeqCst);
                 let sender = outbox.lock().expect("outbox poisoned").clone();
                 let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
-                match resolve_with_session(
+                let resolved = task_handle.block_on(resolve_with_session(
                     &resolver,
                     &session,
-                    &ytdlp_gate,
-                    &ytdlp_pid,
-                    &ytdlp_cancel,
                     &ytdlp_epoch,
-                    epoch,
+                    pass_epoch,
                     &url,
                     &sender,
-                ) {
+                ));
+                match resolved {
                     Ok(source) => {
-                        if ytdlp_epoch.load(Ordering::SeqCst) != epoch {
+                        if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
                             break;
                         }
                         if let Some(new_thumb) = source.thumbnail.as_deref() {
@@ -1420,6 +1436,7 @@ impl App {
         app_logging::debug("interrupting the current playback and clearing transient state");
         let _ = self.engine.stop();
         self.clear_retry();
+        *self.pending.lock().expect("the pending media is not poisoned") = None;
         let mut state = self.state.lock().expect("the state is not poisoned");
         state.pending_restore = PendingRestore::default();
         state.resolving_url = None;
@@ -1832,6 +1849,7 @@ impl App {
 
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
+        self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
     }
 
@@ -1856,11 +1874,11 @@ impl App {
                 state.resolving_url = None;
             }
         }
+        self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
     }
 
-    /// Schedules another attempt, or reports the failure once the budget is
-    /// used up so a permanently broken source does not retry forever.
+    /// Schedules another attempt immediately, or reports failure when exhausted.
     fn schedule_retry(
         &self,
         url: String,
@@ -1868,13 +1886,11 @@ impl App {
         report_kind: RetryKind,
         message: String,
     ) {
-        if matches!(kind, RetryErrorKind::Resolver | RetryErrorKind::SourceSelection)
-            && !self.expects_resolved_url(&url)
-        {
+        if !self.expects_resolved_url(&url) {
             return;
         }
         let mut state = self.state.lock().expect("the state is not poisoned");
-        state.retry.start(url, kind);
+        let scheduled = state.retry.start(url, kind);
         let attempt = state.retry.attempt;
         if state.retry.exhausted() {
             state.retry.clear();
@@ -1885,18 +1901,21 @@ impl App {
             self.report(format!("{message} (gave up after {attempt} retries)"));
             return;
         }
-        let delay = state.retry.next_delay_seconds().unwrap_or(2);
+        if !scheduled {
+            return;
+        }
+        state.retry.schedule_next();
+        let error = message.clone();
         drop(state);
         app_logging::warning(format!(
-            "scheduling retry {attempt}: kind={kind:?} delay={delay}s error={message}"
+            "retrying immediately: kind={kind:?} attempt={attempt} error={message}"
         ));
-        self.report_retry(message, delay, report_kind);
-    }
-
-    /// Sends a retry notification to the UI.
-    fn report_retry(&self, error: String, delay_seconds: u64, kind: RetryKind) {
         let _ = self.outbox.lock().map(|sender| {
-            sender.send(Box::new(Message::RetryScheduled { error, delay_seconds, kind }))
+            sender.send(Box::new(Message::RetryScheduled {
+                error,
+                delay_seconds: 0,
+                kind: report_kind,
+            }))
         });
     }
 
@@ -1904,35 +1923,52 @@ impl App {
     pub fn check_retries(&self) -> Option<RetryKind> {
         let (url, kind) = {
             let mut state = self.state.lock().expect("the state is not poisoned");
-            if let (Some(url), Some(kind)) = (state.retry.url.clone(), state.retry.error_kind)
-                && state.retry.is_ready()
-            {
-                state.retry.next_attempt();
-                (Some(url), Some(kind))
-            } else {
-                (None, None)
-            }
+            state.retry.take_due()?
         };
+        let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
+        app_logging::notice(format!("retrying now: kind={kind:?} url={url} reason=retry"));
+        Some(match kind {
+            RetryErrorKind::Resolver | RetryErrorKind::SourceSelection => {
+                self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
+                RetryKind::Resolver
+            }
+            RetryErrorKind::Playback => {
+                self.consume_current_with_epoch(epoch, PlaybackReason::Retry);
+                RetryKind::Playback
+            }
+        })
+    }
 
-        if let (Some(url), Some(kind)) = (url, kind) {
-            let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
-            app_logging::notice(format!("retrying now: kind={kind:?} url={url} reason=retry"));
-            Some(match kind {
-                RetryErrorKind::Resolver => {
-                    self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
-                    RetryKind::Resolver
+    fn notify_tool_update_if_needed(&self, error: &str) {
+        if !ytdlp_tool::is_update_required(error) {
+            return;
+        }
+        let tools = self.paths.tool_paths();
+        let current = ytdlp_tool::locate::managed(&tools)
+            .and_then(|tool| tool.version().ok())
+            .unwrap_or_default();
+        match ytdlp_tool::update::check(&current) {
+            Ok(Some(update)) => {
+                let should_notify = {
+                    let mut guard = self.notified_tool_update.lock().expect("poisoned");
+                    if guard.as_deref() == Some(update.latest.as_str()) {
+                        false
+                    } else {
+                        *guard = Some(update.latest.clone());
+                        true
+                    }
+                };
+                if should_notify {
+                    let _ = self
+                        .outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateAvailable(update))));
                 }
-                RetryErrorKind::Playback => {
-                    self.consume_current_with_epoch(epoch, PlaybackReason::Retry);
-                    RetryKind::Playback
-                }
-                RetryErrorKind::SourceSelection => {
-                    self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
-                    RetryKind::SourceSelection
-                }
-            })
-        } else {
-            None
+            }
+            Ok(None) => {}
+            Err(err) => app_logging::warning(format!(
+                "yt-dlp update check after update-required error failed: {err}"
+            )),
         }
     }
 
@@ -2129,6 +2165,44 @@ impl App {
         }
     }
 
+    /// The SponsorBlock segments that will be skipped, as fractions of the axis.
+    ///
+    /// Each span is paired with the colour of its category so the interface can
+    /// draw the sections on the scrubber without knowing the category names.
+    pub fn sponsorblock_ranges(&self) -> Vec<(f64, f64, [u8; 3])> {
+        let (segments, is_live) = {
+            let state = self.state.lock().expect("the state is not poisoned");
+            (state.sponsorblock_segments.clone(), state.is_live)
+        };
+        if segments.is_empty() {
+            return Vec::new();
+        }
+
+        let (span, origin) = if is_live {
+            let origin = self.live.lock().expect("the live axis is not poisoned").window_start();
+            (crate::timeline::LIVE_WINDOW, origin)
+        } else {
+            (self.engine.duration(), 0.0)
+        };
+        if span <= 0.0 {
+            return Vec::new();
+        }
+
+        let mut marked = Vec::new();
+        for segment in &segments {
+            if !self.settings.sponsorblock_skip(&segment.category) {
+                continue;
+            }
+            let start = ((segment.start - origin) / span).clamp(0.0, 1.0);
+            let end = ((segment.end - origin) / span).clamp(0.0, 1.0);
+            if end > start {
+                marked.push((start, end, sponsorblock_color(&segment.category)));
+            }
+        }
+        marked.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+        marked
+    }
+
     /// Changes the volume.
     pub fn set_volume(&self, volume: f64) {
         if let Err(error) = self.engine.set_volume(volume) {
@@ -2136,12 +2210,23 @@ impl App {
         }
     }
 
+    /// Changes the playback speed.
+    pub fn set_speed(&self, speed: f64) {
+        if let Err(error) = self.engine.set_speed(speed) {
+            self.report(error.to_string());
+        }
+    }
+
+    /// The current playback speed.
+    pub fn speed(&self) -> f64 {
+        self.engine.speed()
+    }
+
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         self.preempt_ytdlp();
-        let _guard = self.ytdlp_gate.lock().unwrap_or_else(|error| error.into_inner());
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = Resolver::new(command_spec(ytdlp, self.session.cookies_dir()));
+        *resolver = build_resolver(ytdlp, self.session.cookies_dir());
     }
 
     /// Starts background checks for application and `yt-dlp` updates at startup and then periodically.
@@ -2156,27 +2241,14 @@ impl App {
         });
     }
 
-    /// Cancels any active app-managed `yt-dlp` work and invalidates queued runs.
-    ///
-    /// Manual actions call this so a hung or stale resolver/probe cannot delay
-    /// the work the user asked for now.
+    /// Invalidates queued/active resolve work started before this point.
     fn preempt_ytdlp(&self) -> u64 {
-        let epoch = self.ytdlp_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        stream_resolver::cancel_active_process(&self.ytdlp_pid, &self.ytdlp_cancel);
-        epoch
+        self.ytdlp_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Whether a `yt-dlp` run started for `epoch` has been superseded.
     fn is_ytdlp_stale(&self, epoch: u64) -> bool {
         self.ytdlp_epoch.load(Ordering::SeqCst) != epoch
-    }
-
-    /// Runs one `yt-dlp` process at a time for the whole application.
-    ///
-    /// The gate is never held while waiting to retry or to sign in, only while
-    /// `yt-dlp` itself is running or while its managed executable is replaced.
-    pub fn ytdlp_gate(&self) -> &Arc<Mutex<()>> {
-        &self.ytdlp_gate
     }
 
     fn poll_app_update_background(self: Arc<Self>) {
@@ -2219,30 +2291,13 @@ impl App {
     fn poll_tool_update_background(self: Arc<Self>, paths: AppPaths) {
         let outbox = Arc::clone(&self.outbox);
         let app = Arc::clone(&self);
-        let gate = Arc::clone(&self.ytdlp_gate);
-        let pid = Arc::clone(&self.ytdlp_pid);
-        let cancel = Arc::clone(&self.ytdlp_cancel);
-        let epoch_state = Arc::clone(&self.ytdlp_epoch);
         let handle = self.runtime.handle().clone();
         handle.spawn_blocking(move || {
             let tools = paths.tool_paths();
-            let epoch = epoch_state.load(Ordering::SeqCst);
-            let current = {
-                let _guard = gate.lock().unwrap_or_else(|error| error.into_inner());
-                if epoch_state.load(Ordering::SeqCst) != epoch {
-                    return;
-                }
-                pid.store(0, Ordering::SeqCst);
-                cancel.store(false, Ordering::SeqCst);
-                if epoch_state.load(Ordering::SeqCst) != epoch {
-                    cancel.store(true, Ordering::SeqCst);
-                    return;
-                }
-                ytdlp_tool::locate::managed(&tools)
-                    .and_then(|tool| tool.version_with_cancel(Some((&pid, &cancel))).ok())
-            }
-            .unwrap_or_default();
-            if epoch_state.load(Ordering::SeqCst) != epoch || current.is_empty() {
+            let current = ytdlp_tool::locate::managed(&tools)
+                .and_then(|tool| tool.version().ok())
+                .unwrap_or_default();
+            if current.is_empty() {
                 return;
             }
             match ytdlp_tool::update::check(&current) {
@@ -2342,90 +2397,42 @@ impl App {
     /// Downloads and applies an accepted `yt-dlp` update in the background.
     pub fn install_tool_update(&self, update: ytdlp_tool::ToolUpdate) {
         let outbox = Arc::clone(&self.outbox);
-        let gate = Arc::clone(&self.ytdlp_gate);
         let resolver = Arc::clone(&self.resolver);
         let cookies = self.session.cookies_dir().to_path_buf();
         let paths = self.paths.clone();
-        self.runtime.handle().spawn_blocking(move || {
+        self.runtime.handle().spawn(async move {
             app_logging::notice(format!(
-                "downloading yt-dlp update: latest={} url={}",
+                "downloading yt-dlp update via yt-dlp crate: latest={} url={}",
                 update.latest, update.download_url
             ));
-            let tools = paths.tool_paths();
-            let staged = tools.staged_binary();
-            let managed = tools.managed_binary();
-
-            let progress_outbox = Arc::clone(&outbox);
-            let status_outbox = Arc::clone(&outbox);
-            let download = ytdlp_tool::update::download_with_progress(
-                &update.download_url,
-                &staged,
-                move |progress| {
-                    let _ = progress_outbox
-                        .lock()
-                        .map(|sender| sender.send(Box::new(Message::ToolUpdateProgress(progress))));
-                },
-            );
-            if let Err(error) = download {
-                let _ = std::fs::remove_file(&staged);
-                let message = error.to_string();
-                app_logging::error(format!(
-                    "the yt-dlp update download failed: latest={} error={message}",
-                    update.latest
-                ));
-                let _ = outbox
-                    .lock()
-                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
-                return;
-            }
-
-            let _ = status_outbox.lock().map(|sender| {
-                sender.send(Box::new(Message::ToolUpdateStatus("Applying updateâ€¦".to_string())))
+            let _ = outbox.lock().map(|sender| {
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
             });
 
-            let _guard = match gate.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = std::fs::remove_file(&staged);
-                    app_logging::error(
-                        "the yt-dlp update could not be applied: the yt-dlp gate was poisoned",
-                    );
-                    let _ = outbox.lock().map(|sender| {
-                        sender.send(Box::new(Message::ToolUpdateFailed(
-                            "the yt-dlp update could not be applied".to_string(),
-                        )))
-                    });
-                    return;
+            let tools = paths.tool_paths();
+            let managed = tools.managed_binary();
+            match ytdlp_tool::update_managed(&managed, tools.root()).await {
+                Ok(version) => {
+                    let tool = ytdlp_tool::locate::at(&managed, tools.clone());
+                    if let Ok(mut resolver) = resolver.lock() {
+                        *resolver = build_resolver(&tool, &cookies);
+                    }
+                    app_logging::notice(format!("yt-dlp update applied: latest={version}"));
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateApplied(version))));
                 }
-            };
-
-            if let Err(error) = ytdlp_tool::update::replace(&staged, &managed) {
-                let _ = std::fs::remove_file(&staged);
-                let message = error.to_string();
-                app_logging::error(format!(
-                    "the yt-dlp update could not be applied: latest={} error={message}",
-                    update.latest
-                ));
-                let _ = outbox
-                    .lock()
-                    .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
-                return;
+                Err(error) => {
+                    let message = error.to_string();
+                    app_logging::error(format!(
+                        "the yt-dlp update could not be applied: latest={} error={message}",
+                        update.latest
+                    ));
+                    let _ = outbox
+                        .lock()
+                        .map(|sender| sender.send(Box::new(Message::ToolUpdateFailed(message))));
+                }
             }
-
-            let tool = ytdlp_tool::locate::at(&managed);
-            if let Ok(mut resolver) = resolver.lock() {
-                *resolver = Resolver::new(command_spec(&tool, &cookies));
-            }
-            drop(_guard);
-            app_logging::notice(format!(
-                "yt-dlp update applied: latest={} managed={}",
-                update.latest,
-                managed.display()
-            ));
-
-            let _ = outbox
-                .lock()
-                .map(|sender| sender.send(Box::new(Message::ToolUpdateApplied(update.latest))));
         });
     }
 
@@ -2647,6 +2654,17 @@ impl App {
         let pre_buffer_seconds = self.settings.pre_buffer_seconds().0;
         self.engine
             .set_pre_buffer(pre_buffer_seconds, is_live)
+            .map_err(|error| error.to_string())?;
+
+        let (http_headers, cookies) = if let Some(video) = &plan.video {
+            (video.http_headers.as_ref(), video.cookies.as_deref())
+        } else if let Some(audio) = &plan.audio {
+            (audio.http_headers.as_ref(), audio.cookies.as_deref())
+        } else {
+            (None, None)
+        };
+        self.engine
+            .apply_stream_request(http_headers, cookies)
             .map_err(|error| error.to_string())?;
 
         let request = match &plan.audio {
@@ -2885,53 +2903,55 @@ fn format_bitrate(kilobits: u64) -> String {
 /// The label shown when a SponsorBlock category is skipped automatically.
 fn sponsorblock_skip_label(category: &str) -> &'static str {
     match category {
-        "sponsor" => "Sponsor Section",
-        "selfpromo" => "Self-Promo Section",
-        "interaction" => "Interaction Section",
-        "intro" => "Intro Section",
-        "outro" => "Outro Section",
-        "preview" => "Preview Section",
-        "hook" => "Hook Section",
-        "filler" => "Filler Section",
+        "sponsor" => "Sponsor",
+        "selfpromo" => "Unpaid/Self Promotion",
+        "interaction" => "Interaction Reminder",
+        "intro" => "Intermission/Intro",
+        "outro" => "Endcards/Credits",
+        "preview" => "Preview/Recap",
+        "hook" => "Hook",
+        "filler" => "Filler Tangent",
         _ => "Segment",
     }
 }
 
-/// Describes how `yt-dlp` has to be invoked.
+/// The scrubber colour of a SponsorBlock category.
 ///
-/// Every service gets its own cookie file, and a file is only passed when it
-/// contains authentication cookies for that service.
-fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
-    let mut spec = match ytdlp.interpreter() {
-        Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
-        None => CommandSpec::new(ytdlp.program()),
-    };
+/// The colours follow the ones the SponsorBlock web extension uses, so the
+/// segments are recognisable to people who already know them.
+fn sponsorblock_color(category: &str) -> [u8; 3] {
+    match category {
+        "sponsor" => [0, 212, 0],
+        "selfpromo" => [255, 255, 0],
+        "interaction" => [204, 0, 255],
+        "intro" => [0, 255, 255],
+        "outro" => [2, 2, 237],
+        "preview" => [0, 143, 214],
+        "hook" => [57, 86, 153],
+        "filler" => [115, 0, 255],
+        _ => [180, 180, 180],
+    }
+}
+
+/// Builds the resolver around the managed yt-dlp tool and known cookie files.
+fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path) -> Resolver {
+    let mut resolver = Resolver::new(ytdlp.clone());
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
     for service in services {
         let path = web_session::cookie_file(cookies, service);
         if web_session::cookie::signed_in_file(service, &path) {
-            spec = spec.with_cookies(service, path);
+            resolver = resolver.with_cookies(service, path);
         }
     }
-    spec
+    resolver
 }
 
-/// Resolves a URL with `yt-dlp`, serializing each process run through `gate`.
-///
-/// The gate is held only while `yt-dlp` is running, never while waiting for a
-/// sign-in window. A sign-in challenge pauses after the failed run, lets the
-/// user finish, then takes the gate again for one fresh resolve with the
-/// exported cookies. Runs that are cancelled or superseded return
-/// [`stream_resolver::Error::Cancelled`].
-#[allow(clippy::too_many_arguments)]
-fn resolve_with_session(
+/// Resolves a URL, offering sign-in when the service requires it.
+async fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
-    gate: &Mutex<()>,
-    pid: &AtomicU32,
-    cancel: &AtomicBool,
     epoch_state: &AtomicU64,
     epoch: u64,
     url: &str,
@@ -2942,9 +2962,7 @@ fn resolve_with_session(
     if epoch_state.load(Ordering::SeqCst) != epoch {
         return Err(ResolveError::Cancelled);
     }
-    let first = run_ytdlp_resolve(gate, pid, cancel, epoch_state, epoch, || {
-        resolver.resolve_with_cancel(url, Some((pid, cancel)))
-    });
+    let first = resolver.resolve(url).await;
     let error = match first {
         Ok(source) => return Ok(source),
         Err(error) => error,
@@ -2952,6 +2970,7 @@ fn resolve_with_session(
     if matches!(error, ResolveError::Cancelled) || epoch_state.load(Ordering::SeqCst) != epoch {
         return Err(ResolveError::Cancelled);
     }
+
     let message = error.to_string();
     let Some(service) = web_session::challenge_service(url, &message) else {
         return Err(error);
@@ -2961,9 +2980,7 @@ fn resolve_with_session(
             if epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
-            run_ytdlp_resolve(gate, pid, cancel, epoch_state, epoch, || {
-                resolver.resolve_with_cancel(url, Some((pid, cancel)))
-            })
+            resolver.resolve(url).await
         }
         Err(crate::session::Error::Declined) => {
             if epoch_state.load(Ordering::SeqCst) != epoch {
@@ -2976,58 +2993,9 @@ fn resolve_with_session(
             if epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
-            Err(ResolveError::Failed { code: None, stderr: format!("{message} ({problem})") })
+            Err(ResolveError::Tool(format!("{message} ({problem})")))
         }
     }
-}
-
-fn run_ytdlp_resolve<T>(
-    gate: &Mutex<()>,
-    pid: &AtomicU32,
-    cancel: &AtomicBool,
-    epoch_state: &AtomicU64,
-    epoch: u64,
-    run: impl FnOnce() -> Result<T, stream_resolver::Error>,
-) -> Result<T, stream_resolver::Error> {
-    use stream_resolver::Error as ResolveError;
-    let _guard = match gate.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(error)) => {
-            app_logging::warning("the yt-dlp queue gate was poisoned; continuing");
-            error.into_inner()
-        }
-        Err(std::sync::TryLockError::WouldBlock) => {
-            app_logging::debug("waiting for the yt-dlp queue to become available");
-            match gate.lock() {
-                Ok(guard) => guard,
-                Err(error) => {
-                    app_logging::warning("the yt-dlp queue gate was poisoned; continuing");
-                    error.into_inner()
-                }
-            }
-        }
-    };
-    app_logging::debug("the yt-dlp queue is acquired for a resolve");
-    if epoch_state.load(Ordering::SeqCst) != epoch {
-        app_logging::debug("dropping a queued yt-dlp resolve because it was superseded");
-        return Err(ResolveError::Cancelled);
-    }
-    pid.store(0, Ordering::SeqCst);
-    cancel.store(false, Ordering::SeqCst);
-    if epoch_state.load(Ordering::SeqCst) != epoch {
-        cancel.store(true, Ordering::SeqCst);
-        app_logging::debug("dropping a queued yt-dlp resolve because it was superseded");
-        return Err(ResolveError::Cancelled);
-    }
-    let result = run();
-    match &result {
-        Ok(_) => app_logging::debug("the queued yt-dlp resolve finished successfully"),
-        Err(ResolveError::Cancelled) => {
-            app_logging::debug("the queued yt-dlp resolve was cancelled")
-        }
-        Err(error) => app_logging::warning(format!("the queued yt-dlp resolve failed: {error}")),
-    }
-    result
 }
 
 /// Everything that can go wrong while running the application.
@@ -3081,6 +3049,8 @@ mod tests {
             has_audio,
             protocol: None,
             note: None,
+            http_headers: None,
+            cookies: None,
         }
     }
 
@@ -3095,6 +3065,8 @@ mod tests {
             language: None,
             note: None,
             protocol: None,
+            http_headers: None,
+            cookies: None,
         }
     }
 
@@ -3197,14 +3169,24 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_starts_at_two_seconds_and_stops_growing_at_one_minute() {
+    fn a_due_retry_is_taken_once_and_its_timer_is_cleared() {
+        let mut retry = RetryState::default();
+        assert!(retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
+        assert!(!retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
+
+        let due = retry.take_due().expect("the retry is due");
+        assert_eq!(due.0, "https://example.com/video");
+        assert_eq!(due.1, RetryErrorKind::Resolver);
+        assert!(retry.next_retry.is_none());
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.take_due().is_none());
+    }
+
+    #[test]
+    fn retry_is_scheduled_immediately() {
         let mut retry = RetryState::default();
         retry.schedule_next();
-        assert_eq!(retry.next_delay_seconds(), Some(2));
-
-        retry.attempt = 20;
-        retry.schedule_next();
-        assert_eq!(retry.next_delay_seconds(), Some(60));
+        assert!(retry.next_retry.is_some());
     }
 
     #[test]

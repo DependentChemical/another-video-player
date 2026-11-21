@@ -422,6 +422,8 @@ mod tests {
                     has_audio: false,
                     protocol: None,
                     note: None,
+                    http_headers: None,
+                    cookies: None,
                 })
                 .chain(std::iter::once(VideoStream {
                     format_id: "muxed".into(),
@@ -436,6 +438,8 @@ mod tests {
                     has_audio: true,
                     protocol: None,
                     note: None,
+                    http_headers: None,
+                    cookies: None,
                 }))
                 .collect(),
             audio_streams: [64, 96, 128]
@@ -450,6 +454,8 @@ mod tests {
                     language: None,
                     note: (bitrate == 64).then(|| "Default".into()),
                     protocol: None,
+                    http_headers: None,
+                    cookies: None,
                 })
                 .collect(),
         }

@@ -14,6 +14,16 @@ export struct BufferedRange {
     end: float,
 }
 
+/// A marked span on the scrubber, such as a SponsorBlock segment.
+///
+/// Both ends are fractions of the axis the scrubber shows, and the colour
+/// identifies the kind of segment it represents.
+export struct SponsorSegment {
+    start: float,
+    end: float,
+    color: color,
+}
+
 /// One row of the queue dialog.
 export struct QueueItem {
     /// The stable database id of the entry, used to remove exactly one row.

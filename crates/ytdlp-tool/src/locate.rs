@@ -10,24 +10,28 @@ use crate::Error;
 
 /// A `yt-dlp` executable together with the interpreter it needs.
 ///
-/// On Windows the published binary is self contained and `interpreter` is
-/// `None`. On Unix the published artifact is a Python zip application, so
-/// `interpreter` points at a `python3` binary.
+/// This is the singular access point for knowing where yt-dlp lives and how to
+/// invoke it. Metadata resolution is layered on top via `yt_dlp::Downloader`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YtDlp {
     program: PathBuf,
     interpreter: Option<PathBuf>,
+    tools: ToolPaths,
 }
 
 impl YtDlp {
     /// Wraps an executable without an interpreter.
-    pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), interpreter: None }
+    pub fn new(program: impl Into<PathBuf>, tools: ToolPaths) -> Self {
+        Self { program: program.into(), interpreter: None, tools }
     }
 
     /// Wraps an executable that has to be run through an interpreter.
-    pub fn with_interpreter(program: impl Into<PathBuf>, interpreter: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), interpreter: Some(interpreter.into()) }
+    pub fn with_interpreter(
+        program: impl Into<PathBuf>,
+        interpreter: impl Into<PathBuf>,
+        tools: ToolPaths,
+    ) -> Self {
+        Self { program: program.into(), interpreter: Some(interpreter.into()), tools }
     }
 
     /// The executable itself.
@@ -38,6 +42,11 @@ impl YtDlp {
     /// The interpreter the executable needs, if any.
     pub fn interpreter(&self) -> Option<&Path> {
         self.interpreter.as_deref()
+    }
+
+    /// The tool directory used by this executable.
+    pub fn paths(&self) -> &ToolPaths {
+        &self.tools
     }
 
     /// Builds a command that runs `yt-dlp` with the given arguments.
@@ -60,16 +69,12 @@ impl YtDlp {
         command
     }
 
-    /// Asks `yt-dlp` for its version string, e.g. `2025.10.13`.
-    ///
-    /// A version probe must never hang: a broken executable that does not
-    /// answer is treated as unusable so it cannot block later work.
+    /// Asks `yt-dlp` for its version string.
     pub fn version(&self) -> Result<String, Error> {
         self.version_with_cancel(None)
     }
 
-    /// Asks `yt-dlp` for its version string, allowing cancellation by the
-    /// caller.
+    /// Asks `yt-dlp` for its version string, allowing cancellation by the caller.
     pub fn version_with_cancel(
         &self,
         cancel: Option<(&AtomicU32, &AtomicBool)>,
@@ -84,11 +89,6 @@ impl YtDlp {
             ));
             error
         })?;
-        app_logging::debug(format!(
-            "yt-dlp version probe started: program={} pid={}",
-            self.program.display(),
-            child.id()
-        ));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_reader = thread::spawn(move || {
@@ -112,37 +112,21 @@ impl YtDlp {
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if cancel.is_some_and(|(_, flag)| flag.load(Ordering::SeqCst)) {
-                let probe_id = child.id();
-                app_logging::debug(format!("cancelled the yt-dlp version probe: pid={probe_id}"));
                 terminate_child(&mut child, cancel);
                 clear_cancel_pid(cancel);
-                app_logging::debug(format!(
-                    "yt-dlp version probe pid={probe_id} closed after cancellation"
-                ));
                 return Err(Error::NotUsable("the yt-dlp probe was cancelled".to_string()));
             }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
                 Ok(None) => {
-                    let probe_id = child.id();
-                    app_logging::warning(format!(
-                        "the yt-dlp version probe timed out after 10s: pid={probe_id}"
-                    ));
                     terminate_child(&mut child, cancel);
                     clear_cancel_pid(cancel);
-                    app_logging::debug(format!(
-                        "yt-dlp version probe pid={probe_id} closed after timeout"
-                    ));
                     return Err(Error::NotUsable(
                         "timed out reading the yt-dlp version".to_string(),
                     ));
                 }
                 Err(error) => {
-                    app_logging::error(format!(
-                        "the yt-dlp version probe could not wait for pid={}: {error}",
-                        child.id()
-                    ));
                     terminate_child(&mut child, cancel);
                     clear_cancel_pid(cancel);
                     return Err(Error::Io(error));
@@ -155,20 +139,9 @@ impl YtDlp {
         let stderr = stderr_reader.join().unwrap_or_default();
         if !status.success() {
             let message = String::from_utf8_lossy(&stderr).trim().to_string();
-            app_logging::warning(format!(
-                "the yt-dlp version probe failed: program={} pid={} status={status} stderr={message}",
-                self.program.display(),
-                child.id()
-            ));
             return Err(Error::NotUsable(message));
         }
-        let version = String::from_utf8_lossy(&stdout).trim().to_string();
-        app_logging::debug(format!(
-            "yt-dlp version probe finished: program={} pid={} status={status} version={version}",
-            self.program.display(),
-            child.id()
-        ));
-        Ok(version)
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     }
 
     /// Whether the executable exists and answers `--version`.
@@ -207,6 +180,11 @@ impl ToolPaths {
         name.set_extension(suffix);
         name
     }
+
+    /// Directory used by the `yt-dlp` crate for output/artifacts.
+    pub fn tools_output_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
 }
 
 fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
@@ -215,7 +193,6 @@ fn clear_cancel_pid(cancel: Option<(&AtomicU32, &AtomicBool)>) {
     }
 }
 
-/// Stops a probe process and, on Windows, any process tree it spawned.
 fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, &AtomicBool)>) {
     let id = cancel
         .and_then(|(pid, _)| {
@@ -223,10 +200,6 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
             (id != 0).then_some(id)
         })
         .unwrap_or_else(|| child.id());
-    app_logging::debug(format!("stopping yt-dlp probe process: pid={id}"));
-    if let Err(error) = child.kill() {
-        app_logging::debug(format!("yt-dlp probe pid={id} could not be killed directly: {error}"));
-    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -243,78 +216,78 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
         let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
         let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
     }
-    match child.wait() {
-        Ok(status) => {
-            app_logging::debug(format!("yt-dlp probe pid={id} closed with {status}"));
-        }
-        Err(error) => {
-            app_logging::warning(format!(
-                "yt-dlp probe pid={id} could not be reaped after termination: {error}"
-            ));
-        }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stops `yt-dlp` processes that an earlier Flatline run left behind.
+pub fn stop_leftovers(tool: &YtDlp) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Some(name) = tool.program.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let name = name.replace('\'', "''");
+        let target = tool.program.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$name='{name}'; $target='{target}'; \
+             Get-CimInstance Win32_Process -Filter \"name='$name'\" | ForEach-Object {{ \
+                 if ($_.ExecutablePath -eq $target) {{ \
+                     $parent = Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.ParentProcessId)\"; \
+                     if (-not $parent -or ($parent.Name -ne 'flatline.exe' -and $parent.Name -ne $name)) {{ \
+                         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue \
+                     }} \
+                 }} \
+             }}"
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tool;
     }
 }
 
 /// Looks for a managed `yt-dlp` first, then one on `PATH`.
 pub fn discover(paths: &ToolPaths) -> Option<YtDlp> {
-    match managed(paths) {
-        Some(tool) => {
-            app_logging::debug(format!(
-                "using the managed yt-dlp: program={}",
-                tool.program.display()
-            ));
-            Some(tool)
-        }
-        None => {
-            let tool = from_path();
-            if let Some(tool) = &tool {
-                app_logging::debug(format!(
-                    "using a yt-dlp from PATH: program={}",
-                    tool.program.display()
-                ));
-            } else {
-                app_logging::notice("no yt-dlp was found on this system");
-            }
-            tool
-        }
-    }
+    managed(paths).or_else(|| from_path(paths.clone()))
 }
 
 /// The managed `yt-dlp`, if it has been downloaded before.
 pub fn managed(paths: &ToolPaths) -> Option<YtDlp> {
     let program = paths.managed_binary();
-    program.is_file().then(|| describe(program))
+    program.is_file().then(|| describe(program, paths.clone()))
 }
 
 /// A `yt-dlp` found on `PATH`.
-pub fn from_path() -> Option<YtDlp> {
+pub fn from_path(paths: ToolPaths) -> Option<YtDlp> {
     let file_name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(file_name))
         .find(|candidate| candidate.is_file())
-        .map(describe)
+        .map(|program| describe(program, paths))
 }
 
 /// Builds a [`YtDlp`] for an executable, detecting the interpreter it needs.
-pub fn at(program: impl Into<PathBuf>) -> YtDlp {
-    describe(program.into())
+pub fn at(program: impl Into<PathBuf>, paths: ToolPaths) -> YtDlp {
+    describe(program.into(), paths)
 }
 
-/// Builds a [`YtDlp`] for an executable, detecting the interpreter it needs.
-fn describe(program: PathBuf) -> YtDlp {
+fn describe(program: PathBuf, paths: ToolPaths) -> YtDlp {
     match interpreter_for(&program) {
-        Some(interpreter) => YtDlp::with_interpreter(program, interpreter),
-        None => YtDlp::new(program),
+        Some(interpreter) => YtDlp::with_interpreter(program, interpreter, paths),
+        None => YtDlp::new(program, paths),
     }
 }
 
-/// The interpreter an executable needs, if any.
-///
-/// The artifacts the `yt-dlp` project publishes are self contained binaries
-/// on every platform, but an old `yt-dlp` may be the Python zip application.
-/// The first two bytes tell the two apart: a zip application starts with a
-/// `#!` shebang, a native binary starts with its own magic.
 fn interpreter_for(program: &Path) -> Option<PathBuf> {
     if program.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
         return None;
@@ -322,24 +295,17 @@ fn interpreter_for(program: &Path) -> Option<PathBuf> {
     if needs_python(program) { python_on_path() } else { None }
 }
 
-/// Whether a file looks like a Python script rather than a native executable.
 fn needs_python(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
     let mut magic = [0u8; 2];
     match std::io::Read::read_exact(&mut file, &mut magic) {
-        Ok(()) => is_python_magic(&magic),
+        Ok(()) => magic.starts_with(b"#!"),
         Err(_) => false,
     }
 }
 
-/// Whether the first bytes of a file are a shebang.
-fn is_python_magic(magic: &[u8]) -> bool {
-    magic.starts_with(b"#!")
-}
-
-/// Finds a `python3` (or `python`) executable on `PATH`.
 pub fn python_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for name in ["python3", "python"] {
@@ -356,20 +322,4 @@ pub fn python_on_path() -> Option<PathBuf> {
 /// Whether `name` looks like a `yt-dlp` executable.
 pub fn is_ytdlp_name(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with("yt-dlp")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_shebang_marks_a_python_script() {
-        assert!(is_python_magic(b"#!/usr/bin/env python3"));
-    }
-
-    #[test]
-    fn a_native_binary_needs_no_interpreter() {
-        assert!(!is_python_magic(b"\x7fELF"));
-        assert!(!is_python_magic(b"MZ"));
-    }
 }

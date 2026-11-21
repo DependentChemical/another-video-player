@@ -90,6 +90,12 @@ pub struct VideoStream {
     /// Human readable note from the extractor, e.g. `1080p`.
     #[serde(default)]
     pub note: Option<String>,
+    /// HTTP headers the extractor says must be sent with requests to this stream.
+    #[serde(default)]
+    pub http_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Raw cookie string the extractor says must be sent with requests to this stream.
+    #[serde(default)]
+    pub cookies: Option<String>,
 }
 
 impl VideoStream {
@@ -139,6 +145,12 @@ pub struct AudioStream {
     /// Transport protocol, e.g. `https` or `m3u8_native`.
     #[serde(default)]
     pub protocol: Option<String>,
+    /// HTTP headers the extractor says must be sent with requests to this stream.
+    #[serde(default)]
+    pub http_headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Raw cookie string the extractor says must be sent with requests to this stream.
+    #[serde(default)]
+    pub cookies: Option<String>,
 }
 
 impl AudioStream {

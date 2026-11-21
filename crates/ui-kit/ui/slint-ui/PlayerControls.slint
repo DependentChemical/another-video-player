@@ -1,18 +1,23 @@
 import { Theme } from "../theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PauseIcon, PlayIcon, PreviousIcon, NextIcon, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
-import { BufferedRange } from "types.slint";
+import { BufferedRange, SponsorSegment } from "types.slint";
+import { SettingsMenu } from "SettingsMenu.slint";
 
 export component PlayerControls inherits Rectangle {
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
     in property <[BufferedRange]> buffered-ranges: [];
+    in property <[SponsorSegment]> sponsor-segments: [];
     in property <float> volume: 100;
     in property <string> time-text: "0:00 / 0:00";
     in property <bool> live: false;
     in property <bool> at-live-edge: true;
     in property <bool> fullscreen: false;
-    in property <bool> sources-open: false;
+    in property <bool> settings-open: false;
+    in property <bool> settings-speed-mode: false;
+    in property <string> source-quality-label: "Auto";
+    in property <float> playback-speed: 1.0;
     in property <bool> has-media: false;
     in property <bool> controls-visible: true;
     in property <length> container-height: 0;
@@ -25,7 +30,11 @@ export component PlayerControls inherits Rectangle {
     callback pointer-activity();
     callback controls-hovered(bool);
     callback interacting-changed(bool);
-    callback sources-toggled();
+    callback settings-toggled();
+    callback settings-closed();
+    callback sources-requested();
+    callback speed-mode-requested();
+    callback speed-changed(float);
     callback previous-requested();
     callback next-requested();
 
@@ -180,6 +189,7 @@ export component PlayerControls inherits Rectangle {
                 value: root.position;
                 maximum: root.duration;
                 buffered-ranges: root.buffered-ranges;
+                sponsor-segments: root.sponsor-segments;
                 pointer-activity => { root.pointer-activity(); }
                 moved(value) => {
                     root.seek-requested(value);
@@ -197,11 +207,11 @@ export component PlayerControls inherits Rectangle {
             GearButton {
                 width: 32px;
                 height: 32px;
-                active: root.sources-open;
+                active: root.settings-open;
                 enabled: root.has-media;
                 pointer-activity => { root.pointer-activity(); }
                 clicked => {
-                    root.sources-toggled();
+                    root.settings-toggled();
                 }
             }
 
@@ -264,6 +274,43 @@ export component PlayerControls inherits Rectangle {
                 pointer-activity => { root.pointer-activity(); }
                 clicked => {
                     root.fullscreen-toggled();
+                }
+            }
+        }
+    }
+
+    if root.settings-open: Rectangle {
+        width: root.width;
+        height: root.container-height + root.height;
+        background: transparent;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.settings-closed(); }
+        }
+
+        VerticalLayout {
+            width: parent.width;
+            height: parent.height;
+            padding-left: 12px;
+            padding-right: 12px;
+            padding-top: 12px;
+            padding-bottom: Theme.controls-height + 8px;
+            alignment: end;
+
+            HorizontalLayout {
+                alignment: end;
+
+                SettingsMenu {
+                    open: true;
+                    speed-mode: root.settings-speed-mode;
+                    source-quality-label: root.source-quality-label;
+                    playback-speed: root.playback-speed;
+                    close-requested => { root.settings-closed(); }
+                    sources-requested => { root.sources-requested(); }
+                    speed-mode-requested => { root.speed-mode-requested(); }
+                    speed-changed(value) => { root.speed-changed(value); }
                 }
             }
         }

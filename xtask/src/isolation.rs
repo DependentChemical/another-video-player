@@ -22,11 +22,11 @@ const RULES: &[(&str, &[&str])] = &[
     ("playback-engine", &["app-logging"]),
     ("storyboard", &["app-logging"]),
     ("ui-kit", &["app-logging"]),
-    ("ytdlp-tool", &["app-logging"]),
+    ("ytdlp-tool", &["app-logging", "media-model"]),
     ("updater", &["app-logging"]),
     ("source-twitch", &["media-model", "web-session"]),
     ("source-youtube", &["media-model", "web-session"]),
-    ("stream-resolver", &["app-logging", "media-model"]),
+    ("stream-resolver", &["app-logging", "media-model", "ytdlp-tool"]),
     ("video-surface", &["app-logging", "playback-engine"]),
     ("web-session", &["app-logging", "media-model"]),
     (
