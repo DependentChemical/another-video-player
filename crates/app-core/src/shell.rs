@@ -621,9 +621,9 @@ fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
         handle_test_url(ui, url);
         return;
     }
-    if ui.has_media() {
-        // Something plays already, so the new URL must not interrupt it. A
-        // toast says the background is working and the dialog appears once
+    if app.is_playing() {
+        // Something settled is playing, so the new URL must not interrupt it.
+        // A toast says the background is working and the dialog appears once
         // the media is resolved.
         ui.show_toast("Parsing video");
     } else {
@@ -860,15 +860,21 @@ fn tick(
                         );
                         continue;
                     }
+                    if app.is_current_queue_url(&url) {
+                        app_logging::debug(
+                            "discarded a stale retry resolve because playback is already active",
+                        );
+                        continue;
+                    }
                     app_logging::debug(
                         "discarded a resolved video that is no longer current in the active queue",
                     );
                     // The spinner belongs to that discarded result; without
                     // this it would keep claiming the app is resolving.
                     loading.resolve_failed(
-                        "the resolved video is no longer in the active queue".to_string(),
+                        "the resolved video is no longer the current queue entry".to_string(),
                     );
-                    ui.show_toast("The resolved video is no longer in the active queue");
+                    ui.show_toast("The resolved video is no longer the current queue entry");
                     continue;
                 };
                 app_logging::debug(format!(
@@ -911,6 +917,10 @@ fn tick(
                 }
             }
             Message::Pending(Ok(pending)) => {
+                if !app.is_current_epoch(pending.epoch) {
+                    app_logging::debug("discarded a pending video that was superseded");
+                    continue;
+                }
                 let in_playlist = app.active_playlist_name().is_some();
                 ui.show_pending(
                     &pending.title,

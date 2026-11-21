@@ -355,10 +355,13 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
         })
         .unwrap_or_else(|| child.id());
     app_logging::debug(format!("stopping yt-dlp process: pid={id}"));
+    // The Windows one-file build runs the extractor in a child of a bootloader.
+    // `taskkill /T` can only reach that child while the bootloader is alive, so
+    // the tree has to be terminated before the direct child is killed.
+    terminate_pid(id);
     if let Err(error) = child.kill() {
         app_logging::debug(format!("yt-dlp pid={id} could not be killed directly: {error}"));
     }
-    terminate_pid(id);
     match child.wait() {
         Ok(status) => {
             app_logging::debug(format!("yt-dlp pid={id} closed with {status}"));

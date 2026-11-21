@@ -46,6 +46,8 @@ struct RawFormat {
     resolution: Option<String>,
     video_ext: Option<String>,
     audio_ext: Option<String>,
+    http_headers: Option<serde_json::Map<String, Value>>,
+    cookies: Option<String>,
 }
 
 /// Parses a `yt-dlp` metadata document.
@@ -99,6 +101,17 @@ fn build(raw: RawInfo) -> MediaSource {
             && format.audio_ext.is_none()
             && format.resolution.as_deref() != Some("audio only");
 
+        let http_headers = format.http_headers.as_ref().and_then(|map| {
+            let mut out = std::collections::BTreeMap::new();
+            for (name, value) in map {
+                if let Some(value) = value.as_str() {
+                    out.insert(name.clone(), value.to_string());
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        });
+        let cookies = format.cookies.clone();
+
         if has_video || unknown {
             video_streams.push(VideoStream {
                 format_id,
@@ -113,6 +126,8 @@ fn build(raw: RawInfo) -> MediaSource {
                 has_audio: has_audio || unknown,
                 protocol: format.protocol,
                 note: format.format_note,
+                http_headers: http_headers.clone(),
+                cookies: cookies.clone(),
             });
         } else if has_audio {
             audio_streams.push(AudioStream {
@@ -128,6 +143,8 @@ fn build(raw: RawInfo) -> MediaSource {
                 language: format.language,
                 note: format.format_note,
                 protocol: format.protocol,
+                http_headers,
+                cookies,
             });
         }
     }

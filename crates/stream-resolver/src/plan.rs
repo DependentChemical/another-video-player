@@ -117,6 +117,8 @@ mod tests {
                     has_audio: false,
                     protocol: None,
                     note: None,
+                    http_headers: None,
+                    cookies: None,
                 },
                 VideoStream {
                     format_id: "18".into(),
@@ -131,6 +133,8 @@ mod tests {
                     has_audio: true,
                     protocol: None,
                     note: None,
+                    http_headers: None,
+                    cookies: None,
                 },
             ],
             audio_streams: vec![AudioStream {
@@ -143,6 +147,8 @@ mod tests {
                 language: None,
                 note: None,
                 protocol: None,
+                http_headers: None,
+                cookies: None,
             }],
         }
     }

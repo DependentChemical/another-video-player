@@ -149,6 +149,8 @@ pub struct PendingMedia {
     pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
+    /// The manual-work generation this resolve belongs to.
+    pub epoch: u64,
     /// SponsorBlock segments fetched for the media, kept only in memory.
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
@@ -299,13 +301,37 @@ enum RetryErrorKind {
 
 impl RetryState {
     /// Starts a retry for the given URL and error kind.
-    fn start(&mut self, url: String, kind: RetryErrorKind) {
-        if self.url.as_deref() != Some(url.as_str()) || self.error_kind != Some(kind) {
+    ///
+    /// Returns `false` when the same retry is already scheduled, so repeated
+    /// error events for one failed load neither push the retry back nor report
+    /// it again.
+    fn start(&mut self, url: String, kind: RetryErrorKind) -> bool {
+        if self.url.as_deref() == Some(url.as_str()) && self.error_kind == Some(kind) {
+            if self.next_retry.is_some() {
+                return false;
+            }
+        } else {
             self.url = Some(url);
             self.error_kind = Some(kind);
             self.attempt = 0;
         }
         self.schedule_next();
+        true
+    }
+
+    /// Takes the retry that is due, clearing its timer until the next failure.
+    ///
+    /// Clearing the timer is what keeps a slow resolve from being retried again
+    /// while it is still running.
+    fn take_due(&mut self) -> Option<(String, RetryErrorKind)> {
+        if !self.is_ready() {
+            return None;
+        }
+        let url = self.url.clone()?;
+        let kind = self.error_kind?;
+        self.next_retry = None;
+        self.attempt += 1;
+        Some((url, kind))
     }
 
     /// Schedules the next retry with exponential backoff (2, 4, 8, 16... seconds).
@@ -325,6 +351,7 @@ impl RetryState {
     }
 
     /// Increments the attempt counter and schedules the next retry.
+    #[cfg(test)]
     fn next_attempt(&mut self) {
         self.attempt += 1;
         self.schedule_next();
@@ -471,7 +498,7 @@ impl App {
         // is handled immediately.
         let epoch = self.preempt_ytdlp();
         self.clear_retry();
-        if self.has_media() {
+        if self.is_playing() {
             self.resolve_pending(url, epoch);
         } else {
             self.prepare_current(&url, "", None, None, None);
@@ -482,6 +509,27 @@ impl App {
     /// Whether a media is loaded in the player.
     pub fn has_media(&self) -> bool {
         self.state.lock().expect("the state is not poisoned").source.is_some()
+    }
+
+    /// Whether the player holds media that is ready to play or paused.
+    ///
+    /// A media that is still opening, waiting for data or already failed is not
+    /// settled, so a new manual request replaces it instead of becoming pending.
+    pub fn is_playing(&self) -> bool {
+        if !self.has_media() || self.engine.is_idle() {
+            return false;
+        }
+        self.engine.is_active() || (self.engine.is_paused() && !self.engine.is_buffering())
+    }
+
+    /// Whether `url` is the URL of the current active queue entry.
+    pub fn is_current_queue_url(&self, url: &str) -> bool {
+        matches!(self.queue.current(), Ok(Some(entry)) if entry.url == url)
+    }
+
+    /// Whether `epoch` is still the current manual-work generation.
+    pub fn is_current_epoch(&self, epoch: u64) -> bool {
+        !self.is_ytdlp_stale(epoch)
     }
 
     /// Returns the URL currently being resolved, if any.
@@ -658,6 +706,7 @@ impl App {
                         thumbnail,
                         thumbnail_id,
                         resolved_at: unix_time(),
+                        epoch,
                         sponsorblock_segments,
                     }))
                 }
@@ -1293,7 +1342,15 @@ impl App {
                 .lock()
                 .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
 
+            // A manual action bumps the epoch. Background work that started
+            // before it must stop instead of picking up the new epoch and
+            // competing with the media the user asked for.
+            let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
             for (position, url, thumbnail_url) in due {
+                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
+                    app_logging::debug("the thumbnail refresh yielded to manual work");
+                    break;
+                }
                 // Try direct fetch first (no yt-dlp slot needed).
                 match cache.fetch(&url, Some(&thumbnail_url)) {
                     Ok(id) => {
@@ -1314,7 +1371,6 @@ impl App {
 
                 // Fallback: re-resolve via yt-dlp. This is background work and
                 // yields immediately if manual playback preempts or supersedes it.
-                let epoch = ytdlp_epoch.load(Ordering::SeqCst);
                 let sender = outbox.lock().expect("outbox poisoned").clone();
                 let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
                 match resolve_with_session(
@@ -1324,12 +1380,12 @@ impl App {
                     &ytdlp_pid,
                     &ytdlp_cancel,
                     &ytdlp_epoch,
-                    epoch,
+                    pass_epoch,
                     &url,
                     &sender,
                 ) {
                     Ok(source) => {
-                        if ytdlp_epoch.load(Ordering::SeqCst) != epoch {
+                        if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
                             break;
                         }
                         if let Some(new_thumb) = source.thumbnail.as_deref() {
@@ -1420,6 +1476,7 @@ impl App {
         app_logging::debug("interrupting the current playback and clearing transient state");
         let _ = self.engine.stop();
         self.clear_retry();
+        *self.pending.lock().expect("the pending media is not poisoned") = None;
         let mut state = self.state.lock().expect("the state is not poisoned");
         state.pending_restore = PendingRestore::default();
         state.resolving_url = None;
@@ -1868,13 +1925,11 @@ impl App {
         report_kind: RetryKind,
         message: String,
     ) {
-        if matches!(kind, RetryErrorKind::Resolver | RetryErrorKind::SourceSelection)
-            && !self.expects_resolved_url(&url)
-        {
+        if !self.expects_resolved_url(&url) {
             return;
         }
         let mut state = self.state.lock().expect("the state is not poisoned");
-        state.retry.start(url, kind);
+        let scheduled = state.retry.start(url, kind);
         let attempt = state.retry.attempt;
         if state.retry.exhausted() {
             state.retry.clear();
@@ -1883,6 +1938,9 @@ impl App {
                 "giving up after {attempt} retries: kind={kind:?} error={message}"
             ));
             self.report(format!("{message} (gave up after {attempt} retries)"));
+            return;
+        }
+        if !scheduled {
             return;
         }
         let delay = state.retry.next_delay_seconds().unwrap_or(2);
@@ -1902,19 +1960,17 @@ impl App {
 
     /// Checks if any retry is due and executes it.
     pub fn check_retries(&self) -> Option<RetryKind> {
-        let (url, kind) = {
+        let due = {
             let mut state = self.state.lock().expect("the state is not poisoned");
-            if let (Some(url), Some(kind)) = (state.retry.url.clone(), state.retry.error_kind)
-                && state.retry.is_ready()
-            {
-                state.retry.next_attempt();
-                (Some(url), Some(kind))
-            } else {
-                (None, None)
-            }
+            let resolver_in_flight = state.resolving_url.is_some()
+                && matches!(
+                    state.retry.error_kind,
+                    Some(RetryErrorKind::Resolver | RetryErrorKind::SourceSelection)
+                );
+            if resolver_in_flight { None } else { state.retry.take_due() }
         };
 
-        if let (Some(url), Some(kind)) = (url, kind) {
+        if let Some((url, kind)) = due {
             let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
             app_logging::notice(format!("retrying now: kind={kind:?} url={url} reason=retry"));
             Some(match kind {
@@ -2232,7 +2288,13 @@ impl App {
                 if epoch_state.load(Ordering::SeqCst) != epoch {
                     return;
                 }
-                pid.store(0, Ordering::SeqCst);
+                let previous = pid.swap(0, Ordering::SeqCst);
+                if previous != 0 {
+                    app_logging::warning(format!(
+                        "terminating a yt-dlp process left by an earlier probe: pid={previous}"
+                    ));
+                    stream_resolver::terminate_pid(previous);
+                }
                 cancel.store(false, Ordering::SeqCst);
                 if epoch_state.load(Ordering::SeqCst) != epoch {
                     cancel.store(true, Ordering::SeqCst);
@@ -2649,6 +2711,17 @@ impl App {
             .set_pre_buffer(pre_buffer_seconds, is_live)
             .map_err(|error| error.to_string())?;
 
+        let (http_headers, cookies) = if let Some(video) = &plan.video {
+            (video.http_headers.as_ref(), video.cookies.as_deref())
+        } else if let Some(audio) = &plan.audio {
+            (audio.http_headers.as_ref(), audio.cookies.as_deref())
+        } else {
+            (None, None)
+        };
+        self.engine
+            .apply_stream_request(http_headers, cookies)
+            .map_err(|error| error.to_string())?;
+
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
@@ -3012,7 +3085,13 @@ fn run_ytdlp_resolve<T>(
         app_logging::debug("dropping a queued yt-dlp resolve because it was superseded");
         return Err(ResolveError::Cancelled);
     }
-    pid.store(0, Ordering::SeqCst);
+    let previous = pid.swap(0, Ordering::SeqCst);
+    if previous != 0 {
+        app_logging::warning(format!(
+            "terminating a yt-dlp process left by an earlier run: pid={previous}"
+        ));
+        stream_resolver::terminate_pid(previous);
+    }
     cancel.store(false, Ordering::SeqCst);
     if epoch_state.load(Ordering::SeqCst) != epoch {
         cancel.store(true, Ordering::SeqCst);
@@ -3081,6 +3160,8 @@ mod tests {
             has_audio,
             protocol: None,
             note: None,
+            http_headers: None,
+            cookies: None,
         }
     }
 
@@ -3095,6 +3176,8 @@ mod tests {
             language: None,
             note: None,
             protocol: None,
+            http_headers: None,
+            cookies: None,
         }
     }
 
@@ -3194,6 +3277,22 @@ mod tests {
 
         retry.start("https://example.com/other".into(), RetryErrorKind::Resolver);
         assert_eq!(retry.attempt, 0);
+    }
+
+    #[test]
+    fn a_due_retry_is_taken_once_and_its_timer_is_cleared() {
+        let mut retry = RetryState::default();
+        assert!(retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
+        assert!(!retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
+        assert!(retry.take_due().is_none());
+
+        retry.next_retry = Some(Instant::now() - Duration::from_secs(1));
+        let due = retry.take_due().expect("the retry is due");
+        assert_eq!(due.0, "https://example.com/video");
+        assert_eq!(due.1, RetryErrorKind::Resolver);
+        assert!(retry.next_retry.is_none());
+        assert_eq!(retry.attempt, 1);
+        assert!(retry.take_due().is_none());
     }
 
     #[test]

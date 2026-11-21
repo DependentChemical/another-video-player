@@ -224,9 +224,9 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
         })
         .unwrap_or_else(|| child.id());
     app_logging::debug(format!("stopping yt-dlp probe process: pid={id}"));
-    if let Err(error) = child.kill() {
-        app_logging::debug(format!("yt-dlp probe pid={id} could not be killed directly: {error}"));
-    }
+    // The Windows one-file build runs the probe in a child of a bootloader.
+    // `taskkill /T` can only reach that child while the bootloader is alive, so
+    // the tree has to be terminated before the direct child is killed.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -243,6 +243,9 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
         let _ = std::process::Command::new("kill").args(["-TERM", &id.to_string()]).status();
         let _ = std::process::Command::new("kill").args(["-KILL", &id.to_string()]).status();
     }
+    if let Err(error) = child.kill() {
+        app_logging::debug(format!("yt-dlp probe pid={id} could not be killed directly: {error}"));
+    }
     match child.wait() {
         Ok(status) => {
             app_logging::debug(format!("yt-dlp probe pid={id} closed with {status}"));
@@ -252,6 +255,58 @@ fn terminate_child(child: &mut std::process::Child, cancel: Option<(&AtomicU32, 
                 "yt-dlp probe pid={id} could not be reaped after termination: {error}"
             ));
         }
+    }
+}
+
+/// Stops `yt-dlp` processes that an earlier Flatline run left behind.
+///
+/// The Windows one-file build runs the extractor in a child of a bootloader.
+/// When Flatline is killed while a resolve is running, that child survives and
+/// competes with the next run, which then times out. A sweep at startup removes
+/// those leftovers, while processes that still belong to a live Flatline or
+/// `yt-dlp` parent are left alone.
+pub fn stop_leftovers(tool: &YtDlp) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Some(name) = tool.program.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let name = name.replace('\'', "''");
+        let target = tool.program.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "$name='{name}'; $target='{target}'; \
+             Get-CimInstance Win32_Process -Filter \"name='$name'\" | ForEach-Object {{ \
+                 if ($_.ExecutablePath -eq $target) {{ \
+                     $parent = Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.ParentProcessId)\"; \
+                     if (-not $parent -or ($parent.Name -ne 'flatline.exe' -and $parent.Name -ne $name)) {{ \
+                         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue \
+                     }} \
+                 }} \
+             }}"
+        );
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {
+                app_logging::debug("swept leftover yt-dlp processes from an earlier run");
+            }
+            Ok(status) => {
+                app_logging::debug(format!("the leftover yt-dlp sweep exited with {status}"));
+            }
+            Err(error) => {
+                app_logging::debug(format!("the leftover yt-dlp sweep could not run: {error}"));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tool;
     }
 }
 
