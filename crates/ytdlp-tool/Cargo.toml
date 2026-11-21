@@ -10,6 +10,9 @@ authors.workspace = true
 # Layer 1: standalone capability. Knows nothing about any other Flatline crate.
 [dependencies]
 app-logging = { workspace = true }
+media-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 ureq = { workspace = true }
+yt-dlp = { workspace = true }

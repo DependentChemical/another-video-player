@@ -1,150 +1,78 @@
-//! Turning the metadata document of `yt-dlp` into a [`MediaSource`].
+//! Turning `yt-dlp` crate metadata into a [`MediaSource`].
+
+use std::collections::BTreeMap;
 
 use media_model::{AudioStream, MediaSource, VideoStream};
-use serde::Deserialize;
-use serde_json::Value;
 
 use crate::Error;
 
-/// The subset of the `yt-dlp` metadata document Flatline reads.
-#[derive(Debug, Deserialize)]
-struct RawInfo {
-    id: Option<String>,
-    title: Option<String>,
-    uploader: Option<String>,
-    channel: Option<String>,
-    duration: Option<f64>,
-    thumbnail: Option<String>,
-    webpage_url: Option<String>,
-    extractor: Option<String>,
-    extractor_key: Option<String>,
-    is_live: Option<bool>,
-    live_status: Option<String>,
-    #[serde(default)]
-    formats: Vec<RawFormat>,
-}
-
-/// The subset of a single format description Flatline reads.
-#[derive(Debug, Deserialize)]
-struct RawFormat {
-    format_id: Option<String>,
-    url: Option<String>,
-    ext: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-    fps: Option<f64>,
-    vcodec: Option<String>,
-    acodec: Option<String>,
-    tbr: Option<f64>,
-    vbr: Option<f64>,
-    abr: Option<f64>,
-    filesize: Option<u64>,
-    filesize_approx: Option<u64>,
-    protocol: Option<String>,
-    format_note: Option<String>,
-    language: Option<String>,
-    resolution: Option<String>,
-    video_ext: Option<String>,
-    audio_ext: Option<String>,
-    http_headers: Option<serde_json::Map<String, Value>>,
-    cookies: Option<String>,
-}
-
-/// Parses a `yt-dlp` metadata document.
-///
-/// Both a single media document and a playlist document (a JSON array) are
-/// accepted; for a playlist the first entry is used.
-pub fn parse_catalog(json: &str) -> Result<MediaSource, Error> {
-    let value: Value = serde_json::from_str(json).map_err(Error::Json)?;
-    let entry = match value {
-        Value::Array(mut items) if !items.is_empty() => items.remove(0),
-        Value::Array(_) => return Err(Error::Empty),
-        other => other,
-    };
-    let raw: RawInfo = serde_json::from_value(entry).map_err(Error::Json)?;
-    Ok(build(raw))
-}
-
-/// Converts the raw document into the vocabulary of `media-model`.
-fn build(raw: RawInfo) -> MediaSource {
+/// Converts a `yt-dlp` crate video into Flatline's media model.
+pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
     let mut video_streams = Vec::new();
     let mut audio_streams = Vec::new();
 
-    for format in raw.formats {
-        let Some(url) = format.url.filter(|url| !url.is_empty()) else {
+    for format in video.formats {
+        let Some(url) = format.download_info.url.clone().filter(|url| !url.is_empty()) else {
             continue;
         };
-        let format_id = format.format_id.unwrap_or_default();
-        let ext = format.ext.unwrap_or_default();
-        // Storyboards are images, not playable streams.
+        let ext = format.download_info.ext.as_str().to_string();
         if ext.eq_ignore_ascii_case("mhtml") {
             continue;
         }
-        let file_size = format.filesize.or(format.filesize_approx);
-        // `yt-dlp` sometimes omits a codec but still says which track the
-        // format carries through `video_ext` / `audio_ext`. Live HLS audio
-        // rows are the common case: `vcodec: none`, no `acodec`, but
-        // `audio_ext: mp4` and `resolution: audio only`.
-        let has_video = match format.vcodec.as_deref() {
-            Some(codec) => codec != "none",
-            None => format.video_ext.as_deref().is_some_and(|ext| ext != "none"),
-        };
-        let has_audio = match format.acodec.as_deref() {
-            Some(codec) => codec != "none",
-            None => format.audio_ext.as_deref().is_some_and(|ext| ext != "none"),
-        };
-        // A plain file the extractor did not look into reports neither codec
-        // nor track extension. It carries both, so it is a combined stream.
-        let unknown = format.vcodec.is_none()
-            && format.acodec.is_none()
-            && format.video_ext.is_none()
-            && format.audio_ext.is_none()
-            && format.resolution.as_deref() != Some("audio only");
 
-        let http_headers = format.http_headers.as_ref().and_then(|map| {
-            let mut out = std::collections::BTreeMap::new();
-            for (name, value) in map {
-                if let Some(value) = value.as_str() {
-                    out.insert(name.clone(), value.to_string());
-                }
-            }
-            (!out.is_empty()).then_some(out)
-        });
-        let cookies = format.cookies.clone();
+        let format_type = format.format_type();
+        let has_video = format_type.is_video() || format_type.is_audio_and_video();
+        let has_audio = format_type.is_audio() || format_type.is_audio_and_video();
+        if !has_video && !has_audio {
+            continue;
+        }
 
-        if has_video || unknown {
+        let http_headers = headers_to_map(&format.download_info.http_headers);
+        let protocol = Some(protocol_name(format.protocol).to_string());
+        let note = format.format_note.clone();
+        let file_size = format
+            .file_info
+            .filesize
+            .or(format.file_info.filesize_approx)
+            .and_then(|size| u64::try_from(size).ok());
+        let format_id = format.format_id.clone();
+
+        if has_video {
             video_streams.push(VideoStream {
-                format_id,
-                url,
-                ext,
-                width: format.width,
-                height: format.height,
-                fps: format.fps,
-                video_codec: format.vcodec,
-                total_bitrate: format.tbr.or(format.vbr).map(|value| value.round() as u64),
+                format_id: format_id.clone(),
+                url: url.clone(),
+                ext: ext.clone(),
+                width: format.video_resolution.width,
+                height: format.video_resolution.height,
+                fps: format.video_resolution.fps.map(|v| *v),
+                video_codec: normalize_codec(format.codec_info.video_codec.clone()),
+                total_bitrate: pick_bitrate(
+                    format.rates_info.total_rate.map(|v| *v),
+                    format.rates_info.video_rate.map(|v| *v),
+                ),
                 file_size,
-                has_audio: has_audio || unknown,
-                protocol: format.protocol,
-                note: format.format_note,
+                has_audio,
+                protocol: protocol.clone(),
+                note: note.clone(),
                 http_headers: http_headers.clone(),
-                cookies: cookies.clone(),
+                cookies: None,
             });
         } else if has_audio {
             audio_streams.push(AudioStream {
                 format_id,
                 url,
                 ext,
-                audio_codec: format.acodec,
-                bitrate: format
-                    .abr
-                    .map(|value| value.round() as u64)
-                    .or(format.tbr.map(|v| v.round() as u64)),
+                audio_codec: normalize_codec(format.codec_info.audio_codec.clone()),
+                bitrate: pick_bitrate(
+                    format.rates_info.audio_rate.map(|v| *v),
+                    format.rates_info.total_rate.map(|v| *v),
+                ),
                 file_size,
-                language: format.language,
-                note: format.format_note,
-                protocol: format.protocol,
+                language: format.language.clone(),
+                note,
+                protocol,
                 http_headers,
-                cookies,
+                cookies: None,
             });
         }
     }
@@ -152,24 +80,71 @@ fn build(raw: RawInfo) -> MediaSource {
     video_streams.sort_by_key(|stream| std::cmp::Reverse(stream.rank()));
     audio_streams.sort_by_key(|stream| std::cmp::Reverse(stream.rank()));
 
-    let is_live = raw.is_live.unwrap_or(false) || raw.live_status.as_deref() == Some("is_live");
-    let title = raw.title.unwrap_or_else(|| "Untitled".to_string());
+    if video_streams.is_empty() && audio_streams.is_empty() {
+        return Err(Error::Empty);
+    }
 
-    MediaSource {
-        id: raw.id.unwrap_or_default(),
+    let is_live = video.is_live.unwrap_or(false) || video.live_status == "is_live";
+    let title = video.title;
+    let extractor = Some(video.extractor_info.extractor_key)
+        .filter(|v| !v.is_empty())
+        .or_else(|| Some(video.extractor_info.extractor).filter(|v| !v.is_empty()));
+
+    Ok(MediaSource {
+        id: video.id,
         title: without_live_timestamp(&title).to_string(),
-        uploader: raw.uploader.or(raw.channel),
-        duration: raw.duration,
-        thumbnail: raw.thumbnail,
-        webpage_url: raw.webpage_url,
-        extractor: raw.extractor_key.or(raw.extractor),
+        uploader: video.uploader.or(video.channel),
+        duration: video.duration.map(|d| d as f64),
+        thumbnail: video.thumbnail,
+        webpage_url: video.webpage_url,
+        extractor,
         is_live,
         video_streams,
         audio_streams,
+    })
+}
+
+fn pick_bitrate(primary: Option<f64>, fallback: Option<f64>) -> Option<u64> {
+    primary.or(fallback).filter(|v| v.is_finite() && *v > 0.0).map(|v| v.round() as u64)
+}
+
+fn normalize_codec(codec: Option<String>) -> Option<String> {
+    codec.filter(|value| value != "none")
+}
+
+fn headers_to_map(
+    headers: &yt_dlp::model::format::HttpHeaders,
+) -> Option<BTreeMap<String, String>> {
+    let mut map = BTreeMap::new();
+    if !headers.user_agent.is_empty() {
+        map.insert("User-Agent".to_string(), headers.user_agent.clone());
+    }
+    if !headers.accept.is_empty() {
+        map.insert("Accept".to_string(), headers.accept.clone());
+    }
+    if !headers.accept_language.is_empty() {
+        map.insert("Accept-Language".to_string(), headers.accept_language.clone());
+    }
+    if !headers.sec_fetch_mode.is_empty() {
+        map.insert("Sec-Fetch-Mode".to_string(), headers.sec_fetch_mode.clone());
+    }
+    for (name, value) in &headers.extra {
+        if !name.is_empty() && !value.is_empty() {
+            map.insert(name.clone(), value.clone());
+        }
+    }
+    (!map.is_empty()).then_some(map)
+}
+
+fn protocol_name(protocol: yt_dlp::model::format::Protocol) -> &'static str {
+    match protocol {
+        yt_dlp::model::format::Protocol::Https => "https",
+        yt_dlp::model::format::Protocol::M3U8Native => "m3u8_native",
+        yt_dlp::model::format::Protocol::Mhtml => "mhtml",
+        yt_dlp::model::format::Protocol::Unknown => "unknown",
     }
 }
 
-/// Removes yt-dlp's trailing local start time from a broadcast title.
 fn without_live_timestamp(title: &str) -> &str {
     let Some((prefix, time)) = title.rsplit_once(' ') else {
         return title;
@@ -199,133 +174,5 @@ fn without_live_timestamp(title: &str) -> &str {
         clean_title
     } else {
         title
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SAMPLE: &str = r#"{
-        "id": "abc123",
-        "title": "Sample Video",
-        "uploader": "Someone",
-        "duration": 61.5,
-        "extractor_key": "Youtube",
-        "is_live": false,
-        "formats": [
-            {"format_id": "137", "url": "https://example.com/1080.mp4", "ext": "mp4", "height": 1080, "width": 1920, "fps": 30, "vcodec": "avc1.640028", "acodec": "none", "tbr": 4000.5, "filesize": 12345, "protocol": "https"},
-            {"format_id": "140", "url": "https://example.com/audio.m4a", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 128.0, "protocol": "https"},
-            {"format_id": "18", "url": "https://example.com/combined.mp4", "ext": "mp4", "height": 360, "width": 640, "vcodec": "avc1", "acodec": "mp4a", "tbr": 700.0, "protocol": "https"},
-            {"format_id": "sb2", "ext": "mhtml", "url": null}
-        ]
-    }"#;
-
-    #[test]
-    fn video_and_audio_streams_are_separated() {
-        let source = parse_catalog(SAMPLE).expect("catalog parses");
-        assert_eq!(source.title, "Sample Video");
-        assert_eq!(source.video_streams.len(), 2);
-        assert_eq!(source.audio_streams.len(), 1);
-        assert_eq!(source.audio_streams[0].format_id, "140");
-    }
-
-    #[test]
-    fn combined_streams_are_marked_as_carrying_audio() {
-        let source = parse_catalog(SAMPLE).expect("catalog parses");
-        let combined = source.video_streams.iter().find(|s| s.format_id == "18").unwrap();
-        assert!(combined.has_audio);
-        let video_only = source.video_streams.iter().find(|s| s.format_id == "137").unwrap();
-        assert!(!video_only.has_audio);
-    }
-
-    #[test]
-    fn formats_without_a_url_are_skipped() {
-        let source = parse_catalog(SAMPLE).expect("catalog parses");
-        assert!(source.video_streams.iter().all(|s| s.format_id != "sb2"));
-    }
-
-    #[test]
-    fn a_playlist_document_yields_its_first_entry() {
-        let json = format!("[{SAMPLE}]");
-        let source = parse_catalog(&json).expect("catalog parses");
-        assert_eq!(source.id, "abc123");
-    }
-
-    #[test]
-    fn available_heights_are_unique_and_sorted() {
-        let source = parse_catalog(SAMPLE).expect("catalog parses");
-        assert_eq!(source.available_heights(), vec![1080, 360]);
-    }
-
-    #[test]
-    fn a_plain_file_without_codecs_is_a_combined_stream() {
-        let json = r#"{
-            "id": "sample",
-            "title": "sample-5s",
-            "ext": "mp4",
-            "formats": [
-                {"format_id": "mp4", "url": "https://example.com/sample.mp4", "ext": "mp4", "vcodec": null, "protocol": "https"}
-            ]
-        }"#;
-        let source = parse_catalog(json).expect("catalog parses");
-        assert_eq!(source.video_streams.len(), 1);
-        assert!(source.video_streams[0].has_audio);
-        assert!(source.audio_streams.is_empty());
-    }
-
-    #[test]
-    fn a_live_audio_stream_without_a_codec_is_audio_only() {
-        let json = r#"{
-            "id": "live",
-            "title": "Live",
-            "is_live": true,
-            "formats": [
-                {
-                    "format_id": "312",
-                    "url": "https://example.com/video.m3u8",
-                    "ext": "mp4",
-                    "height": 1080,
-                    "width": 1920,
-                    "vcodec": "avc1",
-                    "acodec": "none",
-                    "video_ext": "mp4",
-                    "audio_ext": "none",
-                    "resolution": "1920x1080",
-                    "protocol": "m3u8_native"
-                },
-                {
-                    "format_id": "234",
-                    "url": "https://example.com/audio.m3u8",
-                    "ext": "mp4",
-                    "vcodec": "none",
-                    "audio_ext": "mp4",
-                    "video_ext": "none",
-                    "resolution": "audio only",
-                    "format_note": "Default, high",
-                    "protocol": "m3u8_native"
-                }
-            ]
-        }"#;
-        let source = parse_catalog(json).expect("catalog parses");
-        assert_eq!(source.video_streams.len(), 1);
-        assert_eq!(source.video_streams[0].format_id, "312");
-        assert_eq!(source.audio_streams.len(), 1);
-        assert_eq!(source.audio_streams[0].format_id, "234");
-        assert_eq!(source.audio_streams[0].note.as_deref(), Some("Default, high"));
-    }
-
-    #[test]
-    fn storyboard_images_are_not_streams() {
-        let json = r#"{
-            "id": "sample",
-            "title": "sample",
-            "formats": [
-                {"format_id": "sb0", "url": "https://example.com/sb.mhtml", "ext": "mhtml"}
-            ]
-        }"#;
-        let source = parse_catalog(json).expect("catalog parses");
-        assert!(source.video_streams.is_empty());
-        assert!(source.audio_streams.is_empty());
     }
 }

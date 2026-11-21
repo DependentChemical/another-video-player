@@ -63,7 +63,9 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
 
     let tools = paths.tool_paths();
     let managed = ytdlp_tool::locate::managed(&tools);
-    let ytdlp = managed.clone().unwrap_or_else(|| ytdlp_tool::locate::at(tools.managed_binary()));
+    let ytdlp = managed
+        .clone()
+        .unwrap_or_else(|| ytdlp_tool::locate::at(tools.managed_binary(), tools.clone()));
     ytdlp_tool::locate::stop_leftovers(&ytdlp);
     match &managed {
         Some(_) => app_logging::notice(format!(

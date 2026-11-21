@@ -1,28 +1,32 @@
-//! Discovery, provisioning and self-update of the `yt-dlp` executable.
+//! Discovery, provisioning and metadata access through the `yt-dlp` executable.
 //!
 //! # Layer 1 of the isolation ladder
 //!
-//! This crate owns exactly one capability: *having a working `yt-dlp` at
-//! hand*. It knows nothing about URLs, streams, playback or the user
-//! interface. Other crates receive a plain [`YtDlp`] value and use it as a
-//! black box.
+//! This crate owns exactly one capability: *talking to `yt-dlp`*. It knows
+//! nothing about playback, the user interface or any other Flatline crate
+//! beyond logging. Other crates receive a [`YtDlp`] value and use it as the
+//! single access point for `yt-dlp` work.
 //!
-//! On Unix a `yt-dlp` distribution is a Python zip application, so it needs
-//! an interpreter; on Windows the published `yt-dlp.exe` is self contained.
-//! [`YtDlp`] hides that difference behind [`YtDlp::command`].
+//! The actual metadata fetch is handled by the `yt-dlp` crate underneath;
+//! Flatline keeps control over where the managed executable lives (`tools/`)
+//! and how updates are surfaced to the user.
 
 pub mod locate;
 pub mod platform;
 pub mod update;
 pub mod version;
 
-use std::fmt;
+mod fetch;
 
+use std::fmt;
+use std::path::Path;
+
+pub use fetch::{FetchRequest, FetchResult, is_update_required};
 pub use locate::{ToolPaths, YtDlp};
 pub use platform::Platform;
 pub use update::ToolUpdate;
 
-/// Everything that can go wrong while managing the `yt-dlp` executable.
+/// Everything that can go wrong while managing or running `yt-dlp`.
 #[derive(Debug)]
 pub enum Error {
     /// The operating system refused an operation.
@@ -37,6 +41,8 @@ pub enum Error {
     Parse(String),
     /// The current platform has no supported way to run `yt-dlp`.
     UnsupportedPlatform,
+    /// The `yt-dlp` crate reported an error.
+    YtDlp(String),
 }
 
 impl fmt::Display for Error {
@@ -48,6 +54,7 @@ impl fmt::Display for Error {
             Error::Http(m) => write!(f, "network error: {m}"),
             Error::Parse(m) => write!(f, "could not parse response: {m}"),
             Error::UnsupportedPlatform => write!(f, "yt-dlp is unsupported on this platform"),
+            Error::YtDlp(m) => write!(f, "{m}"),
         }
     }
 }
@@ -58,4 +65,17 @@ impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
         Error::Io(value)
     }
+}
+
+/// Default timeout for metadata resolution.
+pub const RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Resolves a URL into `yt-dlp` video metadata through the singular yt-dlp access point.
+pub async fn fetch(request: FetchRequest) -> Result<FetchResult, Error> {
+    fetch::fetch(request).await
+}
+
+/// Updates the managed yt-dlp executable through the `yt-dlp` crate.
+pub async fn update_managed(program: &Path, output_dir: &Path) -> Result<String, Error> {
+    fetch::update_managed(program, output_dir).await
 }
