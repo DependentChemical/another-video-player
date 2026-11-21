@@ -585,7 +585,7 @@ impl App {
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         app_logging::notice(format!("the library opened at {}", paths.database().display()));
-        let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
+        let cache = ThumbnailCache::new(queue.database(), paths.thumbnails());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1497,21 +1497,33 @@ impl App {
 
             let mut processed = 0;
             for (position, url, path) in legacy {
-                let path = PathBuf::from(path);
-                if path.is_file() {
-                    match cache.register_legacy(&url, &path) {
-                        Ok(new_id) => {
-                            if let Err(error) = queue.set_thumbnail(position, Some(&new_id)) {
-                                app_logging::warning(format!(
-                                    "the active queue entry could not be updated: {error}"
-                                ));
-                            }
-                        }
-                        Err(error) => {
+                let legacy_path = PathBuf::from(&path);
+                let id = ThumbnailCache::thumbnail_id_for(&url);
+                let result = if legacy_path.is_file() {
+                    cache.register_legacy(&url, &legacy_path)
+                } else {
+                    let _ = cache.repair_row(&id);
+                    Ok(id.clone())
+                };
+
+                match result {
+                    Ok(new_id) => {
+                        let has_files = cache.full_path(&new_id).is_some();
+                        let value = has_files.then_some(new_id.as_str());
+                        if let Err(error) = queue.set_thumbnail(position, value) {
                             app_logging::warning(format!(
-                                "a legacy thumbnail could not be migrated: {error}"
+                                "the active queue entry could not be updated: {error}"
+                            ));
+                        } else if !has_files {
+                            app_logging::debug(format!(
+                                "legacy thumbnail missing after move; cleared local path for {url}"
                             ));
                         }
+                    }
+                    Err(error) => {
+                        app_logging::warning(format!(
+                            "a legacy thumbnail could not be migrated: {error}"
+                        ));
                     }
                 }
                 processed += 1;

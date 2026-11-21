@@ -124,9 +124,9 @@ impl AppPaths {
         ytdlp_tool::ToolPaths::new(self.tools())
     }
 
-    /// The directory preview images live in.
+    /// The directory cached thumbnails live in.
     pub fn thumbnails(&self) -> PathBuf {
-        self.root.join("thumbnails")
+        self.cache().join("thumbnails")
     }
 
     /// The SQLite database with the queue and, later, the rest of the library.
@@ -158,8 +158,8 @@ impl AppPaths {
     /// shutdown may have left behind.
     pub fn ensure(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.tools())?;
-        std::fs::create_dir_all(self.thumbnails())?;
         std::fs::create_dir_all(self.cache())?;
+        std::fs::create_dir_all(self.thumbnails())?;
         std::fs::create_dir_all(self.cookies())?;
         std::fs::create_dir_all(self.stream_buffer())?;
         // The browser profile is only needed when a sign-in happens, but an
@@ -255,9 +255,9 @@ mod tests {
     fn the_tools_live_in_a_folder_of_their_own() {
         let paths = AppPaths::with_root("/tmp/flatline");
         assert_eq!(paths.tools(), PathBuf::from("/tmp/flatline").join("tools"));
-        assert_eq!(paths.thumbnails(), PathBuf::from("/tmp/flatline").join("thumbnails"));
-        assert_eq!(paths.database(), PathBuf::from("/tmp/flatline").join("app.db"));
         assert_eq!(paths.cache(), PathBuf::from("/tmp/flatline").join("cache"));
+        assert_eq!(paths.thumbnails(), paths.cache().join("thumbnails"));
+        assert_eq!(paths.database(), PathBuf::from("/tmp/flatline").join("app.db"));
         assert_eq!(paths.stream_buffer(), paths.cache().join("stream_buffer"));
         assert_eq!(paths.log_file(), PathBuf::from("/tmp/flatline").join("flatline.log"));
     }

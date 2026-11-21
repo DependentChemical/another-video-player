@@ -1,15 +1,18 @@
 //! The thumbnail cache.
 //!
 //! Flatline keeps three sized copies of every thumbnail (full, mid and
-//! small) in a `thumbnail_cache` table beside the active queue, so the same
-//! video is never fetched twice and each screen draws the size it actually
-//! needs.
+//! small) under `cache/thumbnails`, so the same video is never fetched twice
+//! and each screen draws the size it actually needs.
 //!
 //! A thumbnail is addressed by a stable id made of a prefix and the hash of
 //! the cleaned video URL (`thumb_<md5>`), so a video that appears in the
 //! queue twice reuses one thumbnail instead of being downloaded twice. The
 //! prefix is what tells a new-style id apart from an old-style direct file
 //! path.
+//!
+//! The database stores only the thumbnail id and remote source URL. File paths
+//! are derived from the cache directory at runtime so the cache remains valid
+//! when the portable application directory moves.
 
 use std::collections::HashSet;
 use std::fs;
@@ -20,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use database::Database;
 use media_model::video_id_hash;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use app_logging;
 
@@ -90,7 +93,7 @@ impl ThumbnailCache {
         format!("{}{}", THUMBNAIL_ID_PREFIX, video_id_hash(video_url))
     }
 
-    /// Ensures the `thumbnail_cache` table exists.
+    /// Ensures the `thumbnail_cache` table exists and migrates older layouts.
     fn ensure_schema(&self) -> Result<(), Error> {
         self.db
             .with_connection(|connection| {
@@ -99,14 +102,12 @@ impl ThumbnailCache {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     thumbnail_id TEXT NOT NULL UNIQUE,
                     source_url TEXT,
-                    full_path TEXT NOT NULL,
-                    mid_path TEXT NOT NULL,
-                    small_path TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS thumbnail_cache_thumbnail_id
                     ON thumbnail_cache(thumbnail_id);",
                 )?;
+                migrate_thumbnail_cache(connection)?;
                 Ok(())
             })
             .map_err(Error::from)
@@ -146,47 +147,29 @@ impl ThumbnailCache {
     /// Returns the full-size thumbnail for `id`, when it is on disk and
     /// readable.
     pub fn full_path(&self, id: &str) -> Option<PathBuf> {
-        let path = match self.db.with_connection(|connection| {
-            connection.query_row(
-                "SELECT full_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0).map(PathBuf::from),
-            )
-        }) {
-            Ok(path) => path,
-            _ => return None,
-        };
+        if !self.thumbnail_exists(id).unwrap_or(false) {
+            return None;
+        }
+        let path = self.full_file(id);
         (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
     }
 
     /// Returns the mid-size thumbnail for `id`, when it is on disk and
     /// readable.
     pub fn mid_path(&self, id: &str) -> Option<PathBuf> {
-        let path = match self.db.with_connection(|connection| {
-            connection.query_row(
-                "SELECT mid_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0).map(PathBuf::from),
-            )
-        }) {
-            Ok(path) => path,
-            _ => return None,
-        };
+        if !self.thumbnail_exists(id).unwrap_or(false) {
+            return None;
+        }
+        let path = self.mid_file(id);
         (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
     }
 
     /// Returns the small thumbnail for `id`, when it is on disk and readable.
     pub fn small_path(&self, id: &str) -> Option<PathBuf> {
-        let path = match self.db.with_connection(|connection| {
-            connection.query_row(
-                "SELECT small_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0).map(PathBuf::from),
-            )
-        }) {
-            Ok(path) => path,
-            _ => return None,
-        };
+        if !self.thumbnail_exists(id).unwrap_or(false) {
+            return None;
+        }
+        let path = self.small_file(id);
         (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
     }
 
@@ -286,16 +269,10 @@ impl ThumbnailCache {
         self.db
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        id,
-                        thumbnail_url,
-                        full_path.to_string_lossy(),
-                        mid_path.to_string_lossy(),
-                        small_path.to_string_lossy(),
-                        now,
-                    ],
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(thumbnail_id) DO UPDATE SET source_url = excluded.source_url",
+                    params![id, thumbnail_url, now],
                 )?;
                 Ok(())
             })
@@ -347,21 +324,17 @@ impl ThumbnailCache {
             .map_err(Error::from)?;
 
         let now = unix_time();
-        self.db.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    legacy_path.to_string_lossy(),
-                    full_path.to_string_lossy(),
-                    mid_path.to_string_lossy(),
-                    small_path.to_string_lossy(),
-                    now,
-                ],
-            )?;
-            Ok(())
-        }).map_err(Error::from)?;
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(thumbnail_id) DO UPDATE SET source_url = COALESCE(thumbnail_cache.source_url, excluded.source_url)",
+                    params![id, Option::<String>::None, now],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)?;
 
         Ok(id)
     }
@@ -393,21 +366,12 @@ impl ThumbnailCache {
             .with_connection(|connection| {
                 let referenced = referenced_thumbnail_ids(connection)?;
 
-                // Every record in the cache.
-                let mut statement = connection.prepare(
-                    "SELECT thumbnail_id, full_path, mid_path, small_path, created_at FROM thumbnail_cache",
-                )?;
-                let rows = statement.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                })?;
+                let mut statement =
+                    connection.prepare("SELECT thumbnail_id, created_at FROM thumbnail_cache")?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
                 for row in rows.filter_map(Result::ok) {
-                    let (id, full, mid, small, created_at) = row;
+                    let (id, created_at) = row;
                     if referenced.contains(&id) {
                         continue;
                     }
@@ -424,9 +388,7 @@ impl ThumbnailCache {
                         "DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1",
                         params![id],
                     );
-                    for path in [&full, &mid, &small] {
-                        let _ = fs::remove_file(Path::new(path));
-                    }
+                    remove_thumbnail_files(&self.directory, &id);
                 }
                 Ok(())
             })
@@ -435,22 +397,6 @@ impl ThumbnailCache {
 
     /// Deletes the thumbnail record `id` and its three image files.
     fn delete_thumbnail(&self, id: &str) -> Result<(), Error> {
-        let paths = self.db.with_connection(|connection| {
-            connection
-                .query_row(
-                    "SELECT full_path, mid_path, small_path FROM thumbnail_cache WHERE thumbnail_id = ?1",
-                    params![id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-        }).map_err(Error::from)?;
-
         let _ = self
             .db
             .with_connection(|connection| {
@@ -458,12 +404,7 @@ impl ThumbnailCache {
                     .execute("DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1", params![id])
             })
             .map_err(Error::from)?;
-
-        if let Some((full, mid, small)) = paths {
-            for path in [&full, &mid, &small] {
-                let _ = fs::remove_file(Path::new(path));
-            }
-        }
+        remove_thumbnail_files(&self.directory, id);
         Ok(())
     }
 
@@ -480,24 +421,10 @@ impl ThumbnailCache {
         let referenced = self
             .db
             .with_connection(|connection| {
-                let mut statement = connection
-                    .prepare("SELECT full_path, mid_path, small_path FROM thumbnail_cache")?;
-                let rows = statement.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                let mut names: HashSet<String> = HashSet::new();
-                for row in rows.filter_map(Result::ok) {
-                    for path in [&row.0, &row.1, &row.2] {
-                        if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
-                            names.insert(name.to_string());
-                        }
-                    }
-                }
-                Ok(names)
+                let mut statement =
+                    connection.prepare("SELECT thumbnail_id FROM thumbnail_cache")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                Ok(rows.filter_map(Result::ok).collect::<HashSet<_>>())
             })
             .map_err(Error::from)?;
         // A thumbnail any playlist still references is kept even when its
@@ -519,15 +446,14 @@ impl ThumbnailCache {
                 Some(name) => name,
                 None => continue,
             };
-            if !referenced.contains(name) {
-                let id = name
-                    .strip_suffix(".mid.jpg")
-                    .or_else(|| name.strip_suffix(".small.jpg"))
-                    .or_else(|| name.strip_suffix(".jpg"))
-                    .unwrap_or(name);
-                if protected_ids.contains(id) {
+            let Some(id) = thumbnail_id_from_file_name(name) else {
+                if name.ends_with(".part") {
                     continue;
                 }
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            if !referenced.contains(&id) && !protected_ids.contains(&id) {
                 let _ = fs::remove_file(&path);
             }
         }
@@ -553,16 +479,9 @@ impl ThumbnailCache {
         self.db
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT OR IGNORE INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        id,
-                        Option::<String>::None,
-                        full.to_string_lossy(),
-                        mid.to_string_lossy(),
-                        small.to_string_lossy(),
-                        now,
-                    ],
+                    "INSERT OR IGNORE INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, Option::<String>::None, now],
                 )?;
                 Ok(())
             })
@@ -594,6 +513,166 @@ impl ThumbnailCache {
     }
 }
 
+/// Migrates older `thumbnail_cache` layouts to the ID-only schema.
+///
+/// Older databases stored absolute `full_path/mid_path/small_path` columns.
+/// The cache is now portable: files live at deterministic names under the
+/// current cache directory and only the thumbnail id/source URL are stored.
+/// Existing rows are preserved, local absolute source paths are scrubbed, and
+/// missing files are copied from old absolute paths when available.
+fn migrate_thumbnail_cache(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(thumbnail_cache)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    if !columns.contains("full_path")
+        && !columns.contains("mid_path")
+        && !columns.contains("small_path")
+    {
+        return Ok(());
+    }
+
+    let cache_directory = thumbnail_cache_directory(connection);
+    let legacy_rows = {
+        let mut statement = connection.prepare(
+            "SELECT thumbnail_id, source_url, full_path, mid_path, small_path, created_at
+             FROM thumbnail_cache",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (id, source_url, full, mid, small, _) in &legacy_rows {
+        if let Some(cache_directory) = cache_directory.as_deref() {
+            migrate_legacy_thumbnail_files(
+                cache_directory,
+                id,
+                full.as_deref(),
+                mid.as_deref(),
+                small.as_deref(),
+            );
+        }
+        let source_url = sanitize_source_url(source_url.as_deref());
+        connection.execute(
+            "UPDATE thumbnail_cache SET source_url = ?2 WHERE thumbnail_id = ?1",
+            params![id, source_url],
+        )?;
+    }
+
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS thumbnail_cache_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thumbnail_id TEXT NOT NULL UNIQUE,
+            source_url TEXT,
+            created_at INTEGER NOT NULL
+        );
+        INSERT OR REPLACE INTO thumbnail_cache_new (id, thumbnail_id, source_url, created_at)
+            SELECT id, thumbnail_id, source_url, created_at FROM thumbnail_cache;
+        DROP TABLE thumbnail_cache;
+        ALTER TABLE thumbnail_cache_new RENAME TO thumbnail_cache;
+        CREATE INDEX IF NOT EXISTS thumbnail_cache_thumbnail_id
+            ON thumbnail_cache(thumbnail_id);",
+    )?;
+    Ok(())
+}
+
+/// Resolves the cache directory from the database path when possible.
+///
+/// The database lives at `<root>/app.db` and thumbnails at
+/// `<root>/cache/thumbnails`.
+fn thumbnail_cache_directory(connection: &Connection) -> Option<PathBuf> {
+    let mut statement = connection.prepare("PRAGMA database_list").ok()?;
+    let mut rows = statement.query([]).ok()?;
+    while let Ok(Some(row)) = rows.next() {
+        let name: String = row.get(1).ok()?;
+        if name != "main" {
+            continue;
+        }
+        let file: String = row.get(2).ok()?;
+        if file.is_empty() {
+            return None;
+        }
+        let root = Path::new(&file).parent()?;
+        return Some(root.join("cache").join("thumbnails"));
+    }
+    None
+}
+
+/// Copies old absolute thumbnail files into the current cache directory.
+fn migrate_legacy_thumbnail_files(
+    cache_directory: &Path,
+    id: &str,
+    full: Option<&str>,
+    mid: Option<&str>,
+    small: Option<&str>,
+) {
+    let _ = fs::create_dir_all(cache_directory);
+    for (target, source) in [
+        (cache_directory.join(format!("{id}.jpg")), full),
+        (cache_directory.join(format!("{id}.mid.jpg")), mid),
+        (cache_directory.join(format!("{id}.small.jpg")), small),
+    ] {
+        if target.is_file() || !is_renderable_jpeg(&target) && target.exists() {
+            continue;
+        }
+        let Some(source) = source else { continue };
+        let source = Path::new(source);
+        if source == target || !source.is_file() || !is_renderable_jpeg(source) {
+            continue;
+        }
+        let _ = fs::copy(source, &target);
+    }
+}
+
+/// Removes machine-local file paths from thumbnail source metadata.
+fn sanitize_source_url(source_url: Option<&str>) -> Option<String> {
+    let value = source_url?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if looks_like_local_path(value) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn looks_like_local_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || value.starts_with("file://")
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+}
+
+/// The thumbnail id encoded in a cache file name.
+fn thumbnail_id_from_file_name(name: &str) -> Option<String> {
+    let id = name
+        .strip_suffix(".mid.jpg")
+        .or_else(|| name.strip_suffix(".small.jpg"))
+        .or_else(|| name.strip_suffix(".jpg"))?;
+    ThumbnailCache::is_thumbnail_id(id).then(|| id.to_string())
+}
+
+/// Removes the three image files owned by a thumbnail id.
+fn remove_thumbnail_files(directory: &Path, id: &str) {
+    for path in [
+        directory.join(format!("{id}.jpg")),
+        directory.join(format!("{id}.mid.jpg")),
+        directory.join(format!("{id}.small.jpg")),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+}
+
 /// Every thumbnail id any playlist entry still points at.
 ///
 /// Thumbnails are shared between the active queue and every user playlist, so
@@ -620,7 +699,7 @@ fn referenced_thumbnail_ids(connection: &Connection) -> rusqlite::Result<HashSet
         match connection.prepare(&sql) {
             Ok(mut statement) => {
                 let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                ids.extend(rows.flatten());
+                ids.extend(rows.flatten().filter(|value| ThumbnailCache::is_thumbnail_id(value)));
             }
             Err(error) if error.to_string().contains("no such table") => {}
             Err(error) => return Err(error),
@@ -747,14 +826,14 @@ mod tests {
             .db
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, "https://example.com/a", full.to_string_lossy(), mid.to_string_lossy(), small.to_string_lossy(), 1],
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, "https://example.com/a", 1],
                 )?;
                 Ok(())
             })
             .unwrap();
-        let orphan = temp.path().join("orphan.jpg");
+        let orphan = temp.path().join("thumb_orphan.jpg");
         write_valid_jpeg(&orphan);
         let stray = temp.path().join("stray.bin");
         fs::write(&stray, b"junk").unwrap();
@@ -862,9 +941,9 @@ mod tests {
             .db
             .with_connection(|connection| {
                 connection.execute(
-                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, "https://example.com/c", "/tmp/full.jpg", "/tmp/mid.jpg", "/tmp/small.jpg", 1],
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![id, "https://example.com/c", 1],
                 )?;
                 Ok(())
             })
@@ -878,5 +957,105 @@ mod tests {
         assert_eq!(new_id, id);
         // The legacy file is left untouched because the id already exists.
         assert!(legacy.exists());
+    }
+
+    #[test]
+    fn cached_paths_are_derived_from_current_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("app.db");
+        let db = Database::open(&db_path).expect("database opens");
+        let old_dir = temp.path().join("old-cache");
+        fs::create_dir_all(&old_dir).unwrap();
+        let cache = ThumbnailCache::new(db.clone(), &old_dir);
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/moved");
+        write_valid_jpeg(&cache.full_file(&id));
+        write_valid_jpeg(&cache.mid_file(&id));
+        write_valid_jpeg(&cache.small_file(&id));
+        db.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at) VALUES (?1, ?2, ?3)",
+                params![id, "https://example.com/moved.jpg", 1],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let moved_dir = temp.path().join("moved-cache");
+        fs::create_dir_all(&moved_dir).unwrap();
+        for suffix in [".jpg", ".mid.jpg", ".small.jpg"] {
+            fs::rename(
+                old_dir.join(format!("{id}{suffix}")),
+                moved_dir.join(format!("{id}{suffix}")),
+            )
+            .unwrap();
+        }
+        let moved_cache = ThumbnailCache::new(db, &moved_dir);
+
+        assert_eq!(moved_cache.full_path(&id), Some(moved_dir.join(format!("{id}.jpg"))));
+        assert_eq!(moved_cache.mid_path(&id), Some(moved_dir.join(format!("{id}.mid.jpg"))));
+        assert_eq!(moved_cache.small_path(&id), Some(moved_dir.join(format!("{id}.small.jpg"))));
+    }
+
+    #[test]
+    fn legacy_absolute_schema_is_migrated_without_redownload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("portable");
+        let cache_dir = root.join("cache").join("thumbnails");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let db_path = root.join("app.db");
+        let db = Database::open(&db_path).expect("database opens");
+        let id = ThumbnailCache::thumbnail_id_for("https://example.com/legacy");
+        let old_full = temp.path().join("old-full.jpg");
+        let old_mid = temp.path().join("old-mid.jpg");
+        let old_small = temp.path().join("old-small.jpg");
+        write_valid_jpeg(&old_full);
+        write_valid_jpeg(&old_mid);
+        write_valid_jpeg(&old_small);
+        db.with_connection(|connection| {
+            connection.execute_batch(
+                "CREATE TABLE thumbnail_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thumbnail_id TEXT NOT NULL UNIQUE,
+                    source_url TEXT,
+                    full_path TEXT NOT NULL,
+                    mid_path TEXT NOT NULL,
+                    small_path TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
+            )?;
+            connection.execute(
+                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, old_full.to_string_lossy(), old_full.to_string_lossy(), old_mid.to_string_lossy(), old_small.to_string_lossy(), 1],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cache = ThumbnailCache::new(db.clone(), &cache_dir);
+
+        assert_eq!(cache.full_path(&id), Some(cache_dir.join(format!("{id}.jpg"))));
+        assert!(cache_dir.join(format!("{id}.mid.jpg")).is_file());
+        assert!(cache_dir.join(format!("{id}.small.jpg")).is_file());
+        let source_url: Option<String> = db
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT source_url FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(source_url, None);
+        let columns: Vec<String> = db
+            .with_connection(|connection| {
+                let mut statement = connection.prepare("PRAGMA table_info(thumbnail_cache)")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "full_path"));
+        assert!(!columns.iter().any(|column| column == "mid_path"));
+        assert!(!columns.iter().any(|column| column == "small_path"));
     }
 }
