@@ -21,9 +21,30 @@ pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
         }
 
         let format_type = format.format_type();
-        let has_video = format_type.is_video() || format_type.is_audio_and_video();
-        let has_audio = format_type.is_audio() || format_type.is_audio_and_video();
-        if !has_video && !has_audio {
+        if format_type.is_storyboard() {
+            continue;
+        }
+
+        let has_video_codec = format.codec_info.video_codec.is_some();
+        let has_audio_codec = format.codec_info.audio_codec.is_some();
+        let has_video_ext = !matches!(
+            format.codec_info.video_ext,
+            yt_dlp::model::format::Extension::None | yt_dlp::model::format::Extension::Unknown
+        );
+        let has_audio_ext = !matches!(
+            format.codec_info.audio_ext,
+            yt_dlp::model::format::Extension::None | yt_dlp::model::format::Extension::Unknown
+        );
+        let resolution_audio_only =
+            format.video_resolution.resolution.as_deref() == Some("audio only");
+        let has_video = has_video_codec || (has_video_ext && !resolution_audio_only);
+        let has_audio = has_audio_codec || has_audio_ext;
+        let unknown = !has_video_codec
+            && !has_audio_codec
+            && !has_video_ext
+            && !has_audio_ext
+            && !resolution_audio_only;
+        if !has_video && !has_audio && !unknown {
             continue;
         }
 
@@ -37,7 +58,8 @@ pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
             .and_then(|size| u64::try_from(size).ok());
         let format_id = format.format_id.clone();
 
-        if has_video {
+        if has_video || unknown {
+            let note = manifest_note(format_type, note);
             video_streams.push(VideoStream {
                 format_id: format_id.clone(),
                 url: url.clone(),
@@ -51,13 +73,14 @@ pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
                     format.rates_info.video_rate.map(|v| *v),
                 ),
                 file_size,
-                has_audio,
+                has_audio: has_audio || unknown,
                 protocol: protocol.clone(),
                 note: note.clone(),
                 http_headers: http_headers.clone(),
                 cookies: None,
             });
         } else if has_audio {
+            let note = manifest_note(format_type, note);
             audio_streams.push(AudioStream {
                 format_id,
                 url,
@@ -145,6 +168,17 @@ fn protocol_name(protocol: yt_dlp::model::format::Protocol) -> &'static str {
     }
 }
 
+fn manifest_note(
+    format_type: yt_dlp::model::format::FormatType,
+    note: Option<String>,
+) -> Option<String> {
+    if format_type.is_manifest() {
+        Some(note.unwrap_or_else(|| "manifest".to_string()))
+    } else {
+        note
+    }
+}
+
 fn without_live_timestamp(title: &str) -> &str {
     let Some((prefix, time)) = title.rsplit_once(' ') else {
         return title;
@@ -174,5 +208,173 @@ fn without_live_timestamp(title: &str) -> &str {
         clean_title
     } else {
         title
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: serde_json::Value) -> Result<MediaSource, Error> {
+        let video: yt_dlp::model::Video = serde_json::from_value(json).expect("valid video json");
+        parse_video(video)
+    }
+
+    fn base_video(formats: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "abc123",
+            "title": "Live test 2026-11-21 21:45",
+            "thumbnail": null,
+            "description": null,
+            "availability": null,
+            "timestamp": null,
+            "duration": null,
+            "duration_string": null,
+            "webpage_url": "https://www.youtube.com/watch?v=abc123",
+            "available_at": null,
+            "language": null,
+            "media_type": null,
+            "is_live": true,
+            "was_live": null,
+            "release_timestamp": null,
+            "release_year": null,
+            "view_count": null,
+            "like_count": null,
+            "comment_count": null,
+            "channel": "Chan",
+            "channel_id": null,
+            "channel_url": null,
+            "channel_follower_count": null,
+            "uploader": null,
+            "uploader_id": null,
+            "uploader_url": null,
+            "channel_is_verified": null,
+            "formats": formats,
+            "thumbnails": [],
+            "automatic_captions": {},
+            "subtitles": {},
+            "chapters": [],
+            "heatmap": null,
+            "tags": [],
+            "categories": [],
+            "age_limit": 0,
+            "_has_drm": null,
+            "live_status": "is_live",
+            "playable_in_embed": true,
+            "extractor": "youtube",
+            "extractor_key": "Youtube",
+            "_version": {"version":"2026.10.26","current_git_head":null,"release_git_head":null,"repository":"yt-dlp/yt-dlp"}
+        })
+    }
+
+    fn format_json(fields: serde_json::Value) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "format": "test",
+            "format_id": "0",
+            "format_note": null,
+            "protocol": "https",
+            "language": null,
+            "has_drm": null,
+            "container": null,
+            "available_at": null,
+            "language_preference": null,
+            "source_preference": null,
+            "acodec": null,
+            "vcodec": null,
+            "audio_ext": "none",
+            "video_ext": "none",
+            "audio_channels": null,
+            "asr": null,
+            "width": null,
+            "height": null,
+            "resolution": null,
+            "fps": null,
+            "aspect_ratio": null,
+            "url": "https://example.com/media",
+            "ext": "mp4",
+            "http_headers": {"User-Agent":"ua","Accept":"*/*","Accept-Language":"en-US,en","Sec-Fetch-Mode":"navigate"},
+            "manifest_url": null,
+            "downloader_options": null,
+            "quality": null,
+            "dynamic_range": null,
+            "filesize_approx": null,
+            "filesize": null,
+            "vbr": null,
+            "abr": null,
+            "tbr": null,
+            "rows": null,
+            "columns": null,
+            "fragments": null
+        });
+        let obj = value.as_object_mut().unwrap();
+        for (k, v) in fields.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        value
+    }
+
+    #[test]
+    fn live_manifest_formats_are_not_dropped() {
+        let source = parse(base_video(serde_json::json!([
+            format_json(serde_json::json!({
+                "format": "95 - 1280x720",
+                "format_id": "95",
+                "url": "https://example.com/manifest.m3u8",
+                "ext": "mp4",
+                "width": 1280,
+                "height": 720,
+                "fps": 30.0,
+                "vcodec": "avc1",
+                "acodec": "mp4a.40.2",
+                "tbr": 2500.0,
+                "protocol": "m3u8_native",
+                "resolution": "1280x720",
+                "video_ext": "mp4",
+                "audio_ext": "none",
+                "manifest_url": "https://example.com/manifest.m3u8"
+            })),
+            format_json(serde_json::json!({
+                "format": "140-drc - audio only",
+                "format_id": "140-drc",
+                "url": "https://example.com/audio.m4a",
+                "ext": "m4a",
+                "vcodec": "none",
+                "acodec": "mp4a.40.2",
+                "abr": 129.0,
+                "protocol": "https",
+                "format_note": "medium",
+                "language": "en",
+                "resolution": "audio only",
+                "video_ext": "none",
+                "audio_ext": "m4a"
+            }))
+        ])))
+        .expect("live manifest should parse");
+
+        assert!(source.is_live);
+        assert_eq!(source.title, "Live test");
+        assert_eq!(source.video_streams.len(), 1);
+        assert_eq!(source.video_streams[0].format_id, "95");
+        assert_eq!(source.video_streams[0].protocol.as_deref(), Some("m3u8_native"));
+        assert_eq!(source.video_streams[0].note.as_deref(), Some("manifest"));
+        assert_eq!(source.audio_streams.len(), 1);
+    }
+
+    #[test]
+    fn storyboard_formats_are_ignored() {
+        let err = parse(base_video(serde_json::json!([format_json(serde_json::json!({
+            "format": "sb0 - storyboard",
+            "format_id": "sb0",
+            "url": "https://example.com/story.mhtml",
+            "ext": "mhtml",
+            "vcodec": "none",
+            "acodec": "none",
+            "protocol": "https",
+            "resolution": "168x94",
+            "video_ext": "none",
+            "audio_ext": "none"
+        }))])))
+        .unwrap_err();
+        assert!(matches!(err, Error::Empty));
     }
 }

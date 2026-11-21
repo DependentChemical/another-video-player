@@ -1,3 +1,4 @@
+﻿#![recursion_limit = "256"]
 //! Resolving a URL into a catalog of playable streams.
 //!
 //! # Layer 1 of the isolation ladder
