@@ -15,7 +15,7 @@ import { HistoryDialog } from "slint-ui/HistoryDialog.slint";
 import { PlaylistDialog } from "slint-ui/PlaylistDialog.slint";
 import { CreatePlaylistDialog } from "slint-ui/CreatePlaylistDialog.slint";
 import {
-    PlaylistItem, StreamItem, QueueItem, HistoryItem, BufferedRange
+    PlaylistItem, StreamItem, QueueItem, HistoryItem, BufferedRange, SponsorSegment
 } from "slint-ui/types.slint";
 
 import "../fonts/Inter.ttf";
@@ -66,6 +66,8 @@ export component MainWindow inherits Window {
     in property <float> duration: 0;
     // The parts of the axis that are already downloaded, as fractions.
     in property <[BufferedRange]> buffered-ranges: [];
+    // The marked segments, such as SponsorBlock spans, as fractions.
+    in property <[SponsorSegment]> sponsor-segments: [];
     in property <float> volume: 100;
     // The playback position, formatted for the user.
     in property <string> time-text: "0:00 / 0:00";
@@ -275,6 +277,7 @@ export component MainWindow inherits Window {
         position: root.position;
         duration: root.duration;
         buffered-ranges: root.buffered-ranges;
+        sponsor-segments: root.sponsor-segments;
         volume: root.volume;
         time-text: root.time-text;
         live: root.live;

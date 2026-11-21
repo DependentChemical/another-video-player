@@ -2185,6 +2185,44 @@ impl App {
         }
     }
 
+    /// The SponsorBlock segments that will be skipped, as fractions of the axis.
+    ///
+    /// Each span is paired with the colour of its category so the interface can
+    /// draw the sections on the scrubber without knowing the category names.
+    pub fn sponsorblock_ranges(&self) -> Vec<(f64, f64, [u8; 3])> {
+        let (segments, is_live) = {
+            let state = self.state.lock().expect("the state is not poisoned");
+            (state.sponsorblock_segments.clone(), state.is_live)
+        };
+        if segments.is_empty() {
+            return Vec::new();
+        }
+
+        let (span, origin) = if is_live {
+            let origin = self.live.lock().expect("the live axis is not poisoned").window_start();
+            (crate::timeline::LIVE_WINDOW, origin)
+        } else {
+            (self.engine.duration(), 0.0)
+        };
+        if span <= 0.0 {
+            return Vec::new();
+        }
+
+        let mut marked = Vec::new();
+        for segment in &segments {
+            if !self.settings.sponsorblock_skip(&segment.category) {
+                continue;
+            }
+            let start = ((segment.start - origin) / span).clamp(0.0, 1.0);
+            let end = ((segment.end - origin) / span).clamp(0.0, 1.0);
+            if end > start {
+                marked.push((start, end, sponsorblock_color(&segment.category)));
+            }
+        }
+        marked.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+        marked
+    }
+
     /// Changes the volume.
     pub fn set_volume(&self, volume: f64) {
         if let Err(error) = self.engine.set_volume(volume) {
@@ -2958,15 +2996,33 @@ fn format_bitrate(kilobits: u64) -> String {
 /// The label shown when a SponsorBlock category is skipped automatically.
 fn sponsorblock_skip_label(category: &str) -> &'static str {
     match category {
-        "sponsor" => "Sponsor Section",
-        "selfpromo" => "Self-Promo Section",
-        "interaction" => "Interaction Section",
-        "intro" => "Intro Section",
-        "outro" => "Outro Section",
-        "preview" => "Preview Section",
-        "hook" => "Hook Section",
-        "filler" => "Filler Section",
+        "sponsor" => "Sponsor",
+        "selfpromo" => "Unpaid/Self Promotion",
+        "interaction" => "Interaction Reminder",
+        "intro" => "Intermission/Intro",
+        "outro" => "Endcards/Credits",
+        "preview" => "Preview/Recap",
+        "hook" => "Hook",
+        "filler" => "Filler Tangent",
         _ => "Segment",
+    }
+}
+
+/// The scrubber colour of a SponsorBlock category.
+///
+/// The colours follow the ones the SponsorBlock web extension uses, so the
+/// segments are recognisable to people who already know them.
+fn sponsorblock_color(category: &str) -> [u8; 3] {
+    match category {
+        "sponsor" => [0, 212, 0],
+        "selfpromo" => [255, 255, 0],
+        "interaction" => [204, 0, 255],
+        "intro" => [0, 255, 255],
+        "outro" => [2, 2, 237],
+        "preview" => [0, 143, 214],
+        "hook" => [57, 86, 153],
+        "filler" => [115, 0, 255],
+        _ => [180, 180, 180],
     }
 }
 

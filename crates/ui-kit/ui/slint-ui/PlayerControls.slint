@@ -1,12 +1,13 @@
 import { Theme } from "../theme.slint";
 import { FlatButton, FullscreenButton, GearButton, LiveButton, PauseIcon, PlayIcon, PreviousIcon, NextIcon, SeekBar, VolumeIcon, VolumeOffIcon } from "../widgets.slint";
-import { BufferedRange } from "types.slint";
+import { BufferedRange, SponsorSegment } from "types.slint";
 
 export component PlayerControls inherits Rectangle {
     in property <bool> playing: false;
     in property <float> position: 0;
     in property <float> duration: 0;
     in property <[BufferedRange]> buffered-ranges: [];
+    in property <[SponsorSegment]> sponsor-segments: [];
     in property <float> volume: 100;
     in property <string> time-text: "0:00 / 0:00";
     in property <bool> live: false;
@@ -180,6 +181,7 @@ export component PlayerControls inherits Rectangle {
                 value: root.position;
                 maximum: root.duration;
                 buffered-ranges: root.buffered-ranges;
+                sponsor-segments: root.sponsor-segments;
                 pointer-activity => { root.pointer-activity(); }
                 moved(value) => {
                     root.seek-requested(value);

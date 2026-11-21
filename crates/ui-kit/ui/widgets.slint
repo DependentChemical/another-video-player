@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { BufferedRange } from "slint-ui/types.slint";
+import { BufferedRange, SponsorSegment } from "slint-ui/types.slint";
 
 // The font that carries the icons.
 //
@@ -419,6 +419,8 @@ export component SeekBar inherits Rectangle {
     in property <float> maximum: 1;
     // The spans that are already downloaded, as fractions of the track.
     in property <[BufferedRange]> buffered-ranges: [];
+    // The marked spans, such as SponsorBlock segments, as fractions of the track.
+    in property <[SponsorSegment]> sponsor-segments: [];
     in property <bool> interactive: true;
     callback moved(float);
     callback pointer-activity();
@@ -446,8 +448,8 @@ export component SeekBar inherits Rectangle {
         background: Theme.border;
     }
 
-    // The downloaded part sits under the played part, so the played part keeps
-    // the accent colour while the run-ahead is visible in a lighter tint.
+    // The downloaded part sits under every marker and the played part, so the
+    // run-ahead is visible behind them in a lighter tint.
     for span in root.buffered-ranges: Rectangle {
         x: 6px + root.track-width * span.start;
         y: (parent.height - self.height) / 2;
@@ -455,6 +457,17 @@ export component SeekBar inherits Rectangle {
         height: 4px;
         border-radius: 2px;
         background: Theme.buffered;
+    }
+
+    // The marked spans sit above the downloaded part but below the played
+    // part, so the current playback always remains the topmost bar.
+    for seg in root.sponsor-segments: Rectangle {
+        x: 6px + root.track-width * seg.start;
+        y: (parent.height - self.height) / 2;
+        width: root.track-width * (seg.end - seg.start);
+        height: 4px;
+        border-radius: 2px;
+        background: seg.color;
     }
 
     fill := Rectangle {

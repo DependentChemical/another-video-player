@@ -485,6 +485,24 @@ impl PlayerUi {
         self.window.set_buffered_ranges(slint::ModelRc::new(slint::VecModel::from(ranges)));
     }
 
+    /// The marked spans on the scrubber, such as SponsorBlock segments.
+    ///
+    /// Each span is a fraction between zero and one of the shown axis, and the
+    /// colour identifies the kind of segment it represents.
+    pub fn set_sponsor_segments(&self, segments: &[(f64, f64, [u8; 3])]) {
+        let segments: Vec<SponsorSegment> = segments
+            .iter()
+            .filter_map(|&(start, end, [red, green, blue])| {
+                (end > start).then_some(SponsorSegment {
+                    start: start as f32,
+                    end: end as f32,
+                    color: slint::Color::from_rgb_u8(red, green, blue),
+                })
+            })
+            .collect();
+        self.window.set_sponsor_segments(slint::ModelRc::new(slint::VecModel::from(segments)));
+    }
+
     /// The volume slider position, from 0 to 100.
     pub fn set_volume(&self, volume: f64) {
         self.window.set_volume(volume as f32);
