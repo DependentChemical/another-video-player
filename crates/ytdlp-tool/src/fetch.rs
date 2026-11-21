@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{Error, RESOLUTION_TIMEOUT, YtDlp};
+use crate::{Error, RESOLUTION_TIMEOUT, SOCKET_TIMEOUT, YtDlp};
 
 /// Metadata resolution request.
 #[derive(Debug, Clone, Default)]
@@ -117,7 +117,9 @@ fn run_fetch(
         bytes
     });
 
-    let deadline = Instant::now() + RESOLUTION_TIMEOUT;
+    let started = Instant::now();
+    let deadline = started + RESOLUTION_TIMEOUT;
+    let mut socket_timeout_logged = false;
     let status = loop {
         if cancel.load(Ordering::SeqCst) {
             crate::locate::terminate_child_process(&mut child);
@@ -129,11 +131,52 @@ fn run_fetch(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) if Instant::now() < deadline => {
+                let elapsed = started.elapsed();
+                if !socket_timeout_logged && elapsed >= SOCKET_TIMEOUT {
+                    socket_timeout_logged = true;
+                    app_logging::warning(format!(
+                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s",
+                        SOCKET_TIMEOUT.as_secs(),
+                        elapsed.as_secs(),
+                        RESOLUTION_TIMEOUT.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
             Ok(None) => {
+                let elapsed = started.elapsed();
                 crate::locate::terminate_child_process(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                let stderr_tail = String::from_utf8_lossy(&stderr);
+                let stdout_tail = String::from_utf8_lossy(&stdout);
+                let stderr_tail = stderr_tail.trim();
+                let stdout_tail = stdout_tail.trim();
+                app_logging::warning(format!(
+                    "yt-dlp hard timeout reached; killing process: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
+                    SOCKET_TIMEOUT.as_secs(),
+                    elapsed.as_secs(),
+                    RESOLUTION_TIMEOUT.as_secs(),
+                    stderr.len(),
+                    stdout.len(),
+                    stderr_tail
+                        .chars()
+                        .rev()
+                        .take(300)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>(),
+                    stdout_tail
+                        .chars()
+                        .rev()
+                        .take(300)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                ));
                 crate::locate::kill_all(tool);
                 pid.store(0, Ordering::SeqCst);
                 return Err(Error::YtDlp(format!(
@@ -179,7 +222,7 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "--no-progress".to_string(),
         "--ignore-config".to_string(),
         "--socket-timeout".to_string(),
-        RESOLUTION_TIMEOUT.as_secs().to_string(),
+        SOCKET_TIMEOUT.as_secs().to_string(),
     ];
     for arg in extra {
         if !args.iter().any(|existing| existing == arg) {
