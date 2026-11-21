@@ -277,7 +277,8 @@ fn wait_for_page(
     closed: &AtomicBool,
 ) -> Wait {
     let deadline = Instant::now() + timeout;
-    let service = Service::from_url(target.as_str());
+    let service = web_session::registry::service_from_url(target.as_str())
+        .or_else(|| Service::from_url(target.as_str()));
     while Instant::now() < deadline {
         if closed.load(Ordering::SeqCst) {
             return Wait::Cancelled;

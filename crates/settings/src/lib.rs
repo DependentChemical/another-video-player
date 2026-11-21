@@ -57,6 +57,7 @@ impl Settings {
 
     /// Parses settings from JSON text.
     pub fn from_json(json: &str) -> Result<Self, Error> {
+        let json = json.strip_prefix('\u{feff}').unwrap_or(json);
         let document: Value =
             serde_json::from_str(json).map_err(|error| Error::Invalid(error.to_string()))?;
         if !document.get("Video-Settings").is_some_and(Value::is_object) {
@@ -100,6 +101,22 @@ impl Settings {
             .filter(|value| !value.is_empty())
             .unwrap_or("NOTICE")
             .to_ascii_uppercase()
+    }
+
+    /// Whether a SponsorBlock category should be skipped during playback.
+    ///
+    /// A category is skipped when its explicit `value` is `true`, or when the
+    /// value is unset/null and its `default` is `true`. Unknown categories
+    /// default to `true` so the player stays safe when settings are extended.
+    pub fn sponsorblock_skip(&self, category: &str) -> bool {
+        let base = format!("/Player-Settings/SponsorBlock/{category}");
+        let value_path = format!("{base}/value");
+        let default_path = format!("{base}/default");
+        self.document
+            .pointer(&value_path)
+            .and_then(Value::as_bool)
+            .or_else(|| self.document.pointer(&default_path).and_then(Value::as_bool))
+            .unwrap_or(true)
     }
 
     /// Chooses a playable stream using the matching site defaults or globals.
@@ -439,6 +456,22 @@ mod tests {
     }
 
     #[test]
+    fn sponsorblock_defaults_to_skip_when_unset() {
+        let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"best","combined":"best"}}}}"#).expect("settings parse");
+        assert!(settings.sponsorblock_skip("sponsor"));
+        assert!(settings.sponsorblock_skip("intro"));
+        assert!(settings.sponsorblock_skip("unknown"));
+    }
+
+    #[test]
+    fn sponsorblock_value_overrides_default() {
+        let settings = Settings::from_json(r#"{"Video-Settings":{},"Player-Settings":{"SponsorBlock":{"sponsor":{"default":true,"value":false},"intro":{"default":false,"value":true},"outro":{"default":false,"value":null}}}}"#).expect("settings parse");
+        assert!(!settings.sponsorblock_skip("sponsor"));
+        assert!(settings.sponsorblock_skip("intro"));
+        assert!(!settings.sponsorblock_skip("outro"));
+    }
+
+    #[test]
     fn site_defaults_override_global_defaults_and_resolution_aliases_work() {
         let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"best","combined":"best"}},"per-site":{"main-list":{"Site":{"regex":"example\\.com","sources-default":{"video":"2k","audio":"default,best","combined":"best"}}}}}}"#).expect("settings parse");
         let selected = settings.select(&source(), "https://example.com/watch").expect("selects");
@@ -568,6 +601,12 @@ mod tests {
         source.audio_streams.clear();
         let settings = Settings::from_json(r#"{"Video-Settings":{"global":{"sources-default":{"video":"best","audio":"best","combined":"best"}}}}"#).expect("settings parse");
         assert!(matches!(settings.select(&source, "https://example.test"), Err(Error::NoStream)));
+    }
+
+    #[test]
+    fn settings_accept_a_utf8_bom() {
+        let json = "\u{feff}{\"Video-Settings\":{\"global\":{\"sources-default\":{\"video\":\"\",\"audio\":\"\",\"combined\":\"\"}},\"per-site\":{\"main-list\":{}}}}";
+        assert!(Settings::from_json(json).is_ok());
     }
 
     #[test]

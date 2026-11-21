@@ -24,10 +24,15 @@ const RULES: &[(&str, &[&str])] = &[
     ("ui-kit", &["app-logging"]),
     ("ytdlp-tool", &["app-logging"]),
     ("updater", &["app-logging"]),
+    ("source-twitch", &["media-model", "web-session"]),
+    ("source-youtube", &["media-model", "web-session"]),
     ("stream-resolver", &["app-logging", "media-model"]),
     ("video-surface", &["app-logging", "playback-engine"]),
     ("web-session", &["app-logging", "media-model"]),
-    ("web-session-view", &["app-logging", "web-session", "media-model"]),
+    (
+        "web-session-view",
+        &["app-logging", "web-session", "media-model", "source-youtube", "source-twitch"],
+    ),
     (
         "app-core",
         &[
@@ -41,6 +46,8 @@ const RULES: &[(&str, &[&str])] = &[
             "ui-kit",
             "video-surface",
             "web-session",
+            "source-youtube",
+            "source-twitch",
             "ytdlp-tool",
             "updater",
         ],

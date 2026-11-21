@@ -12,6 +12,8 @@ authors.workspace = true
 [dependencies]
 media-model = { workspace = true }
 web-session = { workspace = true }
+source-youtube = { workspace = true }
+source-twitch = { workspace = true }
 tauri = { workspace = true }
 url = { workspace = true }
 

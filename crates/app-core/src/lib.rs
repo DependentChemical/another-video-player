@@ -30,10 +30,18 @@ pub use timeline::{LIVE_BUFFER, LIVE_WINDOW, LiveAxis, Timeline};
 /// The version of Flatline, taken from the workspace manifest in `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Registers the internal source plugins so source-specific behavior is used.
+fn register_sources() {
+    static SOURCES: &[&dyn web_session::Source] =
+        &[&source_youtube::SOURCE, &source_twitch::SOURCE];
+    web_session::Sources::new(SOURCES).install();
+}
+
 /// Starts the player.
 ///
 /// When a URL is given, it is loaded right away.
 pub fn run(url: Option<&str>) -> Result<(), Error> {
+    register_sources();
     let paths = AppPaths::discover();
     let logging_level = Settings::load(paths.settings())
         .ok()

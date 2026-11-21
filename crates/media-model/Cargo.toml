@@ -1,14 +1,16 @@
 [package]
 name = "media-model"
-description = "Shared vocabulary for Flatline: media sources, stream catalogs and quality selection."
+description = "Shared data types for Flatline: media sources, stream catalogs, qualities and playback plans."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Layer 0 of the isolation ladder: pure vocabulary, no internal dependencies.
+# Layer 0: this crate is the vocabulary. It must not depend on any other
+# Flatline crate. The `url` dependency is only used to parse URLs for host
+# matching in `Service::from_url`, which keeps the layer 0 rule intact.
 [dependencies]
-serde = { workspace = true }
 md5 = { workspace = true }
+serde = { workspace = true }
 url = { workspace = true }

@@ -54,6 +54,8 @@ pub enum Message {
     ToolUpdateFailed(String),
     /// Something went wrong that the user should know about.
     Problem(String),
+    /// A short informational message shown to the user.
+    Toast(String),
     /// A legacy thumbnail migration started; carries how many entries await processing.
     ThumbnailMigrationStarted { count: usize },
     /// A legacy thumbnail migration finished; carries how many entries were processed.
@@ -125,6 +127,8 @@ pub struct ResolvedMedia {
     pub reason: PlaybackReason,
     /// The resolved source.
     pub source: MediaSource,
+    /// SponsorBlock segments fetched for the media, kept only in memory.
+    pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
 /// A URL that was resolved while another media plays.
@@ -145,6 +149,8 @@ pub struct PendingMedia {
     pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
+    /// SponsorBlock segments fetched for the media, kept only in memory.
+    pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
 /// What the user interface has to show after a media was accepted.
@@ -170,6 +176,8 @@ pub struct Loaded {
     pub uploader: Option<String>,
     /// The full-size cached thumbnail, shown when the media has no video track.
     pub thumbnail: Option<PathBuf>,
+    /// SponsorBlock segments fetched for the media, kept only in memory.
+    pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
 /// What happened when an entry was removed from the active queue.
@@ -259,6 +267,10 @@ struct State {
     resolving_url: Option<String>,
     /// Retry state for the current URL.
     retry: RetryState,
+    /// SponsorBlock segments for the current media, kept only in memory.
+    sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
+    /// Segment range suppressed after a manual seek, played once without auto-skip.
+    sponsorblock_suppressed: Option<(f64, f64)>,
 }
 
 /// Retry state for a URL being resolved or played.
@@ -548,12 +560,18 @@ impl App {
             }
             let message = match result {
                 Ok(source) => {
+                    let sponsorblock_segments = if source_youtube::matches_url(&url) {
+                        source_youtube::sponsorblock::fetch_for_url(&url)
+                    } else {
+                        Vec::new()
+                    };
                     let thumbnail = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     app_logging::debug(format!(
-                        "playback source resolved: url={url} title=\"{}\" streams={} reason={}",
+                        "playback source resolved: url={url} title=\"{}\" streams={} reason={} sponsorblock_segments={}",
                         source.title,
                         source.video_streams.len() + source.audio_streams.len(),
-                        reason.as_str()
+                        reason.as_str(),
+                        sponsorblock_segments.len()
                     ));
                     Message::Resolved(Ok(ResolvedMedia {
                         url: url.clone(),
@@ -561,6 +579,7 @@ impl App {
                         resolved_at: unix_time(),
                         reason,
                         source,
+                        sponsorblock_segments,
                     }))
                 }
                 Err(error) => {
@@ -620,11 +639,17 @@ impl App {
             }
             let message = match result {
                 Ok(source) => {
+                    let sponsorblock_segments = if source_youtube::matches_url(&url) {
+                        source_youtube::sponsorblock::fetch_for_url(&url)
+                    } else {
+                        Vec::new()
+                    };
                     let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
                     let thumbnail = thumbnail_id.as_deref().and_then(|id| cache.mid_path(id));
                     app_logging::debug(format!(
-                        "pending video resolved: url={url} title=\"{}\"",
-                        source.title
+                        "pending video resolved: url={url} title=\"{}\" sponsorblock_segments={}",
+                        source.title,
+                        sponsorblock_segments.len()
                     ));
                     Message::Pending(Ok(PendingMedia {
                         url,
@@ -633,6 +658,7 @@ impl App {
                         thumbnail,
                         thumbnail_id,
                         resolved_at: unix_time(),
+                        sponsorblock_segments,
                     }))
                 }
                 Err(error) => {
@@ -711,6 +737,7 @@ impl App {
             thumbnail,
             pending.resolved_at,
             PlaybackReason::Manual,
+            pending.sponsorblock_segments,
         )?;
         Some((pending.url, loaded))
     }
@@ -1402,6 +1429,8 @@ impl App {
         state.current_thumbnail_url = None;
         state.current_uploader = None;
         state.last_history_save = None;
+        state.sponsorblock_segments.clear();
+        state.sponsorblock_suppressed = None;
     }
 
     /// Removes an entry from the active queue.
@@ -1552,6 +1581,7 @@ impl App {
                 if let (Some(json), Some(resolved_at)) =
                     (entry.resolved_source.as_deref(), entry.resolved_at)
                     && unix_time().saturating_sub(resolved_at) <= RESOLVED_SOURCE_MAX_AGE
+                    && !source_youtube::matches_url(&entry.url)
                     && let Ok(source) = serde_json::from_str::<MediaSource>(json)
                 {
                     app_logging::debug(format!(
@@ -1566,6 +1596,7 @@ impl App {
                         resolved_at,
                         reason,
                         source,
+                        sponsorblock_segments: Vec::new(),
                     }));
                     let _ = self.outbox.lock().map(|sender| sender.send(Box::new(message)));
                 } else {
@@ -1591,6 +1622,7 @@ impl App {
         thumbnail: Option<&str>,
         resolved_at: i64,
         reason: PlaybackReason,
+        sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
     ) -> Option<Loaded> {
         let current = match self.queue.current() {
             Ok(Some(entry)) if entry.url == url => entry,
@@ -1605,6 +1637,20 @@ impl App {
                 return None;
             }
         };
+        // A late retry resolve must not interrupt playback that is already healthy.
+        if reason == PlaybackReason::Retry {
+            let state = self.state.lock().expect("the state is not poisoned");
+            let same_url = state.current_url.as_deref() == Some(url);
+            let playback_healthy = same_url && !self.engine.is_idle();
+            let has_pending_restore = state.pending_restore.seek.is_some();
+            drop(state);
+            if playback_healthy || has_pending_restore {
+                app_logging::debug(format!(
+                    "discarding a stale retry resolve because playback is already active: url={url}"
+                ));
+                return None;
+            }
+        }
         if let Err(error) = self.queue.update_details(
             current.position,
             &source.title,
@@ -1624,7 +1670,14 @@ impl App {
             .thumbnail_id()
             .and_then(|id| self.cache.full_path(id))
             .and_then(|path| path.to_str().map(|s| s.to_string()));
-        Some(self.accept_current_source(source, url, &current, thumbnail_path.as_deref(), reason))
+        Some(self.accept_current_source(
+            source,
+            url,
+            &current,
+            thumbnail_path.as_deref(),
+            reason,
+            sponsorblock_segments,
+        ))
     }
 
     /// Builds playback state for the source already authorized by the queue.
@@ -1635,6 +1688,7 @@ impl App {
         current: &library::QueueEntry,
         thumbnail: Option<&str>,
         reason: PlaybackReason,
+        sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
     ) -> Loaded {
         let sources = source_lists(&source);
         let default_plan = self
@@ -1701,6 +1755,7 @@ impl App {
             thumbnail_url: source.thumbnail.clone(),
             uploader: source.uploader.clone(),
             thumbnail: thumbnail.map(PathBuf::from),
+            sponsorblock_segments: sponsorblock_segments.clone(),
         };
 
         // Compute id_hash for history tracking
@@ -1741,6 +1796,8 @@ impl App {
             state.current_thumbnail_url = loaded.thumbnail_url.clone();
             state.current_uploader = loaded.uploader.clone();
             state.last_history_save = None;
+            state.sponsorblock_segments = sponsorblock_segments;
+            state.sponsorblock_suppressed = None;
             // A successful resolution ends any prior retry cycle.
             state.resolving_url = None;
             if plan.is_some() && state.retry.error_kind != Some(RetryErrorKind::Playback) {
@@ -1986,6 +2043,7 @@ impl App {
         } else {
             seconds
         };
+        self.suppress_sponsorblock_at(target);
         if let Err(error) = self.engine.seek(target) {
             self.report(error.to_string());
         }
@@ -1995,6 +2053,8 @@ impl App {
     ///
     /// This is the fast replay of a live stream.
     pub fn seek_back(&self, seconds: f64) {
+        let target = (self.engine.position() - seconds.abs()).max(0.0);
+        self.suppress_sponsorblock_at(target);
         if let Err(error) = self.engine.seek_relative(-seconds.abs()) {
             self.report(error.to_string());
         }
@@ -2320,7 +2380,7 @@ impl App {
             }
 
             let _ = status_outbox.lock().map(|sender| {
-                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying updateâ€¦".to_string())))
             });
 
             let _guard = match gate.lock() {
@@ -2460,6 +2520,114 @@ impl App {
         }
     }
 
+    /// Applies SponsorBlock skips for the current playback position.
+    ///
+    /// Manual seeks can land inside a skip range to let the user watch it once;
+    /// normal playback skips enabled ranges automatically. Overlapping enabled
+    /// segments are merged so the range is skipped in a single seek.
+    pub fn apply_sponsorblock_skips(&self) {
+        if self.engine.is_idle() {
+            return;
+        }
+        let position = self.engine.position();
+        if !position.is_finite() || position < 0.0 {
+            return;
+        }
+        let duration = self.engine.duration();
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        if state.is_live || state.sponsorblock_segments.is_empty() {
+            state.sponsorblock_suppressed = None;
+            return;
+        }
+        // Wait until the media duration is known and the player is seekable.
+        if !duration.is_finite() || duration <= 0.0 {
+            return;
+        }
+
+        let segments = state.sponsorblock_segments.clone();
+        let ranges = source_youtube::sponsorblock::merged_skip_ranges(&segments, |category| {
+            self.settings.sponsorblock_skip(category)
+        });
+        if ranges.is_empty() {
+            state.sponsorblock_suppressed = None;
+            return;
+        }
+
+        if let Some((start, end)) = state.sponsorblock_suppressed {
+            // While the user-selected (or in-progress) range is playing, do not
+            // auto-skip. Once playback leaves it, normal skip rules resume so a
+            // later scrub back before the range will skip it again.
+            if position + 0.05 >= start && position < end - 0.05 {
+                return;
+            }
+            state.sponsorblock_suppressed = None;
+        }
+
+        let Some(range) = ranges
+            .iter()
+            .find(|range| position + 0.05 >= range.start && position < range.end - 0.05)
+            .cloned()
+        else {
+            return;
+        };
+
+        // Skip to the merged range end in one seek. Wait until the target is
+        // within mpv's reported seekable range to avoid ignored/failed seeks
+        // (e.g. during startup or for segments starting at 0:00).
+        let desired = range.end.min((duration - 0.05).max(0.0));
+        let Some(edge) = self.engine.seekable_end() else {
+            return;
+        };
+        if !edge.is_finite() || edge < desired - 0.05 {
+            return;
+        }
+        let target = desired.min(edge).max(0.0);
+        if target <= position + 0.05 {
+            return;
+        }
+
+        let fully_skippable = target >= range.end - 0.05;
+        // Suppress while the seek is in flight; only keep suppression if we
+        // could not jump past the whole merged range (e.g. near EOF).
+        state.sponsorblock_suppressed =
+            if fully_skippable { None } else { Some((range.start, range.end)) };
+        drop(state);
+
+        app_logging::debug(format!(
+            "skipping SponsorBlock segment during playback: category={} from={position:.3}s to={target:.3}s",
+            range.category
+        ));
+        if let Err(error) = self.engine.seek(target) {
+            app_logging::warning(format!(
+                "failed to auto-skip SponsorBlock segment: category={} target={target:.3}s error={error}",
+                range.category
+            ));
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            if state.sponsorblock_suppressed == Some((range.start, range.end)) {
+                state.sponsorblock_suppressed = None;
+            }
+        } else if fully_skippable {
+            self.toast(format!("Skipped {}", sponsorblock_skip_label(&range.category)));
+        }
+    }
+
+    /// Remembers a manually selected skip range so it can play once.
+    fn suppress_sponsorblock_at(&self, target: f64) {
+        let mut state = self.state.lock().expect("the state is not poisoned");
+        if state.is_live || state.sponsorblock_segments.is_empty() || !target.is_finite() {
+            state.sponsorblock_suppressed = None;
+            return;
+        }
+        let segments = state.sponsorblock_segments.clone();
+        let ranges = source_youtube::sponsorblock::merged_skip_ranges(&segments, |category| {
+            self.settings.sponsorblock_skip(category)
+        });
+        state.sponsorblock_suppressed = ranges
+            .iter()
+            .find(|range| target + 0.05 >= range.start && target < range.end - 0.05)
+            .map(|range| (range.start, range.end));
+    }
+
     /// Takes the messages the background work produced.
     pub fn poll(&self) -> Vec<Message> {
         let mut messages = Vec::new();
@@ -2480,6 +2648,7 @@ impl App {
         self.engine
             .set_pre_buffer(pre_buffer_seconds, is_live)
             .map_err(|error| error.to_string())?;
+
         let request = match &plan.audio {
             Some(audio) => LoadRequest::with_audio(plan.media_url.clone(), audio.url.clone()),
             None => LoadRequest::new(plan.media_url.clone()),
@@ -2490,6 +2659,11 @@ impl App {
     /// Sends a problem to the user interface.
     fn report(&self, text: String) {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
+    }
+
+    /// Sends an informational toast to the user interface.
+    fn toast(&self, text: String) {
+        let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Toast(text))));
     }
 }
 
@@ -2640,7 +2814,7 @@ fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool)
 fn video_label(stream: &media_model::VideoStream) -> String {
     match (stream.width, stream.height) {
         (Some(_), Some(height)) if height >= 720 => format!("{height}p"),
-        (Some(width), Some(height)) => format!("{width}×{height}"),
+        (Some(width), Some(height)) => format!("{width}Ã—{height}"),
         (None, Some(height)) => format!("{height}p"),
         _ => stream.format_id.clone(),
     }
@@ -2650,7 +2824,7 @@ fn video_label(stream: &media_model::VideoStream) -> String {
 fn video_detail(stream: &media_model::VideoStream) -> String {
     let mut parts = Vec::new();
     if let (Some(width), Some(height)) = (stream.width, stream.height) {
-        parts.push(format!("{width}×{height}"));
+        parts.push(format!("{width}Ã—{height}"));
     }
     if let Some(fps) = stream.fps
         && fps > 0.0
@@ -2666,7 +2840,7 @@ fn video_detail(stream: &media_model::VideoStream) -> String {
     if !stream.ext.is_empty() {
         parts.push(stream.ext.clone());
     }
-    parts.join(" · ")
+    parts.join(" Â· ")
 }
 
 /// The prominent label of an audio stream: its bitrate.
@@ -2696,7 +2870,7 @@ fn audio_detail(stream: &media_model::AudioStream) -> String {
         parts.push(note.clone());
     }
     parts.push(stream.format_id.clone());
-    parts.join(" · ")
+    parts.join(" Â· ")
 }
 
 /// Turns a bitrate in kilobits per second into a human line.
@@ -2708,27 +2882,40 @@ fn format_bitrate(kilobits: u64) -> String {
     }
 }
 
+/// The label shown when a SponsorBlock category is skipped automatically.
+fn sponsorblock_skip_label(category: &str) -> &'static str {
+    match category {
+        "sponsor" => "Sponsor Section",
+        "selfpromo" => "Self-Promo Section",
+        "interaction" => "Interaction Section",
+        "intro" => "Intro Section",
+        "outro" => "Outro Section",
+        "preview" => "Preview Section",
+        "hook" => "Hook Section",
+        "filler" => "Filler Section",
+        _ => "Segment",
+    }
+}
+
 /// Describes how `yt-dlp` has to be invoked.
 ///
 /// Every service gets its own cookie file, and a file is only passed when it
 /// contains authentication cookies for that service.
 fn command_spec(ytdlp: &YtDlp, cookies: &std::path::Path) -> CommandSpec {
-    let spec = match ytdlp.interpreter() {
+    let mut spec = match ytdlp.interpreter() {
         Some(interpreter) => CommandSpec::with_interpreter(ytdlp.program(), interpreter),
         None => CommandSpec::new(ytdlp.program()),
     };
-    let youtube = web_session::cookie_file(cookies, Service::YouTube);
-    let twitch = web_session::cookie_file(cookies, Service::Twitch);
-    let spec = if web_session::cookie::signed_in_file(Service::YouTube, &youtube) {
-        spec.with_cookies(Service::YouTube, youtube)
-    } else {
-        spec
-    };
-    if web_session::cookie::signed_in_file(Service::Twitch, &twitch) {
-        spec.with_cookies(Service::Twitch, twitch)
-    } else {
-        spec
+    let services: Vec<Service> = web_session::Sources::installed()
+        .map(|sources| sources.all().iter().map(|source| source.service()).collect())
+        .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
+    for service in services {
+        let path = web_session::cookie_file(cookies, service);
+        if web_session::cookie::signed_in_file(service, &path) {
+            spec = spec.with_cookies(service, path);
+        }
     }
+    spec
 }
 
 /// Resolves a URL with `yt-dlp`, serializing each process run through `gate`.
@@ -3065,7 +3252,7 @@ mod tests {
     fn labels_carry_the_size_the_user_asked_for() {
         let lists = source_lists(&source());
         assert_eq!(lists.video[0].label, "1080p");
-        assert!(lists.video[0].detail.contains("1920×1080"));
+        assert!(lists.video[0].detail.contains("1920Ã—1080"));
         assert!(lists.audio[0].label.contains("128"));
     }
 
