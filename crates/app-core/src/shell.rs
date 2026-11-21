@@ -122,6 +122,7 @@ impl Shell {
         {
             let window = ui.window().window();
             let ui_for_events = Rc::clone(&ui);
+            let app_for_close = Arc::clone(&app);
             let last_pointer_activity = Rc::clone(&last_pointer_activity);
             let mut window_icon = Some(icon);
             window.on_winit_window_event(move |slint_window, event| {
@@ -138,18 +139,23 @@ impl Shell {
                     }
                 }
                 match event {
+                    winit::event::WindowEvent::CloseRequested => {
+                        app_for_close.shutdown();
+                        EventResult::Propagate
+                    }
                     winit::event::WindowEvent::CursorLeft { .. } => {
                         last_pointer_activity.set(Instant::now() - Duration::from_secs(5));
                         if ui_for_events.has_media() && !ui_for_events.controls_popup_open() {
                             ui_for_events.set_controls_visible(false);
                         }
+                        EventResult::Propagate
                     }
                     winit::event::WindowEvent::CursorEntered { .. } => {
                         last_pointer_activity.set(Instant::now());
+                        EventResult::Propagate
                     }
-                    _ => {}
+                    _ => EventResult::Propagate,
                 }
-                EventResult::Propagate
             });
         }
 

@@ -1695,6 +1695,17 @@ impl App {
         state.sponsorblock_suppressed = None;
     }
 
+    /// Performs a clean shutdown: stops playback and kills child processes.
+    /// The tokio runtime is shut down when the App is dropped.
+    pub fn shutdown(&self) {
+        app_logging::notice("shutting down Flatline");
+
+        self.interrupt_playback();
+        self.ytdlp.cancel_all();
+
+        app_logging::notice("Flatline shutdown complete");
+    }
+
     /// Removes an entry from the active queue.
     ///
     /// The entry is identified by its stable database id, so exactly one row
