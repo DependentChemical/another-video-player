@@ -169,7 +169,7 @@ fn run_fetch(
 
     let value: serde_json::Value = serde_json::from_slice(&stdout)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
-    serde_json::from_value(value)
+    deserialize_video_lenient(value)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
 }
 
@@ -204,6 +204,111 @@ fn normalize_args(mut args: Vec<String>) -> Vec<String> {
 fn dummy_ffmpeg_path(output_dir: &Path) -> PathBuf {
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     output_dir.join(name)
+}
+
+fn deserialize_video_lenient(
+    value: serde_json::Value,
+) -> Result<yt_dlp::model::Video, serde_json::Error> {
+    match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
+        Ok(video) => Ok(video),
+        Err(error) if error.to_string().contains("missing field") => {
+            let normalized = normalize_video_value(value);
+            serde_json::from_value(normalized)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn normalize_video_value(mut value: serde_json::Value) -> serde_json::Value {
+    let Some(video) = value.as_object_mut() else {
+        return value;
+    };
+
+    for (key, default) in [
+        ("display_id", serde_json::Value::String(String::new())),
+        ("tags", serde_json::Value::Array(Vec::new())),
+        ("webpage_url_domain", serde_json::Value::String(String::new())),
+        ("extractor", serde_json::Value::String(String::new())),
+        ("extractor_key", serde_json::Value::String(String::new())),
+        ("playlist", serde_json::Value::Null),
+        ("playlist_index", serde_json::Value::Null),
+        ("thumbnail", serde_json::Value::Null),
+        ("duration_string", serde_json::Value::Null),
+        ("release_year", serde_json::Value::Null),
+        ("epoch", serde_json::Value::Null),
+        ("asr", serde_json::Value::Null),
+        ("filesize", serde_json::Value::Null),
+        ("format_id", serde_json::Value::String(String::new())),
+        ("format_note", serde_json::Value::Null),
+        ("source_preference", serde_json::Value::Null),
+        ("audio_channels", serde_json::Value::Null),
+        ("quality", serde_json::Value::Null),
+        ("has_drm", serde_json::Value::Null),
+        ("tbr", serde_json::Value::Null),
+        ("filesize_approx", serde_json::Value::Null),
+        ("url", serde_json::Value::String(String::new())),
+        ("language", serde_json::Value::Null),
+        ("language_preference", serde_json::Value::Null),
+        ("ext", serde_json::Value::String(String::new())),
+        ("vcodec", serde_json::Value::String(String::new())),
+        ("acodec", serde_json::Value::String(String::new())),
+        ("dynamic_range", serde_json::Value::Null),
+        ("downloader_options", serde_json::Value::Null),
+        ("protocol", serde_json::Value::String("https".to_string())),
+        ("video_ext", serde_json::Value::String(String::new())),
+        ("audio_ext", serde_json::Value::String(String::new())),
+        ("resolution", serde_json::Value::Null),
+        ("aspect_ratio", serde_json::Value::Null),
+        ("http_headers", serde_json::json!({})),
+        ("_type", serde_json::Value::Null),
+    ] {
+        video.entry(key.to_string()).or_insert(default);
+    }
+
+    if let Some(formats) = video.get_mut("formats").and_then(|v| v.as_array_mut()) {
+        for format in formats {
+            let Some(obj) = format.as_object_mut() else {
+                continue;
+            };
+            for (key, default) in [
+                ("format_id", serde_json::Value::String(String::new())),
+                ("url", serde_json::Value::String(String::new())),
+                ("ext", serde_json::Value::String(String::new())),
+                ("protocol", serde_json::Value::String("https".to_string())),
+                ("preference", serde_json::Value::Null),
+                ("quality", serde_json::Value::Null),
+                ("has_drm", serde_json::Value::Null),
+                ("language", serde_json::Value::Null),
+                ("language_preference", serde_json::Value::Null),
+                ("format_note", serde_json::Value::Null),
+                ("filesize", serde_json::Value::Null),
+                ("filesize_approx", serde_json::Value::Null),
+                ("vcodec", serde_json::Value::String("none".to_string())),
+                ("acodec", serde_json::Value::String("none".to_string())),
+                ("dynamic_range", serde_json::Value::Null),
+                ("downloader_options", serde_json::Value::Null),
+                ("container", serde_json::Value::Null),
+                ("video_ext", serde_json::Value::String("none".to_string())),
+                ("audio_ext", serde_json::Value::String("none".to_string())),
+                ("resolution", serde_json::Value::Null),
+                ("aspect_ratio", serde_json::Value::Null),
+                ("http_headers", serde_json::json!({})),
+                ("source_preference", serde_json::Value::Null),
+                ("audio_channels", serde_json::Value::Null),
+                ("tbr", serde_json::Value::Null),
+                ("asr", serde_json::Value::Null),
+                ("fps", serde_json::Value::Null),
+                ("height", serde_json::Value::Null),
+                ("width", serde_json::Value::Null),
+                ("vbr", serde_json::Value::Null),
+                ("abr", serde_json::Value::Null),
+            ] {
+                obj.entry(key.to_string()).or_insert(default);
+            }
+        }
+    }
+
+    value
 }
 
 /// Updates the managed yt-dlp executable through the `yt-dlp` crate.
