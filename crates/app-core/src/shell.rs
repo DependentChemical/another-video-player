@@ -16,7 +16,9 @@ use playback_engine::{EndReason, EngineEvent};
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor, winit};
 use slint::{ComponentHandle, Timer, TimerMode};
-use ui_kit::{HistoryListEntry, PlayerUi, PlaylistListEntry, QueueListEntry, StatusKind};
+use ui_kit::{
+    HistoryListEntry, PlayerUi, PlaylistListEntry, QueueListEntry, SourceLists, StatusKind,
+};
 
 use crate::app::{App, Message, RetryKind};
 use crate::loading::{self, Loading};
@@ -87,6 +89,7 @@ impl Shell {
 
         let loading = Rc::new(RefCell::new(Loading::new()));
         let update = Rc::new(RefCell::new(None::<PendingUpdate>));
+        let source_lists = Rc::new(RefCell::new(SourceLists::default()));
         {
             let update = Rc::clone(&update);
             let app = Arc::clone(&app);
@@ -137,7 +140,7 @@ impl Shell {
                 match event {
                     winit::event::WindowEvent::CursorLeft { .. } => {
                         last_pointer_activity.set(Instant::now() - Duration::from_secs(5));
-                        if ui_for_events.has_media() && !ui_for_events.sources_open() {
+                        if ui_for_events.has_media() && !ui_for_events.controls_popup_open() {
                             ui_for_events.set_controls_visible(false);
                         }
                     }
@@ -165,8 +168,10 @@ impl Shell {
             let app = Arc::clone(&app);
             let ui_for_pending = Rc::clone(&ui);
             let loading = Rc::clone(&loading);
+            let source_lists = Rc::clone(&source_lists);
             ui.on_pending_play(move || {
                 if let Some((_, loaded)) = app.play_pending() {
+                    *source_lists.borrow_mut() = loaded.sources.clone();
                     ui_for_pending.set_url("");
                     ui_for_pending.blur_url();
                     ui_for_pending.set_media_title(&loaded.title);
@@ -178,6 +183,12 @@ impl Shell {
                         loaded.audio.as_deref(),
                         loaded.muxed.as_deref(),
                     );
+                    ui_for_pending.set_source_quality_label(&source_quality_label(
+                        &loaded.sources,
+                        loaded.video.as_deref(),
+                        loaded.audio.as_deref(),
+                        loaded.muxed.as_deref(),
+                    ));
                     ui_for_pending.set_has_media(true);
                     ui_for_pending.set_live(loaded.is_live);
                     ui_for_pending.set_video_thumbnail(loaded.thumbnail.as_deref());
@@ -444,13 +455,24 @@ impl Shell {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
             let ui_for_sources = Rc::clone(&ui);
+            let source_lists = Rc::clone(&source_lists);
             ui.on_sources_applied(move |video, audio, muxed| {
                 drain_engine_events(&app, &mut loading.borrow_mut());
                 loading.borrow_mut().sources_switching();
+                ui_for_sources.set_source_quality_label(&source_quality_label(
+                    &source_lists.borrow(),
+                    video.as_deref(),
+                    audio.as_deref(),
+                    muxed.as_deref(),
+                ));
                 ui_for_sources
                     .set_audio_only(video.is_none() && muxed.is_none() && audio.is_some());
                 app.select_sources(video, audio, muxed);
             });
+        }
+        {
+            let app = Arc::clone(&app);
+            ui.on_playback_speed_changed(move |speed| app.set_speed(speed));
         }
         {
             let app = Arc::clone(&app);
@@ -533,10 +555,10 @@ impl Shell {
             let spinner_step = Rc::clone(&spinner_step);
             timer.start(TimerMode::Repeated, TICK, move || {
                 let mut loading = loading.borrow_mut();
-                tick(&ui, &app, &mut loading, &update);
+                tick(&ui, &app, &mut loading, &update, &source_lists);
                 spinner_step.set((spinner_step.get() + 1) % 3);
                 ui.set_spinner_step(spinner_step.get());
-                let visible = ui.sources_open()
+                let visible = ui.controls_popup_open()
                     || (ui.has_media()
                         && (controls_hovered.get()
                             || controls_interacting.get()
@@ -829,6 +851,7 @@ fn tick(
     app: &App,
     loading: &mut Loading,
     update_slot: &Rc<RefCell<Option<PendingUpdate>>>,
+    source_lists: &Rc<RefCell<SourceLists>>,
 ) {
     for message in app.poll() {
         match message {
@@ -881,6 +904,7 @@ fn tick(
                     "the player is ready for url={url} title=\"{}\"",
                     loaded.title
                 ));
+                source_lists.borrow_mut().clone_from(&loaded.sources);
                 ui.set_media_title(&loaded.title);
                 ui.set_media_uploader(loaded.uploader.as_deref().unwrap_or_default());
                 ui.set_sources(&loaded.sources);
@@ -889,6 +913,12 @@ fn tick(
                     loaded.audio.as_deref(),
                     loaded.muxed.as_deref(),
                 );
+                ui.set_source_quality_label(&source_quality_label(
+                    &loaded.sources,
+                    loaded.video.as_deref(),
+                    loaded.audio.as_deref(),
+                    loaded.muxed.as_deref(),
+                ));
                 ui.set_has_media(true);
                 ui.set_live(loaded.is_live);
                 ui.set_video_thumbnail(loaded.thumbnail.as_deref());
@@ -946,10 +976,10 @@ fn tick(
             Message::AppUpdateProgress(progress) => {
                 ui.set_update_installing(true);
                 if progress >= 1.0 {
-                    ui.set_update_status_text("Installing update…");
+                    ui.set_update_status_text("Installing updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
                     ui.set_update_download_progress(1.0);
                 } else {
-                    ui.set_update_status_text("Downloading update…");
+                    ui.set_update_status_text("Downloading updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
                     ui.set_update_download_progress(progress.max(0.0));
                 }
             }
@@ -960,7 +990,7 @@ fn tick(
             }
             Message::ToolUpdateProgress(progress) => {
                 ui.set_update_installing(true);
-                ui.set_update_status_text("Downloading update…");
+                ui.set_update_status_text("Downloading updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
                 ui.set_update_download_progress(progress.max(0.0));
             }
             Message::ToolUpdateStatus(status) => {
@@ -987,7 +1017,9 @@ fn tick(
             }
             Message::Toast(text) => ui.show_toast(&text),
             Message::ThumbnailMigrationStarted { count } => {
-                ui.show_toast(&format!("Migrating {count} thumbnails to the new cache…"));
+                ui.show_toast(&format!(
+                    "Migrating {count} thumbnails to the new cacheÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
+                ));
             }
             Message::ThumbnailMigrationFinished { processed } => {
                 ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));
@@ -1046,6 +1078,8 @@ fn tick(
     ui.set_at_live_edge(timeline.live && timeline.behind <= crate::timeline::LIVE_BUFFER);
     ui.set_playing(playing);
 
+    ui.set_playback_speed(app.speed());
+
     // The volume is read back from the player, so the slider shows what the
     // player really uses and not only what was asked for.
     ui.set_volume(player_to_slider_volume(app.engine().volume()));
@@ -1100,6 +1134,39 @@ fn drain_engine_events(app: &App, loading: &mut Loading) {
     }
 }
 
+/// The label shown in the settings menu for the currently selected source.
+fn source_quality_label(
+    sources: &SourceLists,
+    video: Option<&str>,
+    audio: Option<&str>,
+    muxed: Option<&str>,
+) -> String {
+    if let Some(id) = muxed {
+        return sources
+            .muxed
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.label.clone())
+            .unwrap_or_else(|| "Auto".to_string());
+    }
+    if let Some(id) = video {
+        return sources
+            .video
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.label.clone())
+            .unwrap_or_else(|| "Auto".to_string());
+    }
+    if let Some(id) = audio {
+        return sources
+            .audio
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.label.clone())
+            .unwrap_or_else(|| "Auto".to_string());
+    }
+    "Auto".to_string()
+}
 /// Everything that can go wrong while building the window.
 #[derive(Debug)]
 pub enum Error {
@@ -1185,5 +1252,16 @@ mod tests {
         // Low positions must stay audible rather than collapsing to silence.
         assert!(slider_to_player_volume(5.0) > 30.0);
         assert!(slider_to_player_volume(10.0) > slider_to_player_volume(5.0));
+    }
+
+    #[test]
+    fn source_quality_prefers_video_then_audio() {
+        let sources = ui_kit::SourceLists {
+            video: vec![ui_kit::SourceOption::new("v1", "1080p", "")],
+            audio: vec![ui_kit::SourceOption::new("a1", "128 kb/s", "")],
+            muxed: vec![],
+        };
+        assert_eq!(super::source_quality_label(&sources, Some("v1"), Some("a1"), None), "1080p");
+        assert_eq!(super::source_quality_label(&sources, None, Some("a1"), None), "128 kb/s");
     }
 }

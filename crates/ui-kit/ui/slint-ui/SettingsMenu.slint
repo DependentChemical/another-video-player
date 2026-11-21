@@ -1,0 +1,271 @@
+﻿import { Theme } from "../theme.slint";
+import { ChevronRightIcon, Icon, SpeedIcon, TuneIcon } from "../widgets.slint";
+
+export component SettingsMenu inherits Rectangle {
+    in property <bool> open: false;
+    in property <bool> speed-mode: false;
+    in property <string> source-quality-label: "";
+    in property <float> playback-speed: 1.0;
+    callback close-requested();
+    callback sources-requested();
+    callback speed-mode-requested();
+    callback speed-changed(float);
+
+    width: 280px;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: #000000a6;
+    drop-shadow-blur: 16px;
+    drop-shadow-color: #00000080;
+    visible: root.open;
+
+    private property <float> snapped-speed:
+        Math.abs(root.playback-speed - 0.5) < 0.04 ? 0.5
+        : Math.abs(root.playback-speed - 1.0) < 0.04 ? 1.0
+        : Math.abs(root.playback-speed - 1.5) < 0.04 ? 1.5
+        : Math.abs(root.playback-speed - 2.0) < 0.04 ? 2.0
+        : root.playback-speed;
+    private property <string> speed-label:
+        Math.abs(root.snapped-speed - 1.0) < 0.01 ? "1x"
+        : Math.abs(root.snapped-speed - 0.5) < 0.01 ? "0.5x"
+        : Math.abs(root.snapped-speed - 1.5) < 0.01 ? "1.5x"
+        : Math.abs(root.snapped-speed - 2.0) < 0.01 ? "2x"
+        : Math.round(root.snapped-speed * 100) / 100 + "x";
+
+    function set-speed-from-ratio(ratio: float) {
+        root.speed-changed(clamp(ratio * 2.0, 0.0, 2.0));
+    }
+
+    function snap-speed(speed: float) -> float {
+        Math.abs(speed - 0.5) < 0.06 ? 0.5
+        : Math.abs(speed - 1.0) < 0.06 ? 1.0
+        : Math.abs(speed - 1.5) < 0.06 ? 1.5
+        : Math.abs(speed - 2.0) < 0.06 ? 2.0
+        : speed
+    }
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+
+        if !root.speed-mode: Rectangle {
+            height: 40px;
+            border-radius: 8px;
+            background: sources-touch.pressed ? Theme.elevated : (sources-touch.has-hover ? #ffffff14 : transparent);
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 10px;
+                cross-axis-alignment: center;
+
+                TuneIcon { ink: Theme.fg; }
+
+                Text {
+                    text: "Sources";
+                    color: Theme.fg;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.source-quality-label;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                ChevronRightIcon { ink: Theme.muted; }
+            }
+
+            sources-touch := TouchArea {
+                clicked => { root.sources-requested(); }
+            }
+        }
+
+        if !root.speed-mode: Rectangle {
+            height: 40px;
+            border-radius: 8px;
+            background: speed-touch.pressed ? Theme.elevated : (speed-touch.has-hover ? #ffffff14 : transparent);
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 10px;
+                cross-axis-alignment: center;
+
+                SpeedIcon { ink: Theme.fg; }
+
+                Text {
+                    text: "Playback Speed";
+                    color: Theme.fg;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.speed-label;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                ChevronRightIcon { ink: Theme.muted; }
+            }
+
+            speed-touch := TouchArea {
+                clicked => { root.speed-mode-requested(); }
+            }
+        }
+
+        if root.speed-mode: VerticalLayout {
+            padding: 8px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 8px;
+                cross-axis-alignment: center;
+
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 6px;
+                    background: back-touch.pressed ? Theme.elevated : (back-touch.has-hover ? #ffffff14 : transparent);
+
+                    Icon {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        glyph: "\u{e5cb}";
+                        ink: Theme.fg;
+                    }
+
+                    back-touch := TouchArea {
+                        clicked => { root.close-requested(); }
+                    }
+                }
+
+                Text {
+                    text: "Playback Speed";
+                    color: Theme.fg;
+                    font-size: 13px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Text {
+                    text: root.speed-label;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: 8px;
+                background: #ffffff08;
+
+                VerticalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        height: 18px;
+
+                        track := Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: Theme.border;
+                        }
+
+                        Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            width: parent.width * clamp(root.playback-speed / 2.0, 0.0, 1.0);
+                            height: 4px;
+                            border-radius: 2px;
+                            background: Theme.accent;
+                        }
+
+                        Rectangle {
+                            x: parent.width * 0.25 - self.width / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 4px;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: #ffffff80;
+                        }
+
+                        Rectangle {
+                            x: parent.width * 0.5 - self.width / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 4px;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: #ffffff80;
+                        }
+
+                        Rectangle {
+                            x: parent.width * 0.75 - self.width / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 4px;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: #ffffff80;
+                        }
+
+                        Rectangle {
+                            x: parent.width - self.width;
+                            y: (parent.height - self.height) / 2;
+                            width: 4px;
+                            height: 4px;
+                            border-radius: 2px;
+                            background: #ffffff80;
+                        }
+
+                        knob := Rectangle {
+                            x: parent.width * clamp(root.playback-speed / 2.0, 0.0, 1.0) - self.width / 2;
+                            y: (parent.height - self.height) / 2;
+                            width: 14px;
+                            height: 14px;
+                            border-radius: 7px;
+                            background: speed-area.has-hover || speed-area.pressed ? #5a9bf5 : Theme.accent;
+                        }
+
+                        speed-area := TouchArea {
+                            pointer-event(event) => {
+                                if event.kind == PointerEventKind.down {
+                                    root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
+                                }
+                                if event.kind == PointerEventKind.up {
+                                    root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
+                                }
+                            }
+                            moved => {
+                                root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        Text { text: "0"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; }
+                        Text { text: "0.5"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
+                        Text { text: "1"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
+                        Text { text: "1.5"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
+                        Text { text: "2"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: right; }
+                    }
+                }
+            }
+        }
+    }
+}

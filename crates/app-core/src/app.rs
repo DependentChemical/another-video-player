@@ -2230,6 +2230,18 @@ impl App {
         }
     }
 
+    /// Changes the playback speed.
+    pub fn set_speed(&self, speed: f64) {
+        if let Err(error) = self.engine.set_speed(speed) {
+            self.report(error.to_string());
+        }
+    }
+
+    /// The current playback speed.
+    pub fn speed(&self) -> f64 {
+        self.engine.speed()
+    }
+
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
         self.preempt_ytdlp();

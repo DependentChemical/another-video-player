@@ -60,6 +60,11 @@ fn clamp_volume(volume: f64) -> f64 {
     volume.clamp(0.0, MAX_VOLUME)
 }
 
+/// Keeps a playback speed inside the range the interface exposes.
+fn clamp_speed(speed: f64) -> f64 {
+    speed.clamp(0.0, 2.0)
+}
+
 /// Why playback of a file ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
@@ -463,6 +468,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Sets the playback speed, where `1.0` is the normal rate.
+    ///
+    /// The value is clamped to `0.0..=2.0`, the range the interface exposes.
+    pub fn set_speed(&self, speed: f64) -> Result<(), Error> {
+        self.core.set_property("speed", clamp_speed(speed)).logged("set the playback speed")?;
+        Ok(())
+    }
+
+    /// The current playback speed, where `1.0` is the normal rate.
+    pub fn speed(&self) -> f64 {
+        self.core.get_property::<f64>("speed").unwrap_or(1.0)
+    }
+
     /// Mutes or unmutes the player.
     pub fn set_muted(&self, muted: bool) -> Result<(), Error> {
         self.core.set_property("mute", muted).logged("change the mute state")?;
@@ -766,5 +784,12 @@ mod tests {
         assert_eq!(clamp_volume(-10.0), 0.0);
         assert_eq!(clamp_volume(50.0), 50.0);
         assert_eq!(clamp_volume(250.0), MAX_VOLUME);
+    }
+
+    #[test]
+    fn speed_is_clamped_to_the_player_range() {
+        assert_eq!(clamp_speed(-1.0), 0.0);
+        assert_eq!(clamp_speed(1.0), 1.0);
+        assert_eq!(clamp_speed(3.0), 2.0);
     }
 }
