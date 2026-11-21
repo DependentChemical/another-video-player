@@ -1637,6 +1637,20 @@ impl App {
                 return None;
             }
         };
+        // A late retry resolve must not interrupt playback that is already healthy.
+        if reason == PlaybackReason::Retry {
+            let state = self.state.lock().expect("the state is not poisoned");
+            let same_url = state.current_url.as_deref() == Some(url);
+            let playback_healthy = same_url && !self.engine.is_idle();
+            let has_pending_restore = state.pending_restore.seek.is_some();
+            drop(state);
+            if playback_healthy || has_pending_restore {
+                app_logging::debug(format!(
+                    "discarding a stale retry resolve because playback is already active: url={url}"
+                ));
+                return None;
+            }
+        }
         if let Err(error) = self.queue.update_details(
             current.position,
             &source.title,

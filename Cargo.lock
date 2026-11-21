@@ -263,7 +263,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-core"
-version = "0.4.47"
+version = "0.4.48"
 dependencies = [
  "app-logging",
  "image",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "app-logging"
-version = "0.4.47"
+version = "0.4.48"
 
 [[package]]
 name = "arbitrary"
