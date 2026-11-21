@@ -22,6 +22,8 @@ use database::Database;
 use media_model::video_id_hash;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use app_logging;
+
 use crate::Error;
 use image_process::{is_renderable_jpeg, normalize_to_jpeg, write_scaled_jpeg};
 
@@ -203,10 +205,16 @@ impl ThumbnailCache {
         }
         // Remove any broken row/files before re-downloading.
         if self.thumbnail_exists(&id)? {
+            app_logging::warning(format!(
+                "thumbnail cache row broken for {id}; deleting before re-download"
+            ));
             let _ = self.delete_thumbnail(&id);
         }
         let Some(thumbnail_url) = thumbnail_url else {
-            return Ok(id);
+            app_logging::warning(format!(
+                "thumbnail download skipped for {video_url}: no thumbnail URL"
+            ));
+            return Err(Error::Http("missing thumbnail URL".to_string()));
         };
 
         let full_path = self.full_file(&id);
@@ -223,45 +231,77 @@ impl ThumbnailCache {
         let _scratch = ScratchFile(&temporary);
 
         {
+            app_logging::debug(format!("thumbnail download started: {thumbnail_url}"));
             let mut response = ureq::get(thumbnail_url)
                 .header("User-Agent", USER_AGENT)
                 .config()
                 .timeout_global(Some(DOWNLOAD_TIMEOUT))
                 .build()
                 .call()
-                .map_err(|error| Error::Http(error.to_string()))?;
+                .map_err(|error| {
+                    let message = error.to_string();
+                    app_logging::warning(format!(
+                        "thumbnail download request failed for {thumbnail_url}: {message}"
+                    ));
+                    Error::Http(message)
+                })?;
             let mut file = fs::File::create(&temporary)?;
             let mut reader = response.body_mut().as_reader();
-            io::copy(&mut reader, &mut file)?;
+            io::copy(&mut reader, &mut file).map_err(|error| {
+                app_logging::warning(format!(
+                    "thumbnail download write failed for {thumbnail_url}: {error}"
+                ));
+                error
+            })?;
             file.sync_all()?;
         }
 
         // Normalize to full-size JPEG, then derive the mid and small copies
         // by fitting each inside its target dimensions without distorting the
         // aspect ratio. The source download is removed by the normalizer.
-        normalize_to_jpeg(&temporary, &full_path)?;
-        write_scaled_jpeg(&full_path, &mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT)
-            .map_err(Error::from)?;
-        write_scaled_jpeg(&full_path, &small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT)
-            .map_err(Error::from)?;
+        normalize_to_jpeg(&temporary, &full_path).map_err(|error| {
+            app_logging::warning(format!(
+                "thumbnail normalize failed for {thumbnail_url}: {error}"
+            ));
+            Error::from(error)
+        })?;
+        write_scaled_jpeg(&full_path, &mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT).map_err(
+            |error| {
+                app_logging::warning(format!(
+                    "thumbnail mid resize failed for {thumbnail_url}: {error}"
+                ));
+                Error::from(error)
+            },
+        )?;
+        write_scaled_jpeg(&full_path, &small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT).map_err(
+            |error| {
+                app_logging::warning(format!(
+                    "thumbnail small resize failed for {thumbnail_url}: {error}"
+                ));
+                Error::from(error)
+            },
+        )?;
 
         let now = unix_time();
-        self.db.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    thumbnail_url,
-                    full_path.to_string_lossy(),
-                    mid_path.to_string_lossy(),
-                    small_path.to_string_lossy(),
-                    now,
-                ],
-            )?;
-            Ok(())
-        }).map_err(Error::from)?;
+        self.db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, full_path, mid_path, small_path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id,
+                        thumbnail_url,
+                        full_path.to_string_lossy(),
+                        mid_path.to_string_lossy(),
+                        small_path.to_string_lossy(),
+                        now,
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(Error::from)?;
 
+        app_logging::debug(format!("thumbnail download cached: {thumbnail_url} -> {id}"));
         Ok(id)
     }
 
@@ -335,6 +375,7 @@ impl ThumbnailCache {
             .map_err(Error::from)?;
 
         if !referenced {
+            app_logging::debug(format!("thumbnail cache releasing thumbnail: {id}"));
             self.delete_thumbnail(id)?;
         }
         Ok(())
@@ -342,14 +383,19 @@ impl ThumbnailCache {
 
     /// Deletes every thumbnail record and image file that no entry in any
     /// playlist points at.
+    ///
+    /// Recently created rows are left alone for a short grace period so a
+    /// background download that has written the cache row but not yet attached
+    /// it to a queue entry cannot be deleted out from under it.
     pub fn release_unreferenced_thumbnails(&self) -> Result<(), Error> {
+        let now = unix_time();
         self.db
             .with_connection(|connection| {
                 let referenced = referenced_thumbnail_ids(connection)?;
 
                 // Every record in the cache.
                 let mut statement = connection.prepare(
-                    "SELECT thumbnail_id, full_path, mid_path, small_path FROM thumbnail_cache",
+                    "SELECT thumbnail_id, full_path, mid_path, small_path, created_at FROM thumbnail_cache",
                 )?;
                 let rows = statement.query_map([], |row| {
                     Ok((
@@ -357,18 +403,29 @@ impl ThumbnailCache {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 })?;
                 for row in rows.filter_map(Result::ok) {
-                    let (id, full, mid, small) = row;
-                    if !referenced.contains(&id) {
-                        let _ = connection.execute(
-                            "DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1",
-                            params![id],
-                        );
-                        for path in [&full, &mid, &small] {
-                            let _ = fs::remove_file(Path::new(path));
-                        }
+                    let (id, full, mid, small, created_at) = row;
+                    if referenced.contains(&id) {
+                        continue;
+                    }
+                    if now.saturating_sub(created_at) < 300 {
+                        app_logging::debug(format!(
+                            "thumbnail cache keeping unreferenced recent row: {id}"
+                        ));
+                        continue;
+                    }
+                    app_logging::warning(format!(
+                        "thumbnail cache releasing unreferenced thumbnail: {id}"
+                    ));
+                    let _ = connection.execute(
+                        "DELETE FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                        params![id],
+                    );
+                    for path in [&full, &mid, &small] {
+                        let _ = fs::remove_file(Path::new(path));
                     }
                 }
                 Ok(())

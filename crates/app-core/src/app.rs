@@ -208,8 +208,8 @@ const MAX_RETRY_ATTEMPTS: u32 = 6;
 /// Retry delay for all yt-dlp/network/player failures. Immediate by design.
 const RETRY_DELAY: Duration = Duration::from_secs(0);
 
-/// How long the background thumbnail pass waits between downloads.
-const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(30);
+/// How long the background thumbnail pass waits between downloads or retries.
+const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -1532,23 +1532,11 @@ impl App {
     ///
     /// Entries that already hold a valid cached thumbnail are skipped; the rest
     /// are downloaded one at a time, slowly, so the cache is rebuilt without
-    /// blocking playback or the interface. The start is reported to the user
-    /// through [`Message::ThumbnailRefreshStarted`].
+    /// blocking playback or the interface. Failures and preemption do not stop
+    /// the pass: it waits and retries until the queue is satisfied or work is
+    /// no longer possible. The start is reported to the user through
+    /// [`Message::ThumbnailRefreshStarted`].
     pub fn refresh_queue_thumbnails(&self) {
-        let entries = match self.queue.entries() {
-            Ok(entries) => entries,
-            Err(error) => {
-                app_logging::error(format!("the active queue could not be read: {error}"));
-                return;
-            }
-        };
-        let due = entries_needing_thumbnails(&entries, &self.cache);
-        if due.is_empty() {
-            return;
-        }
-
-        let count = due.len();
-        app_logging::debug(format!("refreshing {count} queue thumbnails in the background"));
         let cache = self.cache.clone();
         let queue = self.queue.clone();
         let outbox = Arc::clone(&self.outbox);
@@ -1560,93 +1548,77 @@ impl App {
         let task_handle = handle.clone();
 
         handle.spawn_blocking(move || {
-            let _ = outbox
-                .lock()
-                .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
-
-            let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
-            for (position, url, thumbnail_url) in due {
-                loop {
-                    if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
-                        app_logging::debug("the thumbnail refresh yielded to manual work");
-                        return;
-                    }
-                    if let Some((cancel, pid)) = ytdlp.try_begin_thumbnail() {
-                        match cache.fetch(&url, Some(&thumbnail_url)) {
-                            Ok(id) => {
-                                if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                                    app_logging::warning(format!(
-                                        "the active queue entry could not be updated: {error}"
-                                    ));
-                                }
-                                ytdlp.finish_thumbnail(&cancel);
-                                std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
-                                break;
-                            }
-                            Err(error) => {
-                                app_logging::debug(format!(
-                                    "a queue thumbnail direct download failed for {url}: {error}; trying yt-dlp refresh"
-                                ));
-                            }
-                        }
-
-                        let sender = outbox.lock().expect("outbox poisoned").clone();
-                        let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
-                        let resolved = task_handle.block_on(resolve_with_session(
-                            &resolver,
-                            &session,
-                            &ytdlp_epoch,
-                            pass_epoch,
-                            &cancel,
-                            &pid,
-                            &url,
-                            &sender,
+            let mut announced = false;
+            loop {
+                let entries = match queue.entries() {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        app_logging::error(format!(
+                            "thumbnail refresh could not read the active queue: {error}"
                         ));
-                        ytdlp.finish_thumbnail(&cancel);
-                        match resolved {
-                            Ok(source) => {
-                                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch
-                                    || cancel.load(Ordering::SeqCst)
-                                {
-                                    break;
-                                }
-                                if let Some(new_thumb) = source.thumbnail.as_deref() {
-                                    let _ = queue.update_details(
-                                        position,
-                                        &source.title,
-                                        None,
-                                        Some(new_thumb),
-                                        source.uploader.as_deref(),
-                                    );
-                                    match cache.fetch(&url, Some(new_thumb)) {
-                                        Ok(id) => {
-                                            if let Err(error) =
-                                                queue.set_thumbnail(position, Some(&id))
-                                            {
-                                                app_logging::warning(format!(
-                                                    "the active queue entry could not be updated: {error}"
-                                                ));
-                                            }
-                                        }
-                                        Err(error) => {
-                                            app_logging::warning(format!(
-                                                "a queue thumbnail could not be refreshed after yt-dlp: {error}"
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            Err(stream_resolver::Error::Cancelled) => {}
-                            Err(error) => {
-                                app_logging::warning(format!(
-                                    "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
-                                ));
-                            }
-                        }
                         std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
-                        break;
+                        continue;
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                };
+                let due = entries_needing_thumbnails(&entries, &cache);
+                if due.is_empty() {
+                    if announced {
+                        app_logging::notice("thumbnail refresh finished: queue thumbnails are cached");
+                    }
+                    return;
+                }
+
+                if !announced {
+                    let count = due.len();
+                    app_logging::notice(format!(
+                        "refreshing {count} queue thumbnails in the background"
+                    ));
+                    let _ = outbox.lock().map(|sender| {
+                        sender.send(Box::new(Message::ThumbnailRefreshStarted { count }))
+                    });
+                    announced = true;
+                }
+
+                let mut progressed = false;
+                for (position, url, thumbnail_url) in due {
+                    let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
+                    let outcome = refresh_thumbnail_entry(
+                        &cache,
+                        &queue,
+                        &resolver,
+                        &session,
+                        &ytdlp_epoch,
+                        pass_epoch,
+                        &ytdlp,
+                        &task_handle,
+                        &outbox,
+                        position,
+                        &url,
+                        &thumbnail_url,
+                    );
+                    match outcome {
+                        ThumbnailRefreshOutcome::Completed => {
+                            progressed = true;
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        }
+                        ThumbnailRefreshOutcome::Preempted => {
+                            app_logging::debug(
+                                "thumbnail refresh yielded to higher-priority yt-dlp work; retrying in 5s",
+                            );
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                            break;
+                        }
+                        ThumbnailRefreshOutcome::RetryLater(error) => {
+                            app_logging::warning(format!(
+                                "thumbnail refresh failed for {url}; retrying in 5s: {error}"
+                            ));
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        }
+                    }
+                }
+
+                if !progressed {
+                    std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                 }
             }
         });
@@ -3019,6 +2991,131 @@ fn clear_stream_buffer(directory: &Path) {
         };
         if let Err(error) = result {
             app_logging::warning(format!("a stream buffer file could not be removed: {error}"));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ThumbnailRefreshOutcome {
+    Completed,
+    Preempted,
+    RetryLater(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_thumbnail_entry(
+    cache: &ThumbnailCache,
+    queue: &Queue,
+    resolver: &Arc<Mutex<Resolver>>,
+    session: &Session,
+    ytdlp_epoch: &Arc<AtomicU64>,
+    pass_epoch: u64,
+    ytdlp: &Arc<YtdlpControl>,
+    task_handle: &tokio::runtime::Handle,
+    outbox: &Arc<Mutex<Sender<Box<Message>>>>,
+    position: i64,
+    url: &str,
+    thumbnail_url: &str,
+) -> ThumbnailRefreshOutcome {
+    loop {
+        if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
+            return ThumbnailRefreshOutcome::Preempted;
+        }
+        let Some((cancel, pid)) = ytdlp.try_begin_thumbnail() else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+
+        app_logging::debug(format!("thumbnail refresh: downloading {url}"));
+        match cache.fetch(url, Some(thumbnail_url)) {
+            Ok(id) => {
+                if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                    let message =
+                        format!("thumbnail refresh could not update queue entry: {error}");
+                    app_logging::warning(message.clone());
+                    ytdlp.finish_thumbnail(&cancel);
+                    return ThumbnailRefreshOutcome::RetryLater(message);
+                }
+                ytdlp.finish_thumbnail(&cancel);
+                app_logging::debug(format!("thumbnail refresh: cached {url} as {id}"));
+                return ThumbnailRefreshOutcome::Completed;
+            }
+            Err(error) => {
+                app_logging::warning(format!(
+                    "thumbnail refresh direct download failed for {url}: {error}; trying yt-dlp refresh"
+                ));
+            }
+        }
+
+        let sender = outbox.lock().expect("outbox poisoned").clone();
+        let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolved = task_handle.block_on(resolve_with_session(
+            &resolver,
+            session,
+            ytdlp_epoch,
+            pass_epoch,
+            &cancel,
+            &pid,
+            url,
+            &sender,
+        ));
+        ytdlp.finish_thumbnail(&cancel);
+
+        match resolved {
+            Ok(source) => {
+                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch || cancel.load(Ordering::SeqCst)
+                {
+                    return ThumbnailRefreshOutcome::Preempted;
+                }
+                let Some(new_thumb) = source.thumbnail.as_deref() else {
+                    let message = "yt-dlp refresh returned no thumbnail URL".to_string();
+                    app_logging::warning(format!("thumbnail refresh: {message} for {url}"));
+                    return ThumbnailRefreshOutcome::RetryLater(message);
+                };
+
+                if let Err(error) = queue.update_details(
+                    position,
+                    &source.title,
+                    None,
+                    Some(new_thumb),
+                    source.uploader.as_deref(),
+                ) {
+                    app_logging::warning(format!(
+                        "thumbnail refresh could not update queue details for {url}: {error}"
+                    ));
+                }
+
+                match cache.fetch(url, Some(new_thumb)) {
+                    Ok(id) => {
+                        if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                            let message =
+                                format!("thumbnail refresh could not update queue entry: {error}");
+                            app_logging::warning(message.clone());
+                            return ThumbnailRefreshOutcome::RetryLater(message);
+                        }
+                        app_logging::notice(format!(
+                            "thumbnail refresh: recovered {url} via yt-dlp"
+                        ));
+                        return ThumbnailRefreshOutcome::Completed;
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("thumbnail download after yt-dlp refresh failed: {error}");
+                        app_logging::warning(format!(
+                            "thumbnail refresh failed for {url}: {message}"
+                        ));
+                        return ThumbnailRefreshOutcome::RetryLater(message);
+                    }
+                }
+            }
+            Err(stream_resolver::Error::Cancelled) => {
+                return ThumbnailRefreshOutcome::Preempted;
+            }
+            Err(error) => {
+                let message = format!("yt-dlp re-resolve failed: {error}");
+                app_logging::warning(format!("thumbnail refresh failed for {url}: {message}"));
+                return ThumbnailRefreshOutcome::RetryLater(message);
+            }
         }
     }
 }
