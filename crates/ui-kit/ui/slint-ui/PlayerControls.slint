@@ -279,9 +279,14 @@ export component PlayerControls inherits Rectangle {
         }
     }
 
+    // The settings popup opens on top of the control bar, like the options
+    // menu of a YouTube video: the panel sits at the bottom of a rect that
+    // reaches up above the bar, so the menu is visible while the bar stays
+    // in reach for the gear button.
     if root.settings-open: Rectangle {
         width: root.width;
-        height: root.container-height + root.height;
+        height: root.height + 280px;
+        y: -280px;
         background: transparent;
 
         TouchArea {
@@ -296,7 +301,6 @@ export component PlayerControls inherits Rectangle {
             padding-left: 12px;
             padding-right: 12px;
             padding-top: 12px;
-            padding-bottom: Theme.controls-height + 8px;
             alignment: end;
 
             HorizontalLayout {
