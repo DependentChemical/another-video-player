@@ -249,109 +249,189 @@ fn dummy_ffmpeg_path(output_dir: &Path) -> PathBuf {
     output_dir.join(name)
 }
 
+/// Maximum number of repair passes before giving up.
+const MAX_MISSING_FIELD_REPAIRS: usize = 32;
+
+/// Parses `yt-dlp` video metadata, tolerating extractors that omit fields the
+/// `yt-dlp` model marks as required.
+///
+/// Extractors from any source occasionally return metadata without fields the
+/// model needs, so a missing-field error triggers a retry with the field
+/// filled in; the next error's missing-field name is extracted and repaired
+/// in turn, until the document parses or a real type error surfaces.
 fn deserialize_video_lenient(
     value: serde_json::Value,
 ) -> Result<yt_dlp::model::Video, serde_json::Error> {
-    match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
-        Ok(video) => Ok(video),
-        Err(error) if error.to_string().contains("missing field") => {
-            let normalized = normalize_video_value(value);
-            serde_json::from_value(normalized)
+    let mut value = value;
+    for _ in 0..MAX_MISSING_FIELD_REPAIRS {
+        let error = match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
+            Ok(video) => return Ok(video),
+            Err(error) => error,
+        };
+        let Some(field) = missing_field_name(&error) else {
+            return Err(error);
+        };
+        if !try_fills(&mut value, &field) {
+            return Err(error);
         }
-        Err(error) => Err(error),
+    }
+    serde_json::from_value::<yt_dlp::model::Video>(value)
+}
+
+/// Extracts the field name from a serde missing-field error message.
+fn missing_field_name(error: &serde_json::Error) -> Option<String> {
+    let message = error.to_string();
+    let marker = "missing field `";
+    let start = message.find(marker)? + marker.len();
+    let end = message[start..].find('`')? + start;
+    let name = &message[start..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Tries filling `field`'s typed default into the objects lacking it, in
+/// tree order, until the tree parses or the candidates run out.
+///
+/// A fill is kept only when the next parse reports a different missing field;
+/// fills that break the tree (structs that absorb unknown keys with other
+/// types, the flattened `HttpHeaders.extra` map, for example) are undone and
+/// the next lacking object is tried. Returns whether any fill was kept.
+fn try_fills(value: &mut serde_json::Value, field: &str) -> bool {
+    let mut kept = false;
+    for path in lacking_paths(value, field) {
+        let default = missing_field_default(field);
+        set_lacking(value, &path, field, default);
+        match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
+            Ok(_) => return true,
+            Err(error) if missing_field_name(&error).is_some() => kept = true,
+            Err(_) => remove_at(value, &path, field),
+        }
+        if kept {
+            break;
+        }
+    }
+    kept
+}
+
+/// A step from the root of the value tree to the object it identifies.
+#[derive(Clone)]
+enum PathSeg {
+    /// An object member key.
+    Key(String),
+    /// An array element index.
+    Index(usize),
+}
+
+/// Paths to every object in the tree that lacks `field`, in pre-order.
+fn lacking_paths(value: &serde_json::Value, field: &str) -> Vec<Vec<PathSeg>> {
+    let mut paths = Vec::new();
+    collect_lacking(value, field, &mut Vec::new(), &mut paths);
+    paths
+}
+
+/// Records the path of every object that lacks `field`, recursing into the
+/// values of objects that lack it themselves.
+fn collect_lacking(
+    value: &serde_json::Value,
+    field: &str,
+    path: &mut Vec<PathSeg>,
+    paths: &mut Vec<Vec<PathSeg>>,
+) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if !object.contains_key(field) {
+                paths.push(path.clone());
+            }
+            for (key, nested) in object {
+                path.push(PathSeg::Key(key.clone()));
+                collect_lacking(nested, field, path, paths);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(PathSeg::Index(index));
+                collect_lacking(item, field, path, paths);
+                path.pop();
+            }
+        }
+        _ => {}
     }
 }
 
-fn normalize_video_value(mut value: serde_json::Value) -> serde_json::Value {
-    let Some(video) = value.as_object_mut() else {
-        return value;
+/// Inserts `field` with `default` into the object at `path`.
+fn set_lacking(
+    value: &mut serde_json::Value,
+    path: &[PathSeg],
+    field: &str,
+    default: serde_json::Value,
+) {
+    let Some((seg, rest)) = path.split_first() else {
+        if let serde_json::Value::Object(object) = value {
+            object.insert(field.to_string(), default);
+        }
+        return;
     };
-
-    for (key, default) in [
-        ("display_id", serde_json::Value::String(String::new())),
-        ("tags", serde_json::Value::Array(Vec::new())),
-        ("webpage_url_domain", serde_json::Value::String(String::new())),
-        ("extractor", serde_json::Value::String(String::new())),
-        ("extractor_key", serde_json::Value::String(String::new())),
-        ("playlist", serde_json::Value::Null),
-        ("playlist_index", serde_json::Value::Null),
-        ("thumbnail", serde_json::Value::Null),
-        ("duration_string", serde_json::Value::Null),
-        ("release_year", serde_json::Value::Null),
-        ("epoch", serde_json::Value::Null),
-        ("asr", serde_json::Value::Null),
-        ("filesize", serde_json::Value::Null),
-        ("format_id", serde_json::Value::String(String::new())),
-        ("format_note", serde_json::Value::Null),
-        ("source_preference", serde_json::Value::Null),
-        ("audio_channels", serde_json::Value::Null),
-        ("quality", serde_json::Value::Null),
-        ("has_drm", serde_json::Value::Null),
-        ("tbr", serde_json::Value::Null),
-        ("filesize_approx", serde_json::Value::Null),
-        ("url", serde_json::Value::String(String::new())),
-        ("language", serde_json::Value::Null),
-        ("language_preference", serde_json::Value::Null),
-        ("ext", serde_json::Value::String(String::new())),
-        ("vcodec", serde_json::Value::String(String::new())),
-        ("acodec", serde_json::Value::String(String::new())),
-        ("dynamic_range", serde_json::Value::Null),
-        ("downloader_options", serde_json::Value::Null),
-        ("protocol", serde_json::Value::String("https".to_string())),
-        ("video_ext", serde_json::Value::String(String::new())),
-        ("audio_ext", serde_json::Value::String(String::new())),
-        ("resolution", serde_json::Value::Null),
-        ("aspect_ratio", serde_json::Value::Null),
-        ("http_headers", serde_json::json!({})),
-        ("_type", serde_json::Value::Null),
-    ] {
-        video.entry(key.to_string()).or_insert(default);
-    }
-
-    if let Some(formats) = video.get_mut("formats").and_then(|v| v.as_array_mut()) {
-        for format in formats {
-            let Some(obj) = format.as_object_mut() else {
-                continue;
-            };
-            for (key, default) in [
-                ("format_id", serde_json::Value::String(String::new())),
-                ("url", serde_json::Value::String(String::new())),
-                ("ext", serde_json::Value::String(String::new())),
-                ("protocol", serde_json::Value::String("https".to_string())),
-                ("preference", serde_json::Value::Null),
-                ("quality", serde_json::Value::Null),
-                ("has_drm", serde_json::Value::Null),
-                ("language", serde_json::Value::Null),
-                ("language_preference", serde_json::Value::Null),
-                ("format_note", serde_json::Value::Null),
-                ("filesize", serde_json::Value::Null),
-                ("filesize_approx", serde_json::Value::Null),
-                ("vcodec", serde_json::Value::String("none".to_string())),
-                ("acodec", serde_json::Value::String("none".to_string())),
-                ("dynamic_range", serde_json::Value::Null),
-                ("downloader_options", serde_json::Value::Null),
-                ("container", serde_json::Value::Null),
-                ("video_ext", serde_json::Value::String("none".to_string())),
-                ("audio_ext", serde_json::Value::String("none".to_string())),
-                ("resolution", serde_json::Value::Null),
-                ("aspect_ratio", serde_json::Value::Null),
-                ("http_headers", serde_json::json!({})),
-                ("source_preference", serde_json::Value::Null),
-                ("audio_channels", serde_json::Value::Null),
-                ("tbr", serde_json::Value::Null),
-                ("asr", serde_json::Value::Null),
-                ("fps", serde_json::Value::Null),
-                ("height", serde_json::Value::Null),
-                ("width", serde_json::Value::Null),
-                ("vbr", serde_json::Value::Null),
-                ("abr", serde_json::Value::Null),
-            ] {
-                obj.entry(key.to_string()).or_insert(default);
+    match seg {
+        PathSeg::Key(key) => {
+            if let serde_json::Value::Object(object) = value
+                && let Some(nested) = object.get_mut(key)
+            {
+                set_lacking(nested, rest, field, default);
+            }
+        }
+        PathSeg::Index(index) => {
+            if let serde_json::Value::Array(items) = value
+                && let Some(nested) = items.get_mut(*index)
+            {
+                set_lacking(nested, rest, field, default);
             }
         }
     }
+}
 
-    value
+/// Removes `field` from the object at `path`.
+fn remove_at(value: &mut serde_json::Value, path: &[PathSeg], field: &str) {
+    let Some((seg, rest)) = path.split_first() else {
+        if let serde_json::Value::Object(object) = value {
+            object.remove(field);
+        }
+        return;
+    };
+    match seg {
+        PathSeg::Key(key) => {
+            if let serde_json::Value::Object(object) = value
+                && let Some(nested) = object.get_mut(key)
+            {
+                remove_at(nested, rest, field);
+            }
+        }
+        PathSeg::Index(index) => {
+            if let serde_json::Value::Array(items) = value
+                && let Some(nested) = items.get_mut(*index)
+            {
+                remove_at(nested, rest, field);
+            }
+        }
+    }
+}
+
+/// The value inserted when a required field is missing. `Null` deserializes
+/// as an absent `Option`; the names below map to required fields of the
+/// `yt-dlp` model, where null or empty is not accepted.
+fn missing_field_default(field: &str) -> serde_json::Value {
+    match field {
+        // `Thumbnail.preference` is a required integer, as was `Format`'s
+        // in earlier model versions; extractors omit it occasionally.
+        "preference" => serde_json::json!(0),
+        "age_limit" => serde_json::json!(0),
+        "playable_in_embed" => serde_json::json!(false),
+        "id" | "title" | "live_status" | "extractor" | "extractor_key" | "url" | "format"
+        | "format_id" | "ext" | "extension" | "version" | "repository" => {
+            serde_json::json!("")
+        }
+        "_version" => serde_json::json!({ "version": "", "repository": "" }),
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// Updates the managed yt-dlp executable through the `yt-dlp` crate.
@@ -398,4 +478,77 @@ pub fn is_update_required(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn well_formed_video() -> serde_json::Value {
+        json!({
+            "id": "abc123",
+            "title": "Some video",
+            "age_limit": 0,
+            "live_status": "finished",
+            "playable_in_embed": true,
+            "extractor": "e",
+            "extractor_key": "e",
+            "_version": { "version": "2026.01.01", "repository": "yt-dlp/yt-dlp" },
+            "formats": [
+                {
+                    "format": "HLS Audio",
+                    "format_id": "hls",
+                    "url": "https://example.invalid/hls",
+                    "ext": "mp4",
+                    "http_headers": {}
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn parses_well_formed_metadata() {
+        let video = deserialize_video_lenient(well_formed_video()).expect("metadata parses");
+        assert_eq!(video.id, "abc123");
+        assert_eq!(video.title, "Some video");
+        assert_eq!(video.formats.len(), 1);
+    }
+
+    #[test]
+    fn fills_missing_thumbnail_preference() {
+        // Extractors of other sources omit `preference` on thumbnail entries.
+        let mut video = well_formed_video();
+        video["thumbnails"] = json!([{ "id": "t1", "url": "https://example.invalid/t1.jpg" }]);
+
+        let parsed = deserialize_video_lenient(video).expect("metadata parses");
+        assert_eq!(parsed.thumbnails[0].preference, 0);
+    }
+
+    #[test]
+    fn fills_missing_required_top_level_fields() {
+        let mut video = well_formed_video();
+        let object = video.as_object_mut().expect("video is an object");
+        for key in [
+            "id",
+            "title",
+            "age_limit",
+            "live_status",
+            "playable_in_embed",
+            "extractor",
+            "extractor_key",
+        ] {
+            object.remove(key);
+        }
+
+        let parsed = deserialize_video_lenient(video).expect("metadata parses");
+        assert_eq!(parsed.id, "");
+        assert_eq!(parsed.age_limit, 0);
+        assert!(parsed.live_status.is_empty());
+    }
+
+    #[test]
+    fn rejects_documents_of_the_wrong_shape() {
+        assert!(deserialize_video_lenient(json!({ "id": 1 })).is_err());
+    }
 }
