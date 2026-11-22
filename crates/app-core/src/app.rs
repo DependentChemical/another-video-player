@@ -2112,6 +2112,7 @@ impl App {
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
         if self.handle_ytdlp_timeout(&error) {
+            self.recover_from_timeout(&url);
             self.clear_retry();
             return;
         }
@@ -2141,6 +2142,7 @@ impl App {
             }
         }
         if self.handle_ytdlp_timeout(&error) {
+            self.recover_from_timeout(&url);
             self.schedule_retry(
                 url,
                 RetryErrorKind::Resolver,
@@ -2151,6 +2153,84 @@ impl App {
         }
         self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+    }
+
+    /// Runs the timeout recovery before a retry: the sign-in check, with the
+    /// cookie regeneration the retry uses.
+    ///
+    /// The procedure belongs to the YouTube and Twitch sources: for any other
+    /// target nothing runs and the plain timeout handling applies. A
+    /// signed-in profile regenerates its cookies; an unsigned one is offered
+    /// the sign-in, and the cookies are regenerated once the user signs in.
+    /// A decline is allowed and the retry proceeds as before.
+    fn recover_from_timeout(&self, url: &str) {
+        let Some(service) = web_session::registry::service_from_url(url) else {
+            return;
+        };
+        let signed_in = self.session.has_signed_in_cookies(service);
+        let asks_sign_in = match service {
+            Service::YouTube => {
+                source_youtube::timeout_recovery(signed_in)
+                    == source_youtube::TimeoutRecovery::SignInThenRegenerate
+            }
+            Service::Twitch => {
+                source_twitch::timeout_recovery(signed_in)
+                    == source_twitch::TimeoutRecovery::SignInThenRegenerate
+            }
+        };
+        app_logging::notice(format!(
+            "timeout recovery after a yt-dlp timeout: service={} url={url} signed_in={signed_in}",
+            service.name()
+        ));
+        if asks_sign_in {
+            self.sign_in_then_regenerate_cookies(service, url);
+        } else {
+            self.regenerate_cookies(service);
+        }
+    }
+
+    /// Asks the user to sign in for `service`, then regenerates the cookies
+    /// the retry uses.
+    ///
+    /// A declined sign-in is not an error: the retry proceeds without the
+    /// new cookies.
+    fn sign_in_then_regenerate_cookies(&self, service: Service, url: &str) {
+        app_logging::notice(format!(
+            "the profile is not signed in; asking the user to sign in: service={} url={url}",
+            service.name()
+        ));
+        let notice = self.outbox.lock().expect("the outbox is not poisoned").clone();
+        match self.session.sign_in(service, url, &notice) {
+            Ok(()) => self.regenerate_cookies(service),
+            Err(crate::session::Error::Declined) => {
+                app_logging::notice(format!(
+                    "the user declined the sign-in; the retry proceeds without the new cookies: service={}",
+                    service.name()
+                ));
+            }
+            Err(problem) => {
+                app_logging::warning(format!(
+                    "the sign-in after the timeout did not finish: service={} error={problem}",
+                    service.name()
+                ));
+            }
+        }
+    }
+
+    /// Rebuilds the resolver so the retry uses the current cookies of
+    /// `service`, and tells the user the cookies are being regenerated.
+    fn regenerate_cookies(&self, service: Service) {
+        let tool = self.ytdlp.tool();
+        *self.resolver.lock().expect("the resolver is not poisoned") =
+            build_resolver(&tool, self.session.cookies_dir());
+        app_logging::notice(format!(
+            "the cookies used by the retry are regenerated: service={}",
+            service.name()
+        ));
+        let _ = self
+            .outbox
+            .lock()
+            .map(|sender| sender.send(Box::new(Message::RegeneratingCookies(service))));
     }
 
     /// Schedules another attempt immediately, or reports failure when exhausted.
