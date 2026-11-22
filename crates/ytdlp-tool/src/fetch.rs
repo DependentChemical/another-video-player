@@ -101,10 +101,16 @@ fn run_fetch(
         ))
     })?;
     pid.store(child.id(), Ordering::SeqCst);
-    let stdout_tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
-    let stderr_tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
-    let stdout_reader = spawn_tail_reader(child.stdout.take(), Arc::clone(&stdout_tail));
-    let stderr_reader = spawn_tail_reader(child.stderr.take(), Arc::clone(&stderr_tail));
+    // The document is the whole stdout, so it is collected in full; only
+    // stderr is tailed for diagnostics.
+    let stdout_capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_output_reader(child.stdout.take(), Arc::clone(&stdout_capture), None);
+    let stderr_reader = spawn_output_reader(
+        child.stderr.take(),
+        Arc::clone(&stderr_capture),
+        Some(MAX_OUTPUT_BYTES),
+    );
 
     let started = Instant::now();
     let deadline = started + RESOLUTION_TIMEOUT;
@@ -129,13 +135,13 @@ fn run_fetch(
                         SOCKET_TIMEOUT.as_secs(),
                         elapsed.as_secs(),
                         RESOLUTION_TIMEOUT.as_secs(),
-                        output_excerpt(&stderr_tail),
-                        output_excerpt(&stdout_tail),
+                        output_excerpt(&stderr_capture),
+                        output_excerpt(&stdout_capture),
                     ));
                 }
                 if Instant::now() >= deadline {
-                    let stderr_text = tail_text(&stderr_tail);
-                    let stdout_text = tail_text(&stdout_tail);
+                    let stderr_text = tail_text(&stderr_capture);
+                    let stdout_text = tail_text(&stdout_capture);
                     let stderr_excerpt = last_chars(&stderr_text, 300);
                     let stdout_excerpt = last_chars(&stdout_text, 300);
                     crate::locate::terminate_child_process(&mut child);
@@ -175,29 +181,45 @@ fn run_fetch(
     pid.store(0, Ordering::SeqCst);
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
-    let stdout = tail_text(&stdout_tail);
-    let stderr = tail_text(&stderr_tail);
+    let stdout = tail_text(&stdout_capture);
+    let stderr = tail_text(&stderr_capture);
 
     if !status.success() {
-        let message = if stderr.is_empty() { stdout } else { stderr };
+        let message = if stderr.is_empty() { output_excerpt(&stdout_capture) } else { stderr };
         let detail =
             if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
         return Err(Error::YtDlp(detail));
     }
 
-    let value: serde_json::Value = serde_json::from_str(&stdout)
+    let value = parse_document(&stdout)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
     deserialize_video_lenient(value)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
 }
 
-/// Live tail of one of `yt-dlp`'s output streams, kept while the stream is read.
+/// Parses the first JSON value in `stdout`.
+///
+/// The output is the whole `--dump-single-json` document; a value is taken
+/// where one parses and anything after it is ignored, since `yt-dlp` may
+/// print stray text around the document.
+fn parse_document(stdout: &str) -> Result<serde_json::Value, String> {
+    let mut values = serde_json::Deserializer::from_str(stdout).into_iter::<serde_json::Value>();
+    match values.next() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("no JSON value in output".to_string()),
+    }
+}
+
+/// Captured output of one of `yt-dlp`'s output streams, kept while the stream
+/// is read; tail reads are capped at [`MAX_OUTPUT_BYTES`] and the stdout
+/// document is collected without a cap.
 type OutputTail = Arc<Mutex<Vec<u8>>>;
 
-/// Maximum bytes kept of each output stream.
+/// Maximum bytes kept of each diagnostic output stream.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// The trimmed text of the output stream's tail.
+/// The trimmed text of the captured output.
 fn tail_text(tail: &OutputTail) -> String {
     let guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     String::from_utf8_lossy(guard.as_slice()).trim().to_string()
@@ -213,10 +235,12 @@ fn last_chars(text: &str, count: usize) -> String {
     text.chars().rev().take(count).collect::<String>().chars().rev().collect()
 }
 
-/// Reads `stream` into `tail` until it ends, keeping only its final bytes.
-fn spawn_tail_reader<R: Read + Send + 'static>(
+/// Reads `stream` until it ends into `capture`, keeping its final `max_bytes`
+/// when given or every byte when `None`.
+fn spawn_output_reader<R: Read + Send + 'static>(
     stream: Option<R>,
-    tail: OutputTail,
+    capture: OutputTail,
+    max_bytes: Option<usize>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         if let Some(mut stream) = stream {
@@ -226,12 +250,14 @@ fn spawn_tail_reader<R: Read + Send + 'static>(
                     Ok(0) => break,
                     Ok(n) => {
                         let mut guard =
-                            tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         guard.extend_from_slice(&buffer[..n]);
-                        if guard.len() > MAX_OUTPUT_BYTES {
-                            let start = guard.len() - MAX_OUTPUT_BYTES;
+                        if let Some(max) = max_bytes
+                            && guard.len() > max
+                        {
+                            let start = guard.len() - max;
                             guard.copy_within(start.., 0);
-                            guard.truncate(MAX_OUTPUT_BYTES);
+                            guard.truncate(max);
                         }
                     }
                     Err(_) => break,
@@ -579,22 +605,36 @@ mod tests {
     }
 
     #[test]
-    fn tail_reader_records_the_stream_output() {
+    fn output_reader_records_the_stream_output() {
         let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
-        let handle = spawn_tail_reader(
+        let handle = spawn_output_reader(
             Some(std::io::Cursor::new(b"line1\nline2\n".to_vec())),
             Arc::clone(&tail),
+            Some(MAX_OUTPUT_BYTES),
         );
         let _ = handle.join();
         assert_eq!(tail_text(&tail), "line1\nline2");
     }
 
     #[test]
-    fn tail_reader_keeps_only_the_final_bytes() {
+    fn output_reader_keeps_the_whole_document() {
+        let capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_output_reader(
+            Some(std::io::Cursor::new(vec![b'a'; MAX_OUTPUT_BYTES + 1024])),
+            Arc::clone(&capture),
+            None,
+        );
+        let _ = handle.join();
+        assert_eq!(capture.lock().unwrap().len(), MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn output_reader_keeps_only_the_final_bytes() {
         let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
-        let handle = spawn_tail_reader(
+        let handle = spawn_output_reader(
             Some(std::io::Cursor::new(vec![b'a'; MAX_OUTPUT_BYTES + 100])),
             Arc::clone(&tail),
+            Some(MAX_OUTPUT_BYTES),
         );
         let _ = handle.join();
         assert_eq!(tail.lock().unwrap().len(), MAX_OUTPUT_BYTES);
@@ -610,5 +650,28 @@ mod tests {
     fn output_excerpt_is_bounded_to_300_characters() {
         let tail: OutputTail = Arc::new(Mutex::new(vec![b'x'; 1000]));
         assert_eq!(output_excerpt(&tail).chars().count(), 300);
+    }
+
+    #[test]
+    fn parses_documents_larger_than_the_tail_buffer() {
+        let mut video = well_formed_video();
+        video["title"] = json!("t".repeat(MAX_OUTPUT_BYTES + 1024));
+        let text = serde_json::to_string(&video).expect("video serializes");
+        assert!(text.len() > MAX_OUTPUT_BYTES);
+
+        let parsed = deserialize_video_lenient(parse_document(&text).expect("document parses"));
+        assert_eq!(parsed.expect("metadata parses").title.len(), MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn parse_document_takes_the_first_value_and_ignores_trailing_text() {
+        let text = serde_json::to_string(&well_formed_video()).expect("video serializes");
+        assert!(parse_document(&format!("{text} trailing text")).is_ok());
+    }
+
+    #[test]
+    fn parse_document_rejects_missing_values() {
+        assert!(parse_document("").is_err());
+        assert!(parse_document("garbage in front of the document").is_err());
     }
 }
