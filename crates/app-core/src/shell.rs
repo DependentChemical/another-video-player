@@ -991,10 +991,10 @@ fn tick(
             Message::AppUpdateProgress(progress) => {
                 ui.set_update_installing(true);
                 if progress >= 1.0 {
-                    ui.set_update_status_text("Installing updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
+                    ui.set_update_status_text("Installing update…");
                     ui.set_update_download_progress(1.0);
                 } else {
-                    ui.set_update_status_text("Downloading updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
+                    ui.set_update_status_text("Downloading update…");
                     ui.set_update_download_progress(progress.max(0.0));
                 }
             }
@@ -1005,7 +1005,7 @@ fn tick(
             }
             Message::ToolUpdateProgress(progress) => {
                 ui.set_update_installing(true);
-                ui.set_update_status_text("Downloading updateÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦");
+                ui.set_update_status_text("Downloading update…");
                 ui.set_update_download_progress(progress.max(0.0));
             }
             Message::ToolUpdateStatus(status) => {
@@ -1032,9 +1032,7 @@ fn tick(
             }
             Message::Toast(text) => ui.show_toast(&text),
             Message::ThumbnailMigrationStarted { count } => {
-                ui.show_toast(&format!(
-                    "Migrating {count} thumbnails to the new cacheÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"
-                ));
+                ui.show_toast(&format!("Migrating {count} thumbnails to the new cache…"));
             }
             Message::ThumbnailMigrationFinished { processed } => {
                 ui.show_toast(&format!("Thumbnail migration finished ({processed} processed)"));

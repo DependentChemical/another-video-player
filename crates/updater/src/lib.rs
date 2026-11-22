@@ -236,8 +236,15 @@ fn write_helper(
 
 #[cfg(windows)]
 fn launch_helper(path: &Path) -> Result<(), Error> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = path.to_string_lossy();
+    // cmd /C strips the first and last quote when the command starts with one,
+    // so wrap the quoted path in an extra pair.
+    let command = format!("\"\"{}\"\"", script);
     std::process::Command::new("cmd")
-        .args(["/C", "start", "", path.to_string_lossy().as_ref()])
+        .args(["/C", &command])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(io_error)?;
     std::process::exit(0)
