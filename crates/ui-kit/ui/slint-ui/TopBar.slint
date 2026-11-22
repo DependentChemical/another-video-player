@@ -5,6 +5,7 @@ export component TopBar inherits Rectangle {
     in-out property <string> url: "";
     in property <string> app-name: "Flatline";
     callback load-requested();
+    callback url-edited(string);
     callback pointer-activity();
     callback brand-clicked();
 
@@ -87,6 +88,9 @@ export component TopBar inherits Rectangle {
                 color: Theme.fg;
                 font-size: 13px;
                 vertical-alignment: center;
+                edited => {
+                    root.url-edited(self.text);
+                }
                 accepted => {
                     root.load-requested();
                 }

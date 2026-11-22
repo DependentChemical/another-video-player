@@ -85,6 +85,23 @@ impl Source for Twitch {
     }
 }
 
+/// What the app should do about the cookies when a Twitch URL times out
+/// before the retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutRecovery {
+    /// The cookies are regenerated and the retry uses them.
+    Regenerate,
+    /// The user is asked to sign in, then the cookies are regenerated.
+    /// Declining lets the retry proceed without the new cookies.
+    SignInThenRegenerate,
+}
+
+/// Decides the timeout recovery for a Twitch URL from whether the stored
+/// session currently looks signed in.
+pub fn timeout_recovery(signed_in: bool) -> TimeoutRecovery {
+    if signed_in { TimeoutRecovery::Regenerate } else { TimeoutRecovery::SignInThenRegenerate }
+}
+
 /// Whether a host is `base` itself or one of its subdomains.
 fn host_is(host: &str, base: &str) -> bool {
     host == base || host.ends_with(&format!(".{base}"))
@@ -97,7 +114,7 @@ pub fn matches_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Twitch, matches_url};
+    use super::{TimeoutRecovery, Twitch, matches_url, timeout_recovery};
     use media_model::Service;
     use web_session::Source;
 
@@ -128,5 +145,15 @@ mod tests {
     #[test]
     fn cookie_file_name_is_stable() {
         assert_eq!(Twitch.cookie_file_name(), "cookies-twitch.txt");
+    }
+
+    #[test]
+    fn a_signed_in_profile_only_needs_the_cookie_regeneration() {
+        assert_eq!(timeout_recovery(true), TimeoutRecovery::Regenerate);
+    }
+
+    #[test]
+    fn an_unsigned_profile_offers_the_sign_in_then_the_cookies() {
+        assert_eq!(timeout_recovery(false), TimeoutRecovery::SignInThenRegenerate);
     }
 }

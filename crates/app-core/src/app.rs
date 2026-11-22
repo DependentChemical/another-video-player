@@ -10,7 +10,7 @@ use media_model::{MediaSource, PlaybackPlan, Quality, Service};
 use playback_engine::{Engine, LoadRequest};
 use settings::Settings;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -71,6 +71,13 @@ pub enum Message {
         delay_seconds: u64,
         /// The kind of error being retried.
         kind: RetryKind,
+    },
+    /// Background URL preview processing failed.
+    UrlPreviewFailed {
+        /// The URL that failed.
+        url: String,
+        /// The error message.
+        error: String,
     },
 }
 
@@ -201,9 +208,8 @@ const MAX_RETRY_ATTEMPTS: u32 = 6;
 /// Retry delay for all yt-dlp/network/player failures. Immediate by design.
 const RETRY_DELAY: Duration = Duration::from_secs(0);
 
-/// How long the background thumbnail pass waits between downloads, so it
-/// stays in the background and does not hammer the network.
-const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(1);
+/// How long the background thumbnail pass waits between downloads or retries.
+const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -368,11 +374,166 @@ impl RetryState {
     }
 }
 
+#[derive(Debug)]
+struct YtdlpSlot {
+    active: bool,
+    cancel: Arc<AtomicBool>,
+    pid: Arc<AtomicU32>,
+}
+
+impl YtdlpSlot {
+    fn idle() -> Self {
+        Self {
+            active: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pid: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn begin(&mut self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.pid.store(0, Ordering::SeqCst);
+        self.active = true;
+        (self.cancel.clone(), self.pid.clone())
+    }
+
+    fn finish(&mut self, cancel: &Arc<AtomicBool>) {
+        if Arc::ptr_eq(&self.cancel, cancel) {
+            self.active = false;
+            self.pid.store(0, Ordering::SeqCst);
+        }
+    }
+
+    fn cancel(&mut self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
+        self.cancel.store(true, Ordering::SeqCst);
+        self.active = false;
+        let old = (self.cancel.clone(), self.pid.clone());
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.pid = Arc::new(AtomicU32::new(0));
+        old
+    }
+}
+
+/// Coordinates yt-dlp access across playback, URL preview, and thumbnail work.
+#[derive(Debug)]
+struct YtdlpControl {
+    tool: Mutex<YtDlp>,
+    playback: Mutex<YtdlpSlot>,
+    url_preview: Mutex<YtdlpSlot>,
+    thumbnail: Mutex<YtdlpSlot>,
+}
+
+fn terminate_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        let _ = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+    }
+}
+
+impl YtdlpControl {
+    fn new(tool: YtDlp) -> Self {
+        Self {
+            tool: Mutex::new(tool),
+            playback: Mutex::new(YtdlpSlot::idle()),
+            url_preview: Mutex::new(YtdlpSlot::idle()),
+            thumbnail: Mutex::new(YtdlpSlot::idle()),
+        }
+    }
+
+    fn tool(&self) -> YtDlp {
+        self.tool.lock().expect("the yt-dlp tool is not poisoned").clone()
+    }
+
+    fn replace_tool(&self, tool: YtDlp) {
+        *self.tool.lock().expect("the yt-dlp tool is not poisoned") = tool;
+    }
+
+    fn begin_playback(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
+        self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").cancel();
+        self.playback.lock().expect("yt-dlp playback slot poisoned").begin()
+    }
+
+    fn cancel_playback(&self) {
+        let (_, pid) = self.playback.lock().expect("yt-dlp playback slot poisoned").cancel();
+        terminate_pid(pid.load(Ordering::SeqCst));
+    }
+
+    fn finish_playback(&self, cancel: &Arc<AtomicBool>) {
+        self.playback.lock().expect("yt-dlp playback slot poisoned").finish(cancel);
+    }
+
+    fn begin_url_preview(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
+        self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
+        self.url_preview.lock().expect("yt-dlp url slot poisoned").begin()
+    }
+
+    fn cancel_url_preview(&self) {
+        let (_, pid) = self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
+        terminate_pid(pid.load(Ordering::SeqCst));
+    }
+
+    fn finish_url_preview(&self, cancel: &Arc<AtomicBool>) {
+        self.url_preview.lock().expect("yt-dlp url slot poisoned").finish(cancel);
+    }
+
+    fn try_begin_thumbnail(&self) -> Option<(Arc<AtomicBool>, Arc<AtomicU32>)> {
+        let playback = self.playback.lock().expect("yt-dlp playback slot poisoned");
+        let url = self.url_preview.lock().expect("yt-dlp url slot poisoned");
+        let mut thumb = self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned");
+        if playback.active || url.active || thumb.active {
+            return None;
+        }
+        Some(thumb.begin())
+    }
+
+    fn finish_thumbnail(&self, cancel: &Arc<AtomicBool>) {
+        self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").finish(cancel);
+    }
+
+    fn cancel_thumbnail(&self) {
+        let (_, pid) = self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").cancel();
+        terminate_pid(pid.load(Ordering::SeqCst));
+    }
+
+    fn cancel_all(&self) {
+        let (_, p1) = self.playback.lock().expect("yt-dlp playback slot poisoned").cancel();
+        let (_, p2) = self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
+        let (_, p3) = self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").cancel();
+        terminate_pid(p1.load(Ordering::SeqCst));
+        terminate_pid(p2.load(Ordering::SeqCst));
+        terminate_pid(p3.load(Ordering::SeqCst));
+        self.kill_all();
+    }
+
+    fn kill_all(&self) {
+        let tool = self.tool();
+        ytdlp_tool::kill_all(&tool);
+    }
+}
+
 /// The application, without a user interface.
 pub struct App {
     engine: Engine,
     resolver: Arc<Mutex<Resolver>>,
     ytdlp_epoch: Arc<AtomicU64>,
+    url_preview_epoch: Arc<AtomicU64>,
+    ytdlp: Arc<YtdlpControl>,
     settings: Settings,
     session: Session,
     runtime: tokio::runtime::Runtime,
@@ -424,7 +585,7 @@ impl App {
         let queue =
             Queue::open(paths.database()).map_err(|error| Error::Library(error.to_string()))?;
         app_logging::notice(format!("the library opened at {}", paths.database().display()));
-        let cache = ThumbnailCache::new(queue.database(), paths.cache().join("thumbnails"));
+        let cache = ThumbnailCache::new(queue.database(), paths.thumbnails());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -436,6 +597,8 @@ impl App {
             engine,
             resolver: Arc::new(Mutex::new(resolver)),
             ytdlp_epoch: Arc::new(AtomicU64::new(0)),
+            url_preview_epoch: Arc::new(AtomicU64::new(0)),
+            ytdlp: Arc::new(YtdlpControl::new(ytdlp.clone())),
             settings,
             session,
             runtime,
@@ -487,6 +650,7 @@ impl App {
         // A manual request preempts any active or queued `yt-dlp` work so it
         // is handled immediately.
         let epoch = self.preempt_ytdlp();
+        self.ytdlp.cancel_url_preview();
         self.clear_retry();
         if self.is_playing() {
             self.resolve_pending(url, epoch);
@@ -532,6 +696,68 @@ impl App {
         self.state.lock().expect("the state is not poisoned").current_url.clone()
     }
 
+    /// Processes URL bar input in the background.
+    ///
+    /// Each new edit cancels the previous preview. Failures are reported as
+    /// toasts; successes are silent because the user has not asked to play.
+    pub fn preview_url(&self, url: String) {
+        let url = url.trim().to_string();
+        if url.is_empty() || url.to_ascii_lowercase().starts_with("test://") {
+            self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
+            self.ytdlp.cancel_url_preview();
+            return;
+        }
+        let epoch = self.url_preview_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.ytdlp.cancel_url_preview();
+
+        let resolver = Arc::clone(&self.resolver);
+        let session = self.session.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let epoch_state = Arc::clone(&self.url_preview_epoch);
+        let ytdlp = Arc::clone(&self.ytdlp);
+        self.runtime.handle().spawn(async move {
+            let (cancel, pid) = ytdlp.begin_url_preview();
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                ytdlp.finish_url_preview(&cancel);
+                return;
+            }
+            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
+            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
+            let result = resolve_with_session(
+                &resolver,
+                &session,
+                &epoch_state,
+                epoch,
+                &cancel,
+                &pid,
+                &url,
+                &sender,
+            )
+            .await;
+            ytdlp.finish_url_preview(&cancel);
+            if cancel.load(Ordering::SeqCst)
+                || epoch_state.load(Ordering::SeqCst) != epoch
+                || matches!(result, Err(stream_resolver::Error::Cancelled))
+            {
+                return;
+            }
+            if let Err(error) = result {
+                let raw = error.to_string();
+                let mapped = if raw.to_ascii_lowercase().contains("timed out")
+                    || raw.to_ascii_lowercase().contains("did not respond within")
+                {
+                    ytdlp.kill_all();
+                    format!("Failed to process URL, timeout: {raw}")
+                } else {
+                    format!("Failed to process URL: {raw}")
+                };
+                let _ = outbox.lock().map(|sender| {
+                    sender.send(Box::new(Message::UrlPreviewFailed { url, error: mapped }))
+                });
+            }
+        });
+    }
+
     /// Whether a resolved result for `url` still belongs to the active playback.
     ///
     /// A result is relevant while it matches the in-flight resolve or the URL of
@@ -568,15 +794,28 @@ impl App {
         let outbox = Arc::clone(&self.outbox);
         let cache = self.cache.clone();
         let epoch_state = Arc::clone(&self.ytdlp_epoch);
+        let ytdlp = Arc::clone(&self.ytdlp);
 
         self.runtime.handle().spawn(async move {
+            let (cancel, pid) = ytdlp.begin_playback();
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result =
-                resolve_with_session(&resolver, &session, &epoch_state, epoch, &url, &sender).await;
-            if epoch_state.load(Ordering::SeqCst) != epoch
-                || matches!(result, Err(stream_resolver::Error::Cancelled))
-            {
+            let result = resolve_with_session(
+                &resolver,
+                &session,
+                &epoch_state,
+                epoch,
+                &cancel,
+                &pid,
+                &url,
+                &sender,
+            )
+            .await;
+            ytdlp.finish_playback(&cancel);
+            let cancelled = cancel.load(Ordering::SeqCst)
+                || epoch_state.load(Ordering::SeqCst) != epoch
+                || matches!(result, Err(stream_resolver::Error::Cancelled));
+            if cancelled {
                 app_logging::debug(format!(
                     "discarding a cancelled playback resolve: url={url} reason={}",
                     reason.as_str()
@@ -632,20 +871,31 @@ impl App {
         let cache = self.cache.clone();
         let epoch_state = Arc::clone(&self.ytdlp_epoch);
 
+        let ytdlp = Arc::clone(&self.ytdlp);
         self.runtime.handle().spawn(async move {
-            if epoch_state.load(Ordering::SeqCst) != epoch {
-                app_logging::debug(format!(
-                    "discarding a pending resolve that was superseded: url={url}"
-                ));
+            let (cancel, pid) = ytdlp.begin_url_preview();
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                ytdlp.finish_url_preview(&cancel);
                 return;
             }
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result =
-                resolve_with_session(&resolver, &session, &epoch_state, epoch, &url, &sender).await;
-            if epoch_state.load(Ordering::SeqCst) != epoch
-                || matches!(result, Err(stream_resolver::Error::Cancelled))
-            {
+            let result = resolve_with_session(
+                &resolver,
+                &session,
+                &epoch_state,
+                epoch,
+                &cancel,
+                &pid,
+                &url,
+                &sender,
+            )
+            .await;
+            ytdlp.finish_url_preview(&cancel);
+            let cancelled = cancel.load(Ordering::SeqCst)
+                || epoch_state.load(Ordering::SeqCst) != epoch
+                || matches!(result, Err(stream_resolver::Error::Cancelled));
+            if cancelled {
                 app_logging::debug(format!("discarding a cancelled pending resolve: url={url}"));
                 return;
             }
@@ -675,10 +925,19 @@ impl App {
                     }))
                 }
                 Err(error) => {
+                    let raw = error.to_string();
+                    let mapped = if raw.to_ascii_lowercase().contains("timed out")
+                        || raw.to_ascii_lowercase().contains("did not respond within")
+                    {
+                        ytdlp.kill_all();
+                        format!("Failed to process URL, timeout: {raw}")
+                    } else {
+                        format!("Failed to process URL: {raw}")
+                    };
                     app_logging::warning(format!(
-                        "pending video could not be resolved: url={url} error={error}"
+                        "pending video could not be resolved: url={url} error={mapped}"
                     ));
-                    Message::Pending(Err(error.to_string()))
+                    Message::UrlPreviewFailed { url, error: mapped }
                 }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
@@ -1238,21 +1497,33 @@ impl App {
 
             let mut processed = 0;
             for (position, url, path) in legacy {
-                let path = PathBuf::from(path);
-                if path.is_file() {
-                    match cache.register_legacy(&url, &path) {
-                        Ok(new_id) => {
-                            if let Err(error) = queue.set_thumbnail(position, Some(&new_id)) {
-                                app_logging::warning(format!(
-                                    "the active queue entry could not be updated: {error}"
-                                ));
-                            }
-                        }
-                        Err(error) => {
+                let legacy_path = PathBuf::from(&path);
+                let id = ThumbnailCache::thumbnail_id_for(&url);
+                let result = if legacy_path.is_file() {
+                    cache.register_legacy(&url, &legacy_path)
+                } else {
+                    let _ = cache.repair_row(&id);
+                    Ok(id.clone())
+                };
+
+                match result {
+                    Ok(new_id) => {
+                        let has_files = cache.full_path(&new_id).is_some();
+                        let value = has_files.then_some(new_id.as_str());
+                        if let Err(error) = queue.set_thumbnail(position, value) {
                             app_logging::warning(format!(
-                                "a legacy thumbnail could not be migrated: {error}"
+                                "the active queue entry could not be updated: {error}"
+                            ));
+                        } else if !has_files {
+                            app_logging::debug(format!(
+                                "legacy thumbnail missing after move; cleared local path for {url}"
                             ));
                         }
+                    }
+                    Err(error) => {
+                        app_logging::warning(format!(
+                            "a legacy thumbnail could not be migrated: {error}"
+                        ));
                     }
                 }
                 processed += 1;
@@ -1273,120 +1544,100 @@ impl App {
     ///
     /// Entries that already hold a valid cached thumbnail are skipped; the rest
     /// are downloaded one at a time, slowly, so the cache is rebuilt without
-    /// blocking playback or the interface. The start is reported to the user
-    /// through [`Message::ThumbnailRefreshStarted`].
+    /// blocking playback or the interface. Failures and preemption do not stop
+    /// the pass: it waits and retries until the queue is satisfied or work is
+    /// no longer possible. A video whose thumbnail keeps failing after the
+    /// yt-dlp fallback is removed from the queue and the pass moves on. The
+    /// start is reported to the user through [`Message::ThumbnailRefreshStarted`].
     pub fn refresh_queue_thumbnails(&self) {
-        let entries = match self.queue.entries() {
-            Ok(entries) => entries,
-            Err(error) => {
-                app_logging::error(format!("the active queue could not be read: {error}"));
-                return;
-            }
-        };
-        let due = entries_needing_thumbnails(&entries, &self.cache);
-        if due.is_empty() {
-            return;
-        }
-
-        let count = due.len();
-        app_logging::debug(format!("refreshing {count} queue thumbnails in the background"));
         let cache = self.cache.clone();
         let queue = self.queue.clone();
         let outbox = Arc::clone(&self.outbox);
         let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let ytdlp_epoch = Arc::clone(&self.ytdlp_epoch);
+        let ytdlp = Arc::clone(&self.ytdlp);
         let handle = self.runtime.handle().clone();
         let task_handle = handle.clone();
 
         handle.spawn_blocking(move || {
-            let _ = outbox
-                .lock()
-                .map(|sender| sender.send(Box::new(Message::ThumbnailRefreshStarted { count })));
-
-            // A manual action bumps the epoch. Background work that started
-            // before it must stop instead of picking up the new epoch and
-            // competing with the media the user asked for.
-            let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
-            for (position, url, thumbnail_url) in due {
-                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
-                    app_logging::debug("the thumbnail refresh yielded to manual work");
-                    break;
-                }
-                // Try direct fetch first (no yt-dlp slot needed).
-                match cache.fetch(&url, Some(&thumbnail_url)) {
-                    Ok(id) => {
-                        if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                            app_logging::warning(format!(
-                                "the active queue entry could not be updated: {error}"
-                            ));
-                        }
+            let mut announced = false;
+            loop {
+                let entries = match queue.entries() {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        app_logging::error(format!(
+                            "thumbnail refresh could not read the active queue: {error}"
+                        ));
                         std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                         continue;
                     }
-                    Err(error) => {
-                        app_logging::debug(format!(
-                            "a queue thumbnail direct download failed for {url}: {error}; trying yt-dlp refresh"
-                        ));
+                };
+                let due = entries_needing_thumbnails(&entries, &cache);
+                if due.is_empty() {
+                    if announced {
+                        app_logging::notice("thumbnail refresh finished: queue thumbnails are cached");
+                    }
+                    return;
+                }
+
+                if !announced {
+                    let count = due.len();
+                    app_logging::notice(format!(
+                        "refreshing {count} queue thumbnails in the background"
+                    ));
+                    let _ = outbox.lock().map(|sender| {
+                        sender.send(Box::new(Message::ThumbnailRefreshStarted { count }))
+                    });
+                    announced = true;
+                }
+
+                let mut progressed = false;
+                for (id, position, url, thumbnail_url) in due {
+                    let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
+                    let outcome = refresh_thumbnail_entry(
+                        &cache,
+                        &queue,
+                        &resolver,
+                        &session,
+                        &ytdlp_epoch,
+                        pass_epoch,
+                        &ytdlp,
+                        &task_handle,
+                        &outbox,
+                        id,
+                        position,
+                        &url,
+                        &thumbnail_url,
+                    );
+                    match outcome {
+                        ThumbnailRefreshOutcome::Completed => {
+                            progressed = true;
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        }
+                        ThumbnailRefreshOutcome::Preempted => {
+                            app_logging::debug(
+                                "thumbnail refresh yielded to higher-priority yt-dlp work; retrying in 5s",
+                            );
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                            break;
+                        }
+                        ThumbnailRefreshOutcome::RetryLater(error) => {
+                            app_logging::warning(format!(
+                                "thumbnail refresh failed for {url}; retrying in 5s: {error}"
+                            ));
+                            std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        }
+                        ThumbnailRefreshOutcome::Skipped => {
+                            // The error video is out of the queue; move on.
+                            progressed = true;
+                        }
                     }
                 }
 
-                // Fallback: re-resolve via yt-dlp. This is background work and
-                // yields immediately if manual playback preempts or supersedes it.
-                let sender = outbox.lock().expect("outbox poisoned").clone();
-                let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
-                let resolved = task_handle.block_on(resolve_with_session(
-                    &resolver,
-                    &session,
-                    &ytdlp_epoch,
-                    pass_epoch,
-                    &url,
-                    &sender,
-                ));
-                match resolved {
-                    Ok(source) => {
-                        if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
-                            break;
-                        }
-                        if let Some(new_thumb) = source.thumbnail.as_deref() {
-                            let _ = queue.update_details(
-                                position,
-                                &source.title,
-                                None,
-                                Some(new_thumb),
-                                source.uploader.as_deref(),
-                            );
-                            match cache.fetch(&url, Some(new_thumb)) {
-                                Ok(id) => {
-                                    if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
-                                        app_logging::warning(format!(
-                                            "the active queue entry could not be updated: {error}"
-                                        ));
-                                    }
-                                }
-                                Err(error) => {
-                                    app_logging::warning(format!(
-                                        "a queue thumbnail could not be refreshed after yt-dlp: {error}"
-                                    ));
-                                }
-                            }
-                        } else {
-                            app_logging::debug(format!(
-                                "yt-dlp did not provide a thumbnail for {url}"
-                            ));
-                        }
-                    }
-                    Err(stream_resolver::Error::Cancelled) => {
-                        // Preempted by user/manual work or otherwise superseded.
-                        break;
-                    }
-                    Err(error) => {
-                        app_logging::warning(format!(
-                            "yt-dlp re-resolve failed for thumbnail refresh ({url}): {error}"
-                        ));
-                    }
+                if !progressed {
+                    std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                 }
-                std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
             }
         });
     }
@@ -1448,6 +1699,17 @@ impl App {
         state.last_history_save = None;
         state.sponsorblock_segments.clear();
         state.sponsorblock_suppressed = None;
+    }
+
+    /// Performs a clean shutdown: stops playback and kills child processes.
+    /// The tokio runtime is shut down when the App is dropped.
+    pub fn shutdown(&self) {
+        app_logging::notice("shutting down Flatline");
+
+        self.interrupt_playback();
+        self.ytdlp.cancel_all();
+
+        app_logging::notice("Flatline shutdown complete");
     }
 
     /// Removes an entry from the active queue.
@@ -1849,6 +2111,11 @@ impl App {
 
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
+        if self.handle_ytdlp_timeout(&error) {
+            self.recover_from_timeout(&url);
+            self.clear_retry();
+            return;
+        }
         self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
     }
@@ -1874,8 +2141,96 @@ impl App {
                 state.resolving_url = None;
             }
         }
+        if self.handle_ytdlp_timeout(&error) {
+            self.recover_from_timeout(&url);
+            self.schedule_retry(
+                url,
+                RetryErrorKind::Resolver,
+                RetryKind::Resolver,
+                format!("Failed to process URL, timeout: {error}"),
+            );
+            return;
+        }
         self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+    }
+
+    /// Runs the timeout recovery before a retry: the sign-in check, with the
+    /// cookie regeneration the retry uses.
+    ///
+    /// The procedure belongs to the YouTube and Twitch sources: for any other
+    /// target nothing runs and the plain timeout handling applies. A
+    /// signed-in profile regenerates its cookies; an unsigned one is offered
+    /// the sign-in, and the cookies are regenerated once the user signs in.
+    /// A decline is allowed and the retry proceeds as before.
+    fn recover_from_timeout(&self, url: &str) {
+        let Some(service) = web_session::registry::service_from_url(url) else {
+            return;
+        };
+        let signed_in = self.session.has_signed_in_cookies(service);
+        let asks_sign_in = match service {
+            Service::YouTube => {
+                source_youtube::timeout_recovery(signed_in)
+                    == source_youtube::TimeoutRecovery::SignInThenRegenerate
+            }
+            Service::Twitch => {
+                source_twitch::timeout_recovery(signed_in)
+                    == source_twitch::TimeoutRecovery::SignInThenRegenerate
+            }
+        };
+        app_logging::notice(format!(
+            "timeout recovery after a yt-dlp timeout: service={} url={url} signed_in={signed_in}",
+            service.name()
+        ));
+        if asks_sign_in {
+            self.sign_in_then_regenerate_cookies(service, url);
+        } else {
+            self.regenerate_cookies(service);
+        }
+    }
+
+    /// Asks the user to sign in for `service`, then regenerates the cookies
+    /// the retry uses.
+    ///
+    /// A declined sign-in is not an error: the retry proceeds without the
+    /// new cookies.
+    fn sign_in_then_regenerate_cookies(&self, service: Service, url: &str) {
+        app_logging::notice(format!(
+            "the profile is not signed in; asking the user to sign in: service={} url={url}",
+            service.name()
+        ));
+        let notice = self.outbox.lock().expect("the outbox is not poisoned").clone();
+        match self.session.sign_in(service, url, &notice) {
+            Ok(()) => self.regenerate_cookies(service),
+            Err(crate::session::Error::Declined) => {
+                app_logging::notice(format!(
+                    "the user declined the sign-in; the retry proceeds without the new cookies: service={}",
+                    service.name()
+                ));
+            }
+            Err(problem) => {
+                app_logging::warning(format!(
+                    "the sign-in after the timeout did not finish: service={} error={problem}",
+                    service.name()
+                ));
+            }
+        }
+    }
+
+    /// Rebuilds the resolver so the retry uses the current cookies of
+    /// `service`, and tells the user the cookies are being regenerated.
+    fn regenerate_cookies(&self, service: Service) {
+        let tool = self.ytdlp.tool();
+        *self.resolver.lock().expect("the resolver is not poisoned") =
+            build_resolver(&tool, self.session.cookies_dir());
+        app_logging::notice(format!(
+            "the cookies used by the retry are regenerated: service={}",
+            service.name()
+        ));
+        let _ = self
+            .outbox
+            .lock()
+            .map(|sender| sender.send(Box::new(Message::RegeneratingCookies(service))));
     }
 
     /// Schedules another attempt immediately, or reports failure when exhausted.
@@ -2224,7 +2579,8 @@ impl App {
 
     /// Uses another `yt-dlp` installation from now on.
     pub fn use_tool(&self, ytdlp: &YtDlp) {
-        self.preempt_ytdlp();
+        self.ytdlp.cancel_all();
+        self.ytdlp.replace_tool(ytdlp.clone());
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
         *resolver = build_resolver(ytdlp, self.session.cookies_dir());
     }
@@ -2241,14 +2597,31 @@ impl App {
         });
     }
 
-    /// Invalidates queued/active resolve work started before this point.
+    /// Invalidates queued/active playback resolve work started before this point.
     fn preempt_ytdlp(&self) -> u64 {
+        self.ytdlp.cancel_playback();
+        self.ytdlp.cancel_url_preview();
+        self.ytdlp.cancel_thumbnail();
+        self.ytdlp.kill_all();
         self.ytdlp_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Whether a `yt-dlp` run started for `epoch` has been superseded.
     fn is_ytdlp_stale(&self, epoch: u64) -> bool {
         self.ytdlp_epoch.load(Ordering::SeqCst) != epoch
+    }
+
+    fn handle_ytdlp_timeout(&self, error: &str) -> bool {
+        let lower = error.to_ascii_lowercase();
+        if !(lower.contains("timed out") || lower.contains("did not respond within")) {
+            return false;
+        }
+        app_logging::warning(format!(
+            "yt-dlp timeout detected; killing all yt-dlp processes: {error}"
+        ));
+        self.ytdlp.cancel_all();
+        self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
     fn poll_app_update_background(self: Arc<Self>) {
@@ -2398,6 +2771,7 @@ impl App {
     pub fn install_tool_update(&self, update: ytdlp_tool::ToolUpdate) {
         let outbox = Arc::clone(&self.outbox);
         let resolver = Arc::clone(&self.resolver);
+        let ytdlp = Arc::clone(&self.ytdlp);
         let cookies = self.session.cookies_dir().to_path_buf();
         let paths = self.paths.clone();
         self.runtime.handle().spawn(async move {
@@ -2406,7 +2780,7 @@ impl App {
                 update.latest, update.download_url
             ));
             let _ = outbox.lock().map(|sender| {
-                sender.send(Box::new(Message::ToolUpdateStatus("Applying update…".to_string())))
+                sender.send(Box::new(Message::ToolUpdateStatus("Applying update...".to_string())))
             });
 
             let tools = paths.tool_paths();
@@ -2414,6 +2788,7 @@ impl App {
             match ytdlp_tool::update_managed(&managed, tools.root()).await {
                 Ok(version) => {
                     let tool = ytdlp_tool::locate::at(&managed, tools.clone());
+                    ytdlp.replace_tool(tool.clone());
                     if let Ok(mut resolver) = resolver.lock() {
                         *resolver = build_resolver(&tool, &cookies);
                     }
@@ -2688,11 +3063,11 @@ impl App {
 /// The queue entries that lack a valid cached thumbnail but can still be
 /// downloaded, because the extractor reported a remote thumbnail URL.
 ///
-/// Returns `(position, url, thumbnail_url)` triples, in queue order.
+/// Returns `(id, position, url, thumbnail_url)` tuples, in queue order.
 fn entries_needing_thumbnails(
     entries: &[library::QueueEntry],
     cache: &ThumbnailCache,
-) -> Vec<(i64, String, String)> {
+) -> Vec<(i64, i64, String, String)> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -2702,7 +3077,12 @@ fn entries_needing_thumbnails(
                 Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
                 Some(_) => true,
             };
-            needed.then_some((entry.position, entry.url.clone(), thumbnail_url.to_string()))
+            needed.then_some((
+                entry.id,
+                entry.position,
+                entry.url.clone(),
+                thumbnail_url.to_string(),
+            ))
         })
         .collect()
 }
@@ -2725,6 +3105,166 @@ fn clear_stream_buffer(directory: &Path) {
         };
         if let Err(error) = result {
             app_logging::warning(format!("a stream buffer file could not be removed: {error}"));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ThumbnailRefreshOutcome {
+    Completed,
+    Preempted,
+    RetryLater(String),
+    /// The video was removed from the queue because its thumbnail kept
+    /// failing; the pass moves on to the next entry.
+    Skipped,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_thumbnail_entry(
+    cache: &ThumbnailCache,
+    queue: &Queue,
+    resolver: &Arc<Mutex<Resolver>>,
+    session: &Session,
+    ytdlp_epoch: &Arc<AtomicU64>,
+    pass_epoch: u64,
+    ytdlp: &Arc<YtdlpControl>,
+    task_handle: &tokio::runtime::Handle,
+    outbox: &Arc<Mutex<Sender<Box<Message>>>>,
+    id: i64,
+    position: i64,
+    url: &str,
+    thumbnail_url: &str,
+) -> ThumbnailRefreshOutcome {
+    loop {
+        if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
+            return ThumbnailRefreshOutcome::Preempted;
+        }
+        let Some((cancel, pid)) = ytdlp.try_begin_thumbnail() else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+
+        app_logging::debug(format!("thumbnail refresh: downloading {url}"));
+        match cache.fetch(url, Some(thumbnail_url)) {
+            Ok(id) => {
+                if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                    let message =
+                        format!("thumbnail refresh could not update queue entry: {error}");
+                    app_logging::warning(message.clone());
+                    ytdlp.finish_thumbnail(&cancel);
+                    return ThumbnailRefreshOutcome::RetryLater(message);
+                }
+                ytdlp.finish_thumbnail(&cancel);
+                app_logging::debug(format!("thumbnail refresh: cached {url} as {id}"));
+                return ThumbnailRefreshOutcome::Completed;
+            }
+            Err(error) => {
+                app_logging::warning(format!(
+                    "thumbnail refresh direct download failed for {url}: {error}; trying yt-dlp refresh"
+                ));
+            }
+        }
+
+        let sender = outbox.lock().expect("outbox poisoned").clone();
+        let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
+        let resolved = task_handle.block_on(resolve_with_session(
+            &resolver,
+            session,
+            ytdlp_epoch,
+            pass_epoch,
+            &cancel,
+            &pid,
+            url,
+            &sender,
+        ));
+        ytdlp.finish_thumbnail(&cancel);
+
+        match resolved {
+            Ok(source) => {
+                if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch || cancel.load(Ordering::SeqCst)
+                {
+                    return ThumbnailRefreshOutcome::Preempted;
+                }
+                let Some(new_thumb) = source.thumbnail.as_deref() else {
+                    let message = "yt-dlp refresh returned no thumbnail URL".to_string();
+                    app_logging::warning(format!("thumbnail refresh: {message} for {url}"));
+                    return ThumbnailRefreshOutcome::RetryLater(message);
+                };
+
+                if let Err(error) = queue.update_details(
+                    position,
+                    &source.title,
+                    None,
+                    Some(new_thumb),
+                    source.uploader.as_deref(),
+                ) {
+                    app_logging::warning(format!(
+                        "thumbnail refresh could not update queue details for {url}: {error}"
+                    ));
+                }
+
+                match cache.fetch(url, Some(new_thumb)) {
+                    Ok(id) => {
+                        if let Err(error) = queue.set_thumbnail(position, Some(&id)) {
+                            let message =
+                                format!("thumbnail refresh could not update queue entry: {error}");
+                            app_logging::warning(message.clone());
+                            return ThumbnailRefreshOutcome::RetryLater(message);
+                        }
+                        app_logging::notice(format!(
+                            "thumbnail refresh: recovered {url} via yt-dlp"
+                        ));
+                        return ThumbnailRefreshOutcome::Completed;
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("thumbnail download after yt-dlp refresh failed: {error}");
+                        app_logging::warning(format!(
+                            "thumbnail refresh failed for {url}: {message}"
+                        ));
+                        return skip_error_video(queue, ytdlp, &cancel, id, url, &message);
+                    }
+                }
+            }
+            Err(stream_resolver::Error::Cancelled) => {
+                return ThumbnailRefreshOutcome::Preempted;
+            }
+            Err(error) => {
+                let message = format!("yt-dlp re-resolve failed: {error}");
+                app_logging::warning(format!("thumbnail refresh failed for {url}: {message}"));
+                return skip_error_video(queue, ytdlp, &cancel, id, url, &message);
+            }
+        }
+    }
+}
+
+/// Skips an error video: the thumbnail kept failing after the yt-dlp
+/// fallback, so the refresh pass would retry the same dead video forever.
+///
+/// The video is removed from the queue instead, so it stops being due at the
+/// next startup. The yt-dlp run is finished first so the next entry can
+/// start one right away.
+fn skip_error_video(
+    queue: &Queue,
+    ytdlp: &Arc<YtdlpControl>,
+    cancel: &Arc<AtomicBool>,
+    id: i64,
+    url: &str,
+    message: &str,
+) -> ThumbnailRefreshOutcome {
+    ytdlp.finish_thumbnail(cancel);
+    match queue.remove_entry(id) {
+        Ok(_) => {
+            app_logging::notice(format!(
+                "thumbnail refresh skipped the error video {url}: {message}"
+            ));
+            ThumbnailRefreshOutcome::Skipped
+        }
+        Err(error) => {
+            app_logging::warning(format!(
+                "thumbnail refresh could not remove the error video {url} from the queue: {error}"
+            ));
+            ThumbnailRefreshOutcome::RetryLater(message.to_string())
         }
     }
 }
@@ -2949,25 +3489,31 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path) -> Resolver {
 }
 
 /// Resolves a URL, offering sign-in when the service requires it.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_with_session(
     resolver: &Resolver,
     session: &Session,
     epoch_state: &AtomicU64,
     epoch: u64,
+    cancel: &Arc<AtomicBool>,
+    pid: &Arc<AtomicU32>,
     url: &str,
     notice: &Sender<Box<Message>>,
 ) -> Result<MediaSource, stream_resolver::Error> {
     use stream_resolver::Error as ResolveError;
 
-    if epoch_state.load(Ordering::SeqCst) != epoch {
+    if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
         return Err(ResolveError::Cancelled);
     }
-    let first = resolver.resolve(url).await;
+    let first = resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await;
     let error = match first {
         Ok(source) => return Ok(source),
         Err(error) => error,
     };
-    if matches!(error, ResolveError::Cancelled) || epoch_state.load(Ordering::SeqCst) != epoch {
+    if matches!(error, ResolveError::Cancelled)
+        || cancel.load(Ordering::SeqCst)
+        || epoch_state.load(Ordering::SeqCst) != epoch
+    {
         return Err(ResolveError::Cancelled);
     }
 
@@ -2977,20 +3523,20 @@ async fn resolve_with_session(
     };
     match session.sign_in(service, url, notice) {
         Ok(()) => {
-            if epoch_state.load(Ordering::SeqCst) != epoch {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
-            resolver.resolve(url).await
+            resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await
         }
         Err(crate::session::Error::Declined) => {
-            if epoch_state.load(Ordering::SeqCst) != epoch {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
             let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
             Err(error)
         }
         Err(problem) => {
-            if epoch_state.load(Ordering::SeqCst) != epoch {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
             Err(ResolveError::Tool(format!("{message} ({problem})")))
@@ -3342,7 +3888,34 @@ mod tests {
         ];
 
         let due = entries_needing_thumbnails(&entries, &cache);
-        let due_urls: Vec<_> = due.iter().map(|(_, url, _)| url.as_str()).collect();
+        let due_urls: Vec<_> = due.iter().map(|(_, _, url, _)| url.as_str()).collect();
         assert_eq!(due_urls, vec!["https://example.com/missing", "https://example.com/stale"]);
+    }
+
+    #[test]
+    fn skipping_an_error_video_removes_the_entry_from_the_queue() {
+        let queue = Queue::in_memory().expect("an in-memory queue opens");
+        let entry = queue
+            .push(
+                "https://www.eporner.com/video-i4Gl3h2QyRE/",
+                "error video",
+                None,
+                Some("https://thumbnails.example.com/broken.jpg"),
+                None,
+            )
+            .expect("an entry is added");
+
+        let ytdlp =
+            Arc::new(YtdlpControl::new(YtDlp::new("yt-dlp", ytdlp_tool::ToolPaths::new("tools"))));
+        let (cancel, _pid) = ytdlp.try_begin_thumbnail().expect("the slot is free");
+
+        let outcome =
+            skip_error_video(&queue, &ytdlp, &cancel, entry.id, &entry.url, "404 not found");
+
+        assert!(matches!(outcome, ThumbnailRefreshOutcome::Skipped));
+        let remaining = queue.entries().expect("the entries are read");
+        assert!(!remaining.iter().any(|other| other.id == entry.id));
+        // The yt-dlp run is cleared so the next entry can start one.
+        assert!(ytdlp.try_begin_thumbnail().is_some());
     }
 }

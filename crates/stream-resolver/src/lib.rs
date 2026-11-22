@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Resolving a URL into a catalog of playable streams.
 //!
 //! # Layer 1 of the isolation ladder
@@ -103,6 +104,18 @@ impl Resolver {
 
     /// Resolves a URL into a [`MediaSource`].
     pub async fn resolve(&self, url: &str) -> Result<MediaSource, Error> {
+        let never = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        self.resolve_with_cancel(url, never, pid).await
+    }
+
+    /// Resolves a URL into a [`MediaSource`], stopping when `cancel` is set.
+    pub async fn resolve_with_cancel(
+        &self,
+        url: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> Result<MediaSource, Error> {
         let mut cookies = Vec::new();
         if let Some(service) = Service::from_url(url)
             && let Some(path) = self.cookies.get(&service)
@@ -118,7 +131,8 @@ impl Resolver {
             args: Vec::new(),
         };
 
-        let result = ytdlp_tool::fetch(request).await.map_err(map_tool_error)?;
+        let result =
+            ytdlp_tool::fetch_with_cancel(request, cancel, pid).await.map_err(map_tool_error)?;
         parse::parse_video(result.video)
     }
 }

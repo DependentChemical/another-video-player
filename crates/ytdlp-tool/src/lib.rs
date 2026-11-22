@@ -21,8 +21,8 @@ mod fetch;
 use std::fmt;
 use std::path::Path;
 
-pub use fetch::{FetchRequest, FetchResult, is_update_required};
-pub use locate::{ToolPaths, YtDlp};
+pub use fetch::{FetchRequest, FetchResult, fetch_with_cancel, is_update_required};
+pub use locate::{ToolPaths, YtDlp, kill_all};
 pub use platform::Platform;
 pub use update::ToolUpdate;
 
@@ -67,8 +67,11 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Default timeout for metadata resolution.
-pub const RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Socket timeout passed to `yt-dlp` for network operations.
+pub const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Hard deadline for metadata resolution before the process is forcibly killed.
+pub const RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Resolves a URL into `yt-dlp` video metadata through the singular yt-dlp access point.
 pub async fn fetch(request: FetchRequest) -> Result<FetchResult, Error> {

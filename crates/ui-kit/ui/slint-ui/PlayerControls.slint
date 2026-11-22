@@ -279,9 +279,14 @@ export component PlayerControls inherits Rectangle {
         }
     }
 
+    // The settings popup sits directly above the control bar, like the
+    // options menu of a YouTube video: the rect's bottom edge is the top
+    // edge of the bar and the panel stretches up by the menu's own height,
+    // so the menu grows with its rows and stays pinned to the bar.
     if root.settings-open: Rectangle {
         width: root.width;
-        height: root.container-height + root.height;
+        height: settings-menu.height;
+        y: -settings-menu.height;
         background: transparent;
 
         TouchArea {
@@ -290,29 +295,15 @@ export component PlayerControls inherits Rectangle {
             clicked => { root.settings-closed(); }
         }
 
-        VerticalLayout {
-            width: parent.width;
-            height: parent.height;
-            padding-left: 12px;
-            padding-right: 12px;
-            padding-top: 12px;
-            padding-bottom: Theme.controls-height + 8px;
-            alignment: end;
-
-            HorizontalLayout {
-                alignment: end;
-
-                SettingsMenu {
-                    open: true;
-                    speed-mode: root.settings-speed-mode;
-                    source-quality-label: root.source-quality-label;
-                    playback-speed: root.playback-speed;
-                    close-requested => { root.settings-closed(); }
-                    sources-requested => { root.sources-requested(); }
-                    speed-mode-requested => { root.speed-mode-requested(); }
-                    speed-changed(value) => { root.speed-changed(value); }
-                }
-            }
+        settings-menu := SettingsMenu {
+            open: true;
+            speed-mode: root.settings-speed-mode;
+            source-quality-label: root.source-quality-label;
+            playback-speed: root.playback-speed;
+            close-requested => { root.settings-closed(); }
+            sources-requested => { root.sources-requested(); }
+            speed-mode-requested => { root.speed-mode-requested(); }
+            speed-changed(value) => { root.speed-changed(value); }
         }
     }
 }

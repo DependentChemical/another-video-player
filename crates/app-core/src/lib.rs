@@ -93,6 +93,7 @@ pub fn run(url: Option<&str>) -> Result<(), Error> {
 
     app_logging::notice("the window event loop is running");
     shell.run();
+    app.shutdown();
     app_logging::notice("the window event loop returned; Flatline is exiting");
     Ok(())
 }

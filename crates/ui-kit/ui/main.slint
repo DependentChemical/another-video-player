@@ -125,6 +125,7 @@ export component MainWindow inherits Window {
 
     // ------------------------------------------------------------ events --
     callback load-requested();
+    callback url-edited(string);
     callback sources-applied(string, string, string);
     callback playback-speed-changed(float);
     callback play-toggled();
@@ -273,6 +274,7 @@ export component MainWindow inherits Window {
         width: parent.width;
         url <=> root.url;
         load-requested => { root.load-requested(); }
+        url-edited(text) => { root.url-edited(text); }
         pointer-activity => { root.pointer-activity(); }
         brand-clicked => { root.sidebar-open = !root.sidebar-open; }
     }

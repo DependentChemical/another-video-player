@@ -178,9 +178,6 @@ impl Queue {
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         thumbnail_id TEXT NOT NULL UNIQUE,
                         source_url TEXT,
-                        full_path TEXT NOT NULL,
-                        mid_path TEXT NOT NULL,
-                        small_path TEXT NOT NULL,
                         created_at INTEGER NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS history (

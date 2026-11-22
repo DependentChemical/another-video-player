@@ -9,6 +9,7 @@ authors.workspace = true
 
 # Layer 1: models on top of the database. Knows nothing about playback or UI.
 [dependencies]
+app-logging = { workspace = true }
 database = { workspace = true }
 image-process = { workspace = true }
 media-model = { workspace = true }

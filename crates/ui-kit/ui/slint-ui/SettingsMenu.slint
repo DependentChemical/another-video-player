@@ -11,7 +11,9 @@ export component SettingsMenu inherits Rectangle {
     callback speed-mode-requested();
     callback speed-changed(float);
 
-    width: 280px;
+    width: 187px;
+    // The menu grows with its rows: the settings popup reads this height.
+    height: rows.preferred-height;
     border-radius: 10px;
     border-width: 1px;
     border-color: Theme.border;
@@ -33,10 +35,6 @@ export component SettingsMenu inherits Rectangle {
         : Math.abs(root.snapped-speed - 2.0) < 0.01 ? "2x"
         : Math.round(root.snapped-speed * 100) / 100 + "x";
 
-    function set-speed-from-ratio(ratio: float) {
-        root.speed-changed(clamp(ratio * 2.0, 0.0, 2.0));
-    }
-
     function snap-speed(speed: float) -> float {
         Math.abs(speed - 0.5) < 0.06 ? 0.5
         : Math.abs(speed - 1.0) < 0.06 ? 1.0
@@ -45,7 +43,7 @@ export component SettingsMenu inherits Rectangle {
         : speed
     }
 
-    VerticalLayout {
+    rows := VerticalLayout {
         padding: 8px;
         spacing: 2px;
 
