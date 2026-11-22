@@ -11,7 +11,9 @@ export component SettingsMenu inherits Rectangle {
     callback speed-mode-requested();
     callback speed-changed(float);
 
-    width: 280px;
+    width: 187px;
+    // The menu grows with its rows: the settings popup reads this height.
+    height: rows.preferred-height;
     border-radius: 10px;
     border-width: 1px;
     border-color: Theme.border;
@@ -41,7 +43,7 @@ export component SettingsMenu inherits Rectangle {
         : speed
     }
 
-    VerticalLayout {
+    rows := VerticalLayout {
         padding: 8px;
         spacing: 2px;
 
