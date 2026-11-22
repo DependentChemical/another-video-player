@@ -1546,8 +1546,9 @@ impl App {
     /// are downloaded one at a time, slowly, so the cache is rebuilt without
     /// blocking playback or the interface. Failures and preemption do not stop
     /// the pass: it waits and retries until the queue is satisfied or work is
-    /// no longer possible. The start is reported to the user through
-    /// [`Message::ThumbnailRefreshStarted`].
+    /// no longer possible. A video whose thumbnail keeps failing after the
+    /// yt-dlp fallback is removed from the queue and the pass moves on. The
+    /// start is reported to the user through [`Message::ThumbnailRefreshStarted`].
     pub fn refresh_queue_thumbnails(&self) {
         let cache = self.cache.clone();
         let queue = self.queue.clone();
@@ -1592,7 +1593,7 @@ impl App {
                 }
 
                 let mut progressed = false;
-                for (position, url, thumbnail_url) in due {
+                for (id, position, url, thumbnail_url) in due {
                     let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
                     let outcome = refresh_thumbnail_entry(
                         &cache,
@@ -1604,6 +1605,7 @@ impl App {
                         &ytdlp,
                         &task_handle,
                         &outbox,
+                        id,
                         position,
                         &url,
                         &thumbnail_url,
@@ -1625,6 +1627,10 @@ impl App {
                                 "thumbnail refresh failed for {url}; retrying in 5s: {error}"
                             ));
                             std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
+                        }
+                        ThumbnailRefreshOutcome::Skipped => {
+                            // The error video is out of the queue; move on.
+                            progressed = true;
                         }
                     }
                 }
@@ -2977,11 +2983,11 @@ impl App {
 /// The queue entries that lack a valid cached thumbnail but can still be
 /// downloaded, because the extractor reported a remote thumbnail URL.
 ///
-/// Returns `(position, url, thumbnail_url)` triples, in queue order.
+/// Returns `(id, position, url, thumbnail_url)` tuples, in queue order.
 fn entries_needing_thumbnails(
     entries: &[library::QueueEntry],
     cache: &ThumbnailCache,
-) -> Vec<(i64, String, String)> {
+) -> Vec<(i64, i64, String, String)> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -2991,7 +2997,12 @@ fn entries_needing_thumbnails(
                 Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
                 Some(_) => true,
             };
-            needed.then_some((entry.position, entry.url.clone(), thumbnail_url.to_string()))
+            needed.then_some((
+                entry.id,
+                entry.position,
+                entry.url.clone(),
+                thumbnail_url.to_string(),
+            ))
         })
         .collect()
 }
@@ -3023,6 +3034,9 @@ enum ThumbnailRefreshOutcome {
     Completed,
     Preempted,
     RetryLater(String),
+    /// The video was removed from the queue because its thumbnail kept
+    /// failing; the pass moves on to the next entry.
+    Skipped,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3036,6 +3050,7 @@ fn refresh_thumbnail_entry(
     ytdlp: &Arc<YtdlpControl>,
     task_handle: &tokio::runtime::Handle,
     outbox: &Arc<Mutex<Sender<Box<Message>>>>,
+    id: i64,
     position: i64,
     url: &str,
     thumbnail_url: &str,
@@ -3127,7 +3142,7 @@ fn refresh_thumbnail_entry(
                         app_logging::warning(format!(
                             "thumbnail refresh failed for {url}: {message}"
                         ));
-                        return ThumbnailRefreshOutcome::RetryLater(message);
+                        return skip_error_video(queue, ytdlp, &cancel, id, url, &message);
                     }
                 }
             }
@@ -3137,8 +3152,39 @@ fn refresh_thumbnail_entry(
             Err(error) => {
                 let message = format!("yt-dlp re-resolve failed: {error}");
                 app_logging::warning(format!("thumbnail refresh failed for {url}: {message}"));
-                return ThumbnailRefreshOutcome::RetryLater(message);
+                return skip_error_video(queue, ytdlp, &cancel, id, url, &message);
             }
+        }
+    }
+}
+
+/// Skips an error video: the thumbnail kept failing after the yt-dlp
+/// fallback, so the refresh pass would retry the same dead video forever.
+///
+/// The video is removed from the queue instead, so it stops being due at the
+/// next startup. The yt-dlp run is finished first so the next entry can
+/// start one right away.
+fn skip_error_video(
+    queue: &Queue,
+    ytdlp: &Arc<YtdlpControl>,
+    cancel: &Arc<AtomicBool>,
+    id: i64,
+    url: &str,
+    message: &str,
+) -> ThumbnailRefreshOutcome {
+    ytdlp.finish_thumbnail(cancel);
+    match queue.remove_entry(id) {
+        Ok(_) => {
+            app_logging::notice(format!(
+                "thumbnail refresh skipped the error video {url}: {message}"
+            ));
+            ThumbnailRefreshOutcome::Skipped
+        }
+        Err(error) => {
+            app_logging::warning(format!(
+                "thumbnail refresh could not remove the error video {url} from the queue: {error}"
+            ));
+            ThumbnailRefreshOutcome::RetryLater(message.to_string())
         }
     }
 }
@@ -3762,7 +3808,34 @@ mod tests {
         ];
 
         let due = entries_needing_thumbnails(&entries, &cache);
-        let due_urls: Vec<_> = due.iter().map(|(_, url, _)| url.as_str()).collect();
+        let due_urls: Vec<_> = due.iter().map(|(_, _, url, _)| url.as_str()).collect();
         assert_eq!(due_urls, vec!["https://example.com/missing", "https://example.com/stale"]);
+    }
+
+    #[test]
+    fn skipping_an_error_video_removes_the_entry_from_the_queue() {
+        let queue = Queue::in_memory().expect("an in-memory queue opens");
+        let entry = queue
+            .push(
+                "https://www.eporner.com/video-i4Gl3h2QyRE/",
+                "error video",
+                None,
+                Some("https://thumbnails.example.com/broken.jpg"),
+                None,
+            )
+            .expect("an entry is added");
+
+        let ytdlp =
+            Arc::new(YtdlpControl::new(YtDlp::new("yt-dlp", ytdlp_tool::ToolPaths::new("tools"))));
+        let (cancel, _pid) = ytdlp.try_begin_thumbnail().expect("the slot is free");
+
+        let outcome =
+            skip_error_video(&queue, &ytdlp, &cancel, entry.id, &entry.url, "404 not found");
+
+        assert!(matches!(outcome, ThumbnailRefreshOutcome::Skipped));
+        let remaining = queue.entries().expect("the entries are read");
+        assert!(!remaining.iter().any(|other| other.id == entry.id));
+        // The yt-dlp run is cleared so the next entry can start one.
+        assert!(ytdlp.try_begin_thumbnail().is_some());
     }
 }
