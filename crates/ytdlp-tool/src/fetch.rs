@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -100,22 +101,10 @@ fn run_fetch(
         ))
     })?;
     pid.store(child.id(), Ordering::SeqCst);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut out) = stdout {
-            let _ = out.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut err) = stderr {
-            let _ = err.read_to_end(&mut bytes);
-        }
-        bytes
-    });
+    let stdout_tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stderr_tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_tail_reader(child.stdout.take(), Arc::clone(&stdout_tail));
+    let stderr_reader = spawn_tail_reader(child.stderr.take(), Arc::clone(&stderr_tail));
 
     let started = Instant::now();
     let deadline = started + RESOLUTION_TIMEOUT;
@@ -131,58 +120,47 @@ fn run_fetch(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) => {
                 let elapsed = started.elapsed();
                 if !socket_timeout_logged && elapsed >= SOCKET_TIMEOUT {
                     socket_timeout_logged = true;
                     app_logging::warning(format!(
-                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s",
+                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_tail=\"{}\" stdout_tail=\"{}\"",
                         SOCKET_TIMEOUT.as_secs(),
                         elapsed.as_secs(),
-                        RESOLUTION_TIMEOUT.as_secs()
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        output_excerpt(&stderr_tail),
+                        output_excerpt(&stdout_tail),
                     ));
                 }
+                if Instant::now() >= deadline {
+                    let stderr_text = tail_text(&stderr_tail);
+                    let stdout_text = tail_text(&stdout_tail);
+                    let stderr_excerpt = last_chars(&stderr_text, 300);
+                    let stdout_excerpt = last_chars(&stdout_text, 300);
+                    crate::locate::terminate_child_process(&mut child);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    app_logging::warning(format!(
+                        "yt-dlp hard timeout reached; killing process: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
+                        SOCKET_TIMEOUT.as_secs(),
+                        elapsed.as_secs(),
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        stderr_text.len(),
+                        stdout_text.len(),
+                        stderr_excerpt,
+                        stdout_excerpt
+                    ));
+                    crate::locate::kill_all(tool);
+                    pid.store(0, Ordering::SeqCst);
+                    return Err(Error::YtDlp(format!(
+                        "yt-dlp did not respond within {} seconds; last output: stderr=\"{}\" stdout=\"{}\"",
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        stderr_excerpt,
+                        stdout_excerpt
+                    )));
+                }
                 thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let elapsed = started.elapsed();
-                crate::locate::terminate_child_process(&mut child);
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                let stderr_tail = String::from_utf8_lossy(&stderr);
-                let stdout_tail = String::from_utf8_lossy(&stdout);
-                let stderr_tail = stderr_tail.trim();
-                let stdout_tail = stdout_tail.trim();
-                app_logging::warning(format!(
-                    "yt-dlp hard timeout reached; killing process: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
-                    SOCKET_TIMEOUT.as_secs(),
-                    elapsed.as_secs(),
-                    RESOLUTION_TIMEOUT.as_secs(),
-                    stderr.len(),
-                    stdout.len(),
-                    stderr_tail
-                        .chars()
-                        .rev()
-                        .take(300)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>(),
-                    stdout_tail
-                        .chars()
-                        .rev()
-                        .take(300)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                ));
-                crate::locate::kill_all(tool);
-                pid.store(0, Ordering::SeqCst);
-                return Err(Error::YtDlp(format!(
-                    "yt-dlp did not respond within {} seconds",
-                    RESOLUTION_TIMEOUT.as_secs()
-                )));
             }
             Err(error) => {
                 crate::locate::terminate_child_process(&mut child);
@@ -195,25 +173,72 @@ fn run_fetch(
         }
     };
     pid.store(0, Ordering::SeqCst);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    let stdout = tail_text(&stdout_tail);
+    let stderr = tail_text(&stderr_tail);
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
     if !status.success() {
-        let message = String::from_utf8_lossy(&stderr).trim().to_string();
-        let message = if message.is_empty() {
-            String::from_utf8_lossy(&stdout).trim().to_string()
-        } else {
-            message
-        };
+        let message = if stderr.is_empty() { stdout } else { stderr };
         let detail =
             if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
         return Err(Error::YtDlp(detail));
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&stdout)
+    let value: serde_json::Value = serde_json::from_str(&stdout)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
     deserialize_video_lenient(value)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
+}
+
+/// Live tail of one of `yt-dlp`'s output streams, kept while the stream is read.
+type OutputTail = Arc<Mutex<Vec<u8>>>;
+
+/// Maximum bytes kept of each output stream.
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The trimmed text of the output stream's tail.
+fn tail_text(tail: &OutputTail) -> String {
+    let guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    String::from_utf8_lossy(guard.as_slice()).trim().to_string()
+}
+
+/// The final part of the output stream's text, limited to its last 300 characters.
+fn output_excerpt(tail: &OutputTail) -> String {
+    last_chars(&tail_text(tail), 300)
+}
+
+/// The last `count` characters of `text`, in their original order.
+fn last_chars(text: &str, count: usize) -> String {
+    text.chars().rev().take(count).collect::<String>().chars().rev().collect()
+}
+
+/// Reads `stream` into `tail` until it ends, keeping only its final bytes.
+fn spawn_tail_reader<R: Read + Send + 'static>(
+    stream: Option<R>,
+    tail: OutputTail,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Some(mut stream) = stream {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut guard =
+                            tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.extend_from_slice(&buffer[..n]);
+                        if guard.len() > MAX_OUTPUT_BYTES {
+                            let start = guard.len() - MAX_OUTPUT_BYTES;
+                            guard.copy_within(start.., 0);
+                            guard.truncate(MAX_OUTPUT_BYTES);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    })
 }
 
 fn common_args(extra: &[String]) -> Vec<String> {
@@ -223,6 +248,7 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "--ignore-config".to_string(),
         "--socket-timeout".to_string(),
         SOCKET_TIMEOUT.as_secs().to_string(),
+        "-v".to_string(),
     ];
     for arg in extra {
         if !args.iter().any(|existing| existing == arg) {
@@ -550,5 +576,39 @@ mod tests {
     #[test]
     fn rejects_documents_of_the_wrong_shape() {
         assert!(deserialize_video_lenient(json!({ "id": 1 })).is_err());
+    }
+
+    #[test]
+    fn tail_reader_records_the_stream_output() {
+        let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_tail_reader(
+            Some(std::io::Cursor::new(b"line1\nline2\n".to_vec())),
+            Arc::clone(&tail),
+        );
+        let _ = handle.join();
+        assert_eq!(tail_text(&tail), "line1\nline2");
+    }
+
+    #[test]
+    fn tail_reader_keeps_only_the_final_bytes() {
+        let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_tail_reader(
+            Some(std::io::Cursor::new(vec![b'a'; MAX_OUTPUT_BYTES + 100])),
+            Arc::clone(&tail),
+        );
+        let _ = handle.join();
+        assert_eq!(tail.lock().unwrap().len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn tail_text_trims_the_stream_contents() {
+        let tail: OutputTail = Arc::new(Mutex::new(b"  hello\n\n".to_vec()));
+        assert_eq!(tail_text(&tail), "hello");
+    }
+
+    #[test]
+    fn output_excerpt_is_bounded_to_300_characters() {
+        let tail: OutputTail = Arc::new(Mutex::new(vec![b'x'; 1000]));
+        assert_eq!(output_excerpt(&tail).chars().count(), 300);
     }
 }
