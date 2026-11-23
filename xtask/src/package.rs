@@ -183,8 +183,12 @@ fn copy_bun(staging: &Path, platform: Platform) -> Result<(), String> {
         let mut entry = archive_zip
             .by_index(index)
             .map_err(|error| format!("the bun archive could not be read: {error}"))?;
-        let name = entry.name().to_string();
-        if name != bin_name && name != format!("{}.exe", bin_name) {
+        let full_name = entry.name().to_string();
+        let file_name = std::path::Path::new(&full_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&full_name);
+        if file_name != bin_name.as_str() {
             continue;
         }
         let mut out = std::fs::File::create(&destination).map_err(|error| error.to_string())?;
