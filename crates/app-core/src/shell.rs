@@ -160,6 +160,12 @@ impl Shell {
                         last_pointer_activity.set(Instant::now());
                         EventResult::Propagate
                     }
+                    winit::event::WindowEvent::Focused(false) => {
+                        // The window lost the focus, so the URL bar is not
+                        // the place the user works in any more.
+                        release_empty_url_bar(&ui_for_events);
+                        EventResult::Propagate
+                    }
                     _ => EventResult::Propagate,
                 }
             });
@@ -177,9 +183,9 @@ impl Shell {
             });
         }
         {
-            let app = Arc::clone(&app);
-            ui.on_url_edited(move |url| {
-                app.preview_url(url.to_string());
+            let ui_for_outside = Rc::clone(&ui);
+            ui.on_outside_clicked(move || {
+                release_empty_url_bar(&ui_for_outside);
             });
         }
         {
@@ -606,8 +612,8 @@ impl Shell {
         };
         self.last_pointer_activity.set(Instant::now());
         self.ui.set_url(url);
-        self.loading.borrow_mut().resolve_started();
-        self.app.load(url.to_string());
+        self.loading.borrow_mut().entry_started();
+        self.app.submit_url(url.to_string());
     }
 
     /// Opens the update modal with a fake update so it can be tested.
@@ -638,6 +644,18 @@ fn requested_url(url: &str) -> Option<&str> {
     (!url.is_empty()).then_some(url)
 }
 
+/// Releases the URL bar when it holds nothing.
+///
+/// An empty field that keeps the focus looks active and hides its
+/// placeholder, even though there is nothing to edit. A click anywhere else
+/// or a window that loses the focus puts the bar back into its resting
+/// state.
+fn release_empty_url_bar(ui: &PlayerUi) {
+    if ui.get_url().trim().is_empty() {
+        ui.blur_url();
+    }
+}
+
 /// The internal `test://` URL that forces the update prompt to open.
 ///
 /// These URLs never reach the resolver: they are commands that exercise the
@@ -649,7 +667,7 @@ fn is_test_url(url: &str) -> bool {
     url.trim().to_ascii_lowercase().starts_with("test://")
 }
 
-/// Starts loading a URL for the user, from the bar or from the history.
+/// Starts processing a URL for the user, from the bar or from the history.
 ///
 /// A `test://` URL never reaches the resolver: it is an internal command that
 /// exercises the interface directly, so the resolver never sees it.
@@ -661,15 +679,17 @@ fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
         handle_test_url(ui, url);
         return;
     }
-    if app.is_playing() {
-        // Something settled is playing, so the new URL must not interrupt it.
-        // A toast says the background is working and the dialog appears once
-        // the media is resolved.
-        ui.show_toast("Parsing video");
-    } else {
-        loading.borrow_mut().resolve_started();
+    // A media that is already playing keeps playing, so the entry stays
+    // invisible there and only the notification is shown. An idle player
+    // shows the indicator instead.
+    if !app.is_playing() {
+        loading.borrow_mut().entry_started();
     }
-    app.load(url.to_string());
+    // The new URL replaces the video that waits for the user's choice, so
+    // the old dialog is taken down with it.
+    app.dismiss_pending();
+    ui.hide_pending();
+    app.submit_url(url.to_string());
 }
 
 /// Handles the internal `test://` commands that exercise the interface.
@@ -949,28 +969,35 @@ fn tick(
                     ui.set_duration(duration);
                 }
             }
-            Message::Resolved(Err((url, error))) => {
+            Message::Resolved(Err(failure)) => {
+                let url = failure.url.clone();
                 if !app.expects_resolved_url(&url) {
                     app_logging::debug(format!(
-                        "ignored a resolver error that is no longer relevant: url={url} error={error}"
+                        "ignored a resolver error that is no longer relevant: url={url} error={}",
+                        failure.message
                     ));
                     continue;
                 }
-                app_logging::warning(format!("resolution failed: url={url} error={error}"));
-                loading.resolve_failed(error.clone());
+                app_logging::warning(format!(
+                    "resolution failed: url={url} error={}",
+                    failure.message
+                ));
+                loading.resolve_failed(failure.message.clone());
                 // Schedule a retry for resolver errors
                 if app.resolving_url().as_deref() == Some(url.as_str()) {
-                    app.handle_resolver_error(url, error);
+                    app.handle_resolver_error(failure);
                 } else {
-                    ui.show_toast(&error);
+                    ui.show_toast(&failure.message);
                 }
             }
-            Message::Pending(Ok(pending)) => {
-                if !app.is_current_epoch(pending.epoch) {
-                    app_logging::debug("discarded a pending video that was superseded");
+            Message::Pending(pending) => {
+                if !app.is_current_url_entry(pending.epoch) {
+                    app_logging::debug(format!(
+                        "discarded a url entry that was replaced before it was shown: url={}",
+                        pending.url
+                    ));
                     continue;
                 }
-                app.clear_url_entry_retry();
                 let in_playlist = app.active_playlist_name().is_some();
                 ui.show_pending(
                     &pending.title,
@@ -979,17 +1006,27 @@ fn tick(
                     &playlist_list(app),
                 );
                 app.set_pending(pending);
+                loading.entry_finished();
             }
-            Message::Pending(Err(error)) => {
-                ui.show_url_error(&error);
-                app.report_url_entry_failure(error);
-            }
-            Message::UrlPreviewFailed { url, error } => {
-                if app.retry_url_entry_with_force_ipv4(&url) {
-                    break;
+            Message::UrlEntryFailed { url, error, timeout_seconds, epoch } => {
+                if !app.is_current_url_entry(epoch) {
+                    app_logging::debug(format!(
+                        "discarded the failure of a url entry that was replaced: url={url}"
+                    ));
+                    continue;
                 }
+                // Only the hard timeout is worth a second attempt, because it
+                // is the only failure a different network stack can fix.
+                if let Some(seconds) = timeout_seconds
+                    && app.retry_url_entry_with_force_ipv4(&url, epoch, seconds)
+                {
+                    continue;
+                }
+                // The entry ends here: its process is killed and the error is
+                // shown in the modal.
+                app.cancel_url_entry();
+                loading.entry_failed(error.clone());
                 ui.show_url_error(&error);
-                app.report_url_entry_failure(error);
             }
             Message::SigningIn(service) => {
                 ui.show_toast(&format!("Sign in to {} to continue", service.label()));

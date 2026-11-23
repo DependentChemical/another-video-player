@@ -381,6 +381,11 @@ impl PlayerUi {
         self.window.set_url(url.into());
     }
 
+    /// The URL that is currently in the address bar.
+    pub fn get_url(&self) -> String {
+        self.window.get_url().to_string()
+    }
+
     /// Removes focus from the URL bar so it shows its placeholder when empty.
     pub fn blur_url(&self) {
         self.window.invoke_blur_url();
@@ -837,9 +842,11 @@ impl PlayerUi {
         });
     }
 
-    /// Called when the URL bar text changes.
-    pub fn on_url_edited(&self, handler: impl Fn(String) + 'static) {
-        self.window.on_url_edited(move |text| handler(text.to_string()));
+    /// Called when the user clicks outside the URL bar.
+    ///
+    /// The URL bar uses this to stop looking active when it is empty.
+    pub fn on_outside_clicked(&self, handler: impl Fn() + 'static) {
+        self.window.on_outside_clicked(handler);
     }
 
     /// Called when the user applies a source selection.

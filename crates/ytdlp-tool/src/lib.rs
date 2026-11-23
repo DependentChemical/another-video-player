@@ -41,6 +41,20 @@ pub enum Error {
     Parse(String),
     /// The current platform has no supported way to run `yt-dlp`.
     UnsupportedPlatform,
+    /// The process did not answer before its hard deadline.
+    ///
+    /// This is the one failure that is a timeout of Flatline's own making:
+    /// the process was killed because it ran out of time. Every other
+    /// network failure is reported by `yt-dlp` itself and stays a
+    /// [`Error::YtDlp`].
+    Timeout {
+        /// The deadline that was reached, in seconds.
+        seconds: u64,
+        /// What the process had written when it was killed.
+        detail: String,
+    },
+    /// The request was cancelled before it finished.
+    Cancelled,
     /// The `yt-dlp` crate reported an error.
     YtDlp(String),
 }
@@ -54,6 +68,14 @@ impl fmt::Display for Error {
             Error::Http(m) => write!(f, "network error: {m}"),
             Error::Parse(m) => write!(f, "could not parse response: {m}"),
             Error::UnsupportedPlatform => write!(f, "yt-dlp is unsupported on this platform"),
+            Error::Timeout { seconds, detail } => {
+                if detail.is_empty() {
+                    write!(f, "yt-dlp did not respond within {seconds} seconds")
+                } else {
+                    write!(f, "yt-dlp did not respond within {seconds} seconds; {detail}")
+                }
+            }
+            Error::Cancelled => write!(f, "yt-dlp request was cancelled"),
             Error::YtDlp(m) => write!(f, "{m}"),
         }
     }

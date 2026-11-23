@@ -48,6 +48,11 @@ pub struct Loading {
     current_file: bool,
     /// Prevents a persistent mpv EOF state from advancing on every UI tick.
     eof_consumed: bool,
+    /// Whether the indicator waits for a URL the user submitted.
+    ///
+    /// The entry only owns the indicator while the player was idle, so the
+    /// outcome of an entry never disturbs a media that is already playing.
+    entry_pending: bool,
 }
 
 impl Default for Loading {
@@ -57,6 +62,7 @@ impl Default for Loading {
             status: Status::Info(String::new()),
             current_file: false,
             eof_consumed: false,
+            entry_pending: false,
         }
     }
 }
@@ -82,7 +88,48 @@ impl Loading {
         self.phase = Phase::Resolving;
         self.status = Status::Busy(RESOLVING);
         self.current_file = false;
+        self.entry_pending = false;
         self.suppress_eof();
+    }
+
+    /// The URL the user submitted is on its way to the resolver.
+    ///
+    /// The indicator is only taken when the player was idle. A media that is
+    /// already playing keeps its own state, so the entry stays invisible
+    /// there and the notification is a toast.
+    pub fn entry_started(&mut self) {
+        self.phase = Phase::Resolving;
+        self.status = Status::Busy(RESOLVING);
+        self.current_file = false;
+        self.entry_pending = true;
+        self.suppress_eof();
+    }
+
+    /// The URL the user submitted was processed and waits for the user's choice.
+    ///
+    /// The indicator is released again; nothing is loading any more.
+    pub fn entry_finished(&mut self) {
+        if !self.entry_pending {
+            return;
+        }
+        self.entry_pending = false;
+        self.phase = Phase::Idle;
+        self.status = Status::Info(String::new());
+        self.current_file = false;
+    }
+
+    /// The URL the user submitted could not be processed.
+    ///
+    /// The indicator is only touched when the entry owns it, so a failure
+    /// never disturbs a media that is already playing.
+    pub fn entry_failed(&mut self, error: String) {
+        if !self.entry_pending {
+            return;
+        }
+        self.entry_pending = false;
+        self.phase = Phase::Idle;
+        self.status = Status::Error(error);
+        self.current_file = false;
     }
 
     /// The URL resolved and the player was given a plan to play.
@@ -299,6 +346,62 @@ mod tests {
 
         assert_eq!(loading.status(), &Status::Error("nope".to_string()));
         assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_submitted_url_takes_the_indicator() {
+        let mut loading = Loading::new();
+        loading.entry_started();
+
+        assert_eq!(loading.status(), &Status::Busy(RESOLVING));
+        assert!(loading.is_busy());
+    }
+
+    #[test]
+    fn a_processed_url_releases_the_indicator() {
+        let mut loading = Loading::new();
+        loading.entry_started();
+        loading.entry_finished();
+
+        assert_eq!(loading.status(), &Status::Info(String::new()));
+        assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_failed_url_leaves_a_playing_media_alone() {
+        let mut loading = Loading::new();
+        loading.resolved();
+        loading.file_started();
+        loading.observe(true, false);
+
+        // The entry never owned the indicator, so its failure must not
+        // disturb the media that is playing.
+        loading.entry_failed("nope".to_string());
+
+        assert_eq!(loading.status(), &Status::Info(String::new()));
+    }
+
+    #[test]
+    fn a_failed_url_reports_the_error_when_it_owned_the_indicator() {
+        let mut loading = Loading::new();
+        loading.entry_started();
+        loading.entry_failed("nope".to_string());
+
+        assert_eq!(loading.status(), &Status::Error("nope".to_string()));
+        assert!(!loading.is_busy());
+    }
+
+    #[test]
+    fn a_playback_resolve_takes_the_indicator_from_the_entry() {
+        let mut loading = Loading::new();
+        loading.entry_started();
+        loading.resolve_started();
+
+        // The playback owns the indicator now, so the entry cannot take it
+        // away when it ends.
+        loading.entry_failed("nope".to_string());
+
+        assert_eq!(loading.status(), &Status::Busy(RESOLVING));
     }
 
     #[test]

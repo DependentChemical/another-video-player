@@ -169,6 +169,7 @@ export component MainWindow inherits Window {
     callback pending-add-to-playlist(string);
     callback pending-add-to-new-playlist();
     callback history-item-selected(string);
+    callback outside-clicked();
 
     // --------------------------------------------------------- internals --
     // The picker edits a draft, so cancelling leaves the playing selection
@@ -238,6 +239,9 @@ export component MainWindow inherits Window {
         width: parent.width;
         height: parent.height;
         moved => { root.pointer-activity(); }
+        // A click that is not taken by the bar or a button lands here, so
+        // the URL bar learns that the user clicked away from it.
+        clicked => { root.outside-clicked(); }
         pointer-event(event) => {
             if event.kind == PointerEventKind.move { root.pointer-activity(); }
         }
@@ -278,7 +282,6 @@ export component MainWindow inherits Window {
         width: parent.width;
         url <=> root.url;
         load-requested => { root.load-requested(); }
-        url-edited(text) => { root.url-edited(text); }
         pointer-activity => { root.pointer-activity(); }
         brand-clicked => { root.sidebar-open = !root.sidebar-open; }
     }
@@ -612,6 +615,10 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: min(520px, parent.width - 40px);
+            // The dialog keeps its height no matter how long the message is,
+            // so a long error scrolls instead of pushing the dialog off the
+            // screen.
+            height: min(300px, parent.height - 40px);
             background: Theme.panel;
             border-radius: 12px;
             border-width: 1px;
@@ -625,10 +632,17 @@ export component MainWindow inherits Window {
                     font-size: 20px;
                     wrap: word-wrap;
                 }
-                Text {
-                    text: root.error-message;
-                    color: Theme.muted;
-                    wrap: word-wrap;
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 4px;
+                        padding-right: 10px;
+                        Text {
+                            text: root.error-message;
+                            color: Theme.muted;
+                            wrap: word-wrap;
+                        }
+                    }
                 }
                 HorizontalLayout {
                     alignment: end;
