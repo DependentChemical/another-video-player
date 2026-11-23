@@ -8,10 +8,11 @@ this repository. Read it before changing anything.
 
 ## ⚠️ IMPORTANT and URGENT: check `yt-dlp` for a new stable release
 
-> **Always run a background check for a newer stable `yt-dlp` release before
-> and after touching the resolver, the extractor arguments or the JavaScript
-> runtime.** Most YouTube failures are not Flatline bugs: they are a `yt-dlp`
-> that has fallen behind YouTube.
+> **Reminder: check in the background for a newer stable `yt-dlp` release
+> before and after touching the resolver, the extractor arguments or the
+> JavaScript runtime.** This is an important reminder, not a hard block, but
+> most YouTube failures are not Flatline bugs: they are a `yt-dlp` that has
+> fallen behind YouTube.
 
 The YouTube extractor arguments in `crates/sources/source-youtube` are a
 **quick fix**, not a solution. `--extractor-args
