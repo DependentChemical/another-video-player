@@ -147,8 +147,16 @@ fn run_fetch(
                     crate::locate::terminate_child_process(&mut child);
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
+                    let stage =
+                        if stderr_excerpt.to_ascii_lowercase().contains("downloading webpage") {
+                            "downloading_webpage"
+                        } else if stderr_excerpt.to_ascii_lowercase().contains("extracting url") {
+                            "extracting_url"
+                        } else {
+                            "unknown"
+                        };
                     app_logging::warning(format!(
-                        "yt-dlp hard timeout reached; killing process: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
+                        "yt-dlp hard timeout reached; killing process: url={url} stage={stage} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
                         SOCKET_TIMEOUT.as_secs(),
                         elapsed.as_secs(),
                         RESOLUTION_TIMEOUT.as_secs(),
@@ -157,7 +165,6 @@ fn run_fetch(
                         stderr_excerpt,
                         stdout_excerpt
                     ));
-                    crate::locate::kill_all(tool);
                     pid.store(0, Ordering::SeqCst);
                     return Err(Error::YtDlp(format!(
                         "yt-dlp did not respond within {} seconds; last output: stderr=\"{}\" stdout=\"{}\"",
@@ -272,14 +279,26 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "--no-warnings".to_string(),
         "--no-progress".to_string(),
         "--ignore-config".to_string(),
-        "--socket-timeout".to_string(),
-        SOCKET_TIMEOUT.as_secs().to_string(),
         "-v".to_string(),
     ];
-    for arg in extra {
+    let mut has_socket_timeout = false;
+    let mut iter = extra.iter();
+    while let Some(arg) = iter.next() {
         if !args.iter().any(|existing| existing == arg) {
             args.push(arg.clone());
         }
+        if arg == "--socket-timeout" {
+            has_socket_timeout = true;
+            if let Some(value) = iter.next()
+                && !args.iter().any(|existing| existing == value)
+            {
+                args.push(value.clone());
+            }
+        }
+    }
+    if !has_socket_timeout {
+        args.insert(3, SOCKET_TIMEOUT.as_secs().to_string());
+        args.insert(3, "--socket-timeout".to_string());
     }
     args
 }
@@ -667,6 +686,15 @@ mod tests {
     fn parse_document_takes_the_first_value_and_ignores_trailing_text() {
         let text = serde_json::to_string(&well_formed_video()).expect("video serializes");
         assert!(parse_document(&format!("{text} trailing text")).is_ok());
+    }
+
+    #[test]
+    fn common_args_include_socket_timeout_once() {
+        let args =
+            common_args(&["-4".to_string(), "--socket-timeout".to_string(), "20".to_string()]);
+        assert_eq!(args.iter().filter(|a| a.as_str() == "--socket-timeout").count(), 1);
+        assert!(args.windows(2).any(|w| w[0] == "--socket-timeout" && w[1] == "20"));
+        assert!(args.iter().any(|a| a == "-4"));
     }
 
     #[test]

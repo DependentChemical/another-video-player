@@ -205,8 +205,11 @@ const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
 
-/// Retry delay for all yt-dlp/network/player failures. Immediate by design.
-const RETRY_DELAY: Duration = Duration::from_secs(0);
+/// Base delay before the first retry. Hard timeouts grow from here but stay capped.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(0);
+
+/// Upper bound for retry backoff so playback recovery stays responsive.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(16);
 
 /// How long the background thumbnail pass waits between downloads or retries.
 const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
@@ -289,12 +292,14 @@ struct State {
 struct RetryState {
     /// The URL being retried.
     url: Option<String>,
-    /// Number of retry attempts made.
+    /// How many attempts have been made.
     attempt: u32,
-    /// When the next retry should happen.
+    /// When to try again.
     next_retry: Option<Instant>,
     /// The type of error being retried.
     error_kind: Option<RetryErrorKind>,
+    /// Last error message, used to keep backoff stable for identical failures.
+    last_error: Option<String>,
 }
 
 /// The kind of error that triggered a retry.
@@ -314,7 +319,7 @@ impl RetryState {
     /// Returns `false` when the same retry is already scheduled, so repeated
     /// error events for one failed load neither push the retry back nor report
     /// it again.
-    fn start(&mut self, url: String, kind: RetryErrorKind) -> bool {
+    fn start(&mut self, url: String, kind: RetryErrorKind, message: &str) -> bool {
         if self.url.as_deref() == Some(url.as_str()) && self.error_kind == Some(kind) {
             if self.next_retry.is_some() {
                 return false;
@@ -324,7 +329,8 @@ impl RetryState {
             self.error_kind = Some(kind);
             self.attempt = 0;
         }
-        self.schedule_next();
+        self.last_error = Some(message.to_string());
+        self.schedule_next(kind, message);
         true
     }
 
@@ -343,9 +349,9 @@ impl RetryState {
         Some((url, kind))
     }
 
-    /// Schedules the next retry immediately.
-    fn schedule_next(&mut self) {
-        self.next_retry = Some(Instant::now() + RETRY_DELAY);
+    /// Schedules the next retry with bounded backoff for hard network timeouts.
+    fn schedule_next(&mut self, kind: RetryErrorKind, message: &str) {
+        self.next_retry = Some(Instant::now() + retry_delay(kind, message, self.attempt));
     }
 
     /// Checks if it's time to retry.
@@ -361,8 +367,10 @@ impl RetryState {
     /// Increments the attempt counter and schedules the next retry.
     #[cfg(test)]
     fn next_attempt(&mut self) {
+        let kind = self.error_kind.unwrap_or(RetryErrorKind::Resolver);
+        let msg = self.last_error.clone().unwrap_or_default();
         self.attempt += 1;
-        self.schedule_next();
+        self.schedule_next(kind, &msg);
     }
 
     /// Clears the retry state.
@@ -518,7 +526,6 @@ impl YtdlpControl {
         terminate_pid(p1.load(Ordering::SeqCst));
         terminate_pid(p2.load(Ordering::SeqCst));
         terminate_pid(p3.load(Ordering::SeqCst));
-        self.kill_all();
     }
 
     fn kill_all(&self) {
@@ -571,9 +578,9 @@ impl App {
         // Clear them before creating the engine so mpv never sees stale data.
         clear_stream_buffer(&stream_buffer);
         let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
-        let resolver = build_resolver(ytdlp, &paths.cookies());
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
+        let resolver = build_resolver(ytdlp, &paths.cookies(), &settings);
         let pre_buffer_seconds = settings.pre_buffer_seconds().0;
         app_logging::notice(format!(
             "settings loaded from {}; pre-buffer={pre_buffer_seconds}s log_level={}",
@@ -2222,7 +2229,7 @@ impl App {
     fn regenerate_cookies(&self, service: Service) {
         let tool = self.ytdlp.tool();
         *self.resolver.lock().expect("the resolver is not poisoned") =
-            build_resolver(&tool, self.session.cookies_dir());
+            build_resolver(&tool, self.session.cookies_dir(), &self.settings);
         app_logging::notice(format!(
             "the cookies used by the retry are regenerated: service={}",
             service.name()
@@ -2245,7 +2252,7 @@ impl App {
             return;
         }
         let mut state = self.state.lock().expect("the state is not poisoned");
-        let scheduled = state.retry.start(url, kind);
+        let scheduled = state.retry.start(url, kind, &message);
         let attempt = state.retry.attempt;
         if state.retry.exhausted() {
             state.retry.clear();
@@ -2259,16 +2266,19 @@ impl App {
         if !scheduled {
             return;
         }
-        state.retry.schedule_next();
+        let delay = retry_delay(kind, &message, attempt.saturating_sub(1));
+        let delay_seconds = delay.as_secs();
         let error = message.clone();
         drop(state);
         app_logging::warning(format!(
-            "retrying immediately: kind={kind:?} attempt={attempt} error={message}"
+            "retry scheduled: kind={kind:?} attempt={attempt} delay={}s timeout_class={} error={message}",
+            delay_seconds,
+            is_hard_timeout(kind, &message)
         ));
         let _ = self.outbox.lock().map(|sender| {
             sender.send(Box::new(Message::RetryScheduled {
                 error,
-                delay_seconds: 0,
+                delay_seconds,
                 kind: report_kind,
             }))
         });
@@ -2582,7 +2592,7 @@ impl App {
         self.ytdlp.cancel_all();
         self.ytdlp.replace_tool(ytdlp.clone());
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = build_resolver(ytdlp, self.session.cookies_dir());
+        *resolver = build_resolver(ytdlp, self.session.cookies_dir(), &self.settings);
     }
 
     /// Starts background checks for application and `yt-dlp` updates at startup and then periodically.
@@ -2617,7 +2627,7 @@ impl App {
             return false;
         }
         app_logging::warning(format!(
-            "yt-dlp timeout detected; killing all yt-dlp processes: {error}"
+            "yt-dlp timeout detected; cancelling active yt-dlp requests without killing unrelated processes: {error}"
         ));
         self.ytdlp.cancel_all();
         self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
@@ -2773,6 +2783,7 @@ impl App {
         let resolver = Arc::clone(&self.resolver);
         let ytdlp = Arc::clone(&self.ytdlp);
         let cookies = self.session.cookies_dir().to_path_buf();
+        let settings = self.settings.clone();
         let paths = self.paths.clone();
         self.runtime.handle().spawn(async move {
             app_logging::notice(format!(
@@ -2790,7 +2801,7 @@ impl App {
                     let tool = ytdlp_tool::locate::at(&managed, tools.clone());
                     ytdlp.replace_tool(tool.clone());
                     if let Ok(mut resolver) = resolver.lock() {
-                        *resolver = build_resolver(&tool, &cookies);
+                        *resolver = build_resolver(&tool, &cookies, &settings);
                     }
                     app_logging::notice(format!("yt-dlp update applied: latest={version}"));
                     let _ = outbox
@@ -3473,9 +3484,38 @@ fn sponsorblock_color(category: &str) -> [u8; 3] {
     }
 }
 
+/// Retry delay for a failure class. Hard network timeouts get bounded backoff.
+fn retry_delay(kind: RetryErrorKind, message: &str, attempt: u32) -> Duration {
+    if !is_hard_timeout(kind, message) {
+        return RETRY_BASE_DELAY;
+    }
+    let secs = match attempt {
+        0 => 2,
+        1 => 4,
+        2 => 8,
+        _ => 16,
+    };
+    Duration::from_secs(secs).min(RETRY_MAX_DELAY)
+}
+
+/// Whether a failure is the hard yt-dlp/network timeout class that should back off.
+fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
+    if !matches!(kind, RetryErrorKind::Resolver | RetryErrorKind::SourceSelection) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    lower.contains("did not respond within")
+        || lower.contains("timed out")
+        || lower.contains("downloading webpage")
+}
+
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
-fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path) -> Resolver {
-    let mut resolver = Resolver::new(ytdlp.clone());
+fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings) -> Resolver {
+    let extra_args = settings.ytdlp_extra_args();
+    if !extra_args.is_empty() {
+        app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
+    }
+    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
@@ -3703,22 +3743,22 @@ mod tests {
     #[test]
     fn retry_attempts_keep_backoff_for_the_same_failure() {
         let mut retry = RetryState::default();
-        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver, "err");
         retry.next_attempt();
-        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver, "err");
 
         assert_eq!(retry.attempt, 1);
         assert!(retry.next_retry.is_some());
 
-        retry.start("https://example.com/other".into(), RetryErrorKind::Resolver);
+        retry.start("https://example.com/other".into(), RetryErrorKind::Resolver, "err");
         assert_eq!(retry.attempt, 0);
     }
 
     #[test]
     fn a_due_retry_is_taken_once_and_its_timer_is_cleared() {
         let mut retry = RetryState::default();
-        assert!(retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
-        assert!(!retry.start("https://example.com/video".into(), RetryErrorKind::Resolver));
+        assert!(retry.start("https://example.com/video".into(), RetryErrorKind::Resolver, "err"));
+        assert!(!retry.start("https://example.com/video".into(), RetryErrorKind::Resolver, "err"));
 
         let due = retry.take_due().expect("the retry is due");
         assert_eq!(due.0, "https://example.com/video");
@@ -3729,16 +3769,41 @@ mod tests {
     }
 
     #[test]
-    fn retry_is_scheduled_immediately() {
+    fn hard_timeout_retry_is_backed_off_and_capped() {
         let mut retry = RetryState::default();
-        retry.schedule_next();
-        assert!(retry.next_retry.is_some());
+        assert!(retry.start(
+            "https://example.com/video".into(),
+            RetryErrorKind::Resolver,
+            "yt-dlp did not respond within 20 seconds; Downloading webpage"
+        ));
+        let first = retry.next_retry.expect("scheduled");
+        retry.take_due();
+        retry.start(
+            "https://example.com/video".into(),
+            RetryErrorKind::Resolver,
+            "yt-dlp did not respond within 20 seconds; Downloading webpage",
+        );
+        let second = retry.next_retry.expect("scheduled");
+        assert!(second.saturating_duration_since(first) <= Duration::from_secs(17));
+        assert_eq!(
+            retry_delay(RetryErrorKind::Resolver, "did not respond within 20 seconds", 3),
+            Duration::from_secs(16)
+        );
+    }
+
+    #[test]
+    fn non_timeout_retry_stays_immediate() {
+        assert_eq!(
+            retry_delay(RetryErrorKind::Resolver, "some other error", 0),
+            Duration::from_secs(0)
+        );
+        assert_eq!(retry_delay(RetryErrorKind::Playback, "timed out", 2), Duration::from_secs(0));
     }
 
     #[test]
     fn a_retry_stops_after_the_attempt_budget_is_used_up() {
         let mut retry = RetryState::default();
-        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver);
+        retry.start("https://example.com/video".into(), RetryErrorKind::Resolver, "some error");
 
         for _ in 0..MAX_RETRY_ATTEMPTS {
             assert!(!retry.exhausted());

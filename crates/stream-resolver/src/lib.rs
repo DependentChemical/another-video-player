@@ -83,17 +83,24 @@ impl std::error::Error for Error {}
 pub struct Resolver {
     tool: ytdlp_tool::YtDlp,
     cookies: BTreeMap<Service, std::path::PathBuf>,
+    args: Vec<String>,
 }
 
 impl Resolver {
     /// Creates a resolver that uses the given `yt-dlp` access point.
     pub fn new(tool: ytdlp_tool::YtDlp) -> Self {
-        Self { tool, cookies: BTreeMap::new() }
+        Self { tool, cookies: BTreeMap::new(), args: Vec::new() }
     }
 
     /// Supplies a Netscape cookie file for URLs of one service.
     pub fn with_cookies(mut self, service: Service, path: impl Into<std::path::PathBuf>) -> Self {
         self.cookies.insert(service, path.into());
+        self
+    }
+
+    /// Adds extra yt-dlp arguments used for every resolve request.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args.into_iter().filter(|arg| !arg.trim().is_empty()).collect();
         self
     }
 
@@ -128,7 +135,7 @@ impl Resolver {
             tool: Some(self.tool.clone()),
             url: url.to_string(),
             cookies,
-            args: Vec::new(),
+            args: self.args.clone(),
         };
 
         let result =

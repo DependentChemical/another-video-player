@@ -95,9 +95,42 @@
       "display-name": "Log Level",
       "description": "Lowest severity written to flatline.log. DEBUG records everything, NOTICE adds playback and queue events, WARNING adds recoverable failures, ERROR only records failures.",
       "type": "select",
-      "options": ["DEBUG", "NOTICE", "WARNING", "ERROR"],
+      "options": [
+        "DEBUG",
+        "NOTICE",
+        "WARNING",
+        "ERROR"
+      ],
       "default": "NOTICE",
       "value": "DEBUG"
+    }
+  },
+  "YtDlp-Settings": {
+    "display-name": "yt-dlp Settings",
+    "force-ipv4": {
+      "display-name": "Force IPv4",
+      "description": "Pass -4 to yt-dlp to avoid IPv6 stalls",
+      "type": "boolean",
+      "default": false,
+      "value": null
+    },
+    "socket-timeout": {
+      "display-name": "Socket Timeout (s)",
+      "description": "yt-dlp --socket-timeout seconds",
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 120,
+      "default": 15,
+      "value": null
+    },
+    "extractor-retries": {
+      "display-name": "Extractor Retries",
+      "description": "yt-dlp --extractor-retries",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "value": null
     }
   }
 }
