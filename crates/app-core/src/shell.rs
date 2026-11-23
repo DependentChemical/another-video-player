@@ -887,6 +887,7 @@ fn tick(
                     reason.as_str(),
                     sponsorblock_segments.len()
                 ));
+                app.clear_playback_ipv4_fallback();
                 let Some(loaded) = app.consume_resolved(
                     &url,
                     source,

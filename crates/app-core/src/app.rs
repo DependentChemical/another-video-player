@@ -564,6 +564,8 @@ pub struct App {
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
     /// The last application release version shown to the user.
+    /// Whether -4 was auto-enabled for the current playback retry sequence.
+    auto_force_ipv4: AtomicBool,
     /// One-shot retry guard for URL bar entry failures.
     url_entry_retry: Mutex<UrlEntryRetryState>,
     notified_app_update: Mutex<Option<String>>,
@@ -625,6 +627,7 @@ impl App {
             stream_buffer,
             pending: Mutex::new(None),
             url_entry_retry: Mutex::new(UrlEntryRetryState::default()),
+            auto_force_ipv4: AtomicBool::new(false),
             notified_app_update: Mutex::new(None),
             notified_tool_update: Mutex::new(None),
         };
@@ -666,6 +669,7 @@ impl App {
         let epoch = self.preempt_ytdlp();
         self.ytdlp.cancel_url_preview();
         self.clear_retry();
+        self.auto_force_ipv4.store(false, Ordering::SeqCst);
         if self.is_playing() {
             self.resolve_pending(url, epoch);
         } else {
@@ -711,10 +715,16 @@ impl App {
     }
 
     /// Processes URL bar input in the background.
-    ///
-    /// Each new edit cancels the previous preview. Failures are reported as
-    /// toasts; successes are silent because the user has not asked to play.
     pub fn preview_url(&self, url: String) {
+        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        self.preview_url_with_resolver(url, resolver);
+    }
+
+    /// Processes URL bar input using a specific resolver.
+    ///
+    /// Used by the one-shot URL-entry `-4` retry so playback retries keep their
+    /// own resolver behavior.
+    fn preview_url_with_resolver(&self, url: String, resolver: Resolver) {
         let url = url.trim().to_string();
         if url.is_empty() || url.to_ascii_lowercase().starts_with("test://") {
             self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
@@ -724,7 +734,6 @@ impl App {
         let epoch = self.url_preview_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.ytdlp.cancel_url_preview();
 
-        let resolver = Arc::clone(&self.resolver);
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
         let epoch_state = Arc::clone(&self.url_preview_epoch);
@@ -735,7 +744,6 @@ impl App {
                 ytdlp.finish_url_preview(&cancel);
                 return;
             }
-            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(
                 &resolver,
@@ -757,10 +765,7 @@ impl App {
             }
             if let Err(error) = result {
                 let raw = error.to_string();
-                let mapped = if raw.to_ascii_lowercase().contains("timed out")
-                    || raw.to_ascii_lowercase().contains("did not respond within")
-                {
-                    ytdlp.kill_all();
+                let mapped = if is_hard_timeout(RetryErrorKind::Resolver, &raw) {
                     format!("Failed to process URL, timeout: {raw}")
                 } else {
                     format!("Failed to process URL: {raw}")
@@ -1698,6 +1703,7 @@ impl App {
         app_logging::debug("interrupting the current playback and clearing transient state");
         let _ = self.engine.stop();
         self.clear_retry();
+        self.auto_force_ipv4.store(false, Ordering::SeqCst);
         *self.pending.lock().expect("the pending media is not poisoned") = None;
         let mut state = self.state.lock().expect("the state is not poisoned");
         state.pending_restore = PendingRestore::default();
@@ -2153,6 +2159,9 @@ impl App {
             }
         }
         if self.handle_ytdlp_timeout(&error) {
+            if !self.auto_force_ipv4.swap(true, Ordering::SeqCst) {
+                self.enable_playback_ipv4_fallback(&url);
+            }
             self.recover_from_timeout(&url);
             self.schedule_retry(
                 url,
@@ -2164,6 +2173,24 @@ impl App {
         }
         self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+    }
+
+    /// Enables `-4` for subsequent playback retries in the current sequence.
+    fn enable_playback_ipv4_fallback(&self, url: &str) {
+        let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
+        if resolver.forces_ipv4() {
+            return;
+        }
+        *resolver = resolver.clone().with_force_ipv4();
+        drop(resolver);
+        app_logging::warning(format!(
+            "playback resolver hard timeout; enabling -4 for subsequent retries: url={url}"
+        ));
+        let _ = self.outbox.lock().map(|sender| {
+            sender.send(Box::new(Message::Toast(
+                "Connection timed out; retrying with IPv4...".to_string(),
+            )))
+        });
     }
 
     /// Runs the timeout recovery before a retry: the sign-in check, with the
@@ -2232,8 +2259,11 @@ impl App {
     /// `service`, and tells the user the cookies are being regenerated.
     fn regenerate_cookies(&self, service: Service) {
         let tool = self.ytdlp.tool();
-        *self.resolver.lock().expect("the resolver is not poisoned") =
-            build_resolver(&tool, self.session.cookies_dir(), &self.settings);
+        let mut resolver = build_resolver(&tool, self.session.cookies_dir(), &self.settings);
+        if self.auto_force_ipv4.load(Ordering::SeqCst) {
+            resolver = resolver.with_force_ipv4();
+        }
+        *self.resolver.lock().expect("the resolver is not poisoned") = resolver;
         app_logging::notice(format!(
             "the cookies used by the retry are regenerated: service={}",
             service.name()
@@ -3071,7 +3101,8 @@ impl App {
 
     /// Retries a URL entry resolution once with -4 when a hard timeout occurs.
     ///
-    /// Returns true when a retry was scheduled.
+    /// Returns true when a retry was scheduled. URL-bar parsing is a one-shot
+    /// probe and must not mutate playback resolver state.
     pub fn retry_url_entry_with_force_ipv4(&self, url: &str) -> bool {
         let normalized = url.trim().to_string();
         if normalized.is_empty() {
@@ -3084,12 +3115,13 @@ impl App {
         guard.attempted = Some(normalized.clone());
         drop(guard);
 
-        let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        if resolver.forces_ipv4() {
-            return false;
-        }
-        *resolver = resolver.clone().with_force_ipv4();
-        drop(resolver);
+        let forced = {
+            let resolver = self.resolver.lock().expect("the resolver is not poisoned");
+            if resolver.forces_ipv4() {
+                return false;
+            }
+            resolver.clone().with_force_ipv4()
+        };
 
         app_logging::warning(format!(
             "URL entry failed with hard timeout; retrying once with -4: url={normalized}"
@@ -3099,7 +3131,7 @@ impl App {
                 "Connection timed out; retrying once with IPv4...".to_string(),
             )))
         });
-        self.preview_url(normalized);
+        self.preview_url_with_resolver(normalized, forced);
         true
     }
 
@@ -3112,6 +3144,11 @@ impl App {
     /// Clears one-shot URL entry retry state after success/cancel.
     pub fn clear_url_entry_retry(&self) {
         self.url_entry_retry.lock().expect("url entry retry state poisoned").attempted = None;
+    }
+
+    /// Clears auto-enabled playback IPv4 fallback after a successful resolve.
+    pub fn clear_playback_ipv4_fallback(&self) {
+        self.auto_force_ipv4.store(false, Ordering::SeqCst);
     }
 
     /// Sends an informational toast to the user interface.
@@ -3644,44 +3681,6 @@ async fn resolve_with_session(
     }
 
     let message = error.to_string();
-    if is_hard_timeout(RetryErrorKind::Resolver, &message) && !resolver.forces_ipv4() {
-        app_logging::warning(format!("hard timeout resolving {url}; retrying once with yt-dlp -4"));
-        let _ = notice.send(Box::new(Message::Toast(
-            "Connection timed out; retrying once with IPv4...".to_string(),
-        )));
-        let ipv4 = resolver.clone().with_force_ipv4();
-        let retry = ipv4.resolve_with_cancel(url, cancel.clone(), pid.clone()).await;
-        match retry {
-            Ok(source) => return Ok(source),
-            Err(err)
-                if matches!(err, ResolveError::Cancelled)
-                    || cancel.load(Ordering::SeqCst)
-                    || epoch_state.load(Ordering::SeqCst) != epoch =>
-            {
-                return Err(ResolveError::Cancelled);
-            }
-            Err(err) => {
-                let retry_message = err.to_string();
-                let Some(service) = web_session::challenge_service(url, &retry_message) else {
-                    return Err(err);
-                };
-                return sign_in_and_resolve(
-                    resolver,
-                    session,
-                    epoch_state,
-                    epoch,
-                    cancel,
-                    pid,
-                    url,
-                    notice,
-                    service,
-                    err,
-                )
-                .await;
-            }
-        }
-    }
-
     let Some(service) = web_session::challenge_service(url, &message) else {
         return Err(error);
     };
