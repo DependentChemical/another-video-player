@@ -102,12 +102,13 @@ pub struct Resolver {
     tool: ytdlp_tool::YtDlp,
     cookies: BTreeMap<Service, std::path::PathBuf>,
     args: Vec<String>,
+    service_args: BTreeMap<Service, Vec<String>>,
 }
 
 impl Resolver {
     /// Creates a resolver that uses the given `yt-dlp` access point.
     pub fn new(tool: ytdlp_tool::YtDlp) -> Self {
-        Self { tool, cookies: BTreeMap::new(), args: Vec::new() }
+        Self { tool, cookies: BTreeMap::new(), args: Vec::new(), service_args: BTreeMap::new() }
     }
 
     /// Supplies a Netscape cookie file for URLs of one service.
@@ -121,6 +122,31 @@ impl Resolver {
     pub fn with_args(mut self, args: Vec<String>) -> Self {
         self.args = args.into_iter().filter(|arg| !arg.trim().is_empty()).collect();
         self
+    }
+
+    /// Adds extra yt-dlp arguments used for the URLs of one service.
+    ///
+    /// The arguments are added to the request of every URL that belongs
+    /// to the service, so a source specific argument never reaches the
+    /// extractor of another source.
+    pub fn with_service_args(mut self, service: Service, args: Vec<String>) -> Self {
+        let args = args.into_iter().filter(|arg| !arg.trim().is_empty()).collect();
+        self.service_args.insert(service, args);
+        self
+    }
+
+    /// The arguments a request for `url` is made with.
+    ///
+    /// The general arguments come first, the ones of the service the URL
+    /// belongs to last.
+    fn args_for(&self, url: &str) -> Vec<String> {
+        let mut args = self.args.clone();
+        if let Some(service) = Service::from_url(url)
+            && let Some(extra) = self.service_args.get(&service)
+        {
+            args.extend(extra.iter().cloned());
+        }
+        args
     }
 
     /// Returns whether resolves are forced to IPv4.
@@ -166,7 +192,7 @@ impl Resolver {
             tool: Some(self.tool.clone()),
             url: url.to_string(),
             cookies,
-            args: self.args.clone(),
+            args: self.args_for(url),
         };
 
         let result =
@@ -204,7 +230,42 @@ pub fn parse_catalog(json: &str) -> Result<MediaSource, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, map_tool_error};
+    use super::{Error, Resolver, map_tool_error};
+    use media_model::Service;
+
+    fn resolver() -> Resolver {
+        let tool = ytdlp_tool::YtDlp::new(
+            "yt-dlp",
+            ytdlp_tool::locate::ToolPaths::new(std::env::temp_dir().join("flatline-tests")),
+        );
+        Resolver::new(tool)
+    }
+
+    #[test]
+    fn the_arguments_of_a_service_only_reach_that_service() {
+        let resolver = resolver().with_args(vec!["--no-warnings".to_string()]).with_service_args(
+            Service::YouTube,
+            vec!["--extractor-args".to_string(), "youtube:player_js_variant=tv".to_string()],
+        );
+
+        let youtube = resolver.args_for("https://www.youtube.com/watch?v=1");
+        assert_eq!(youtube[0], "--no-warnings");
+        assert_eq!(youtube[1], "--extractor-args");
+        assert_eq!(youtube[2], "youtube:player_js_variant=tv");
+
+        let twitch = resolver.args_for("https://www.twitch.tv/videos/1");
+        assert_eq!(twitch, vec!["--no-warnings".to_string()]);
+    }
+
+    #[test]
+    fn a_url_without_a_service_keeps_the_general_arguments_only() {
+        let resolver = resolver().with_service_args(
+            Service::YouTube,
+            vec!["--extractor-args".to_string(), "youtube:player_js_variant=tv".to_string()],
+        );
+
+        assert!(resolver.args_for("https://example.org/video.mp4").is_empty());
+    }
 
     #[test]
     fn the_hard_timeout_keeps_its_own_kind() {

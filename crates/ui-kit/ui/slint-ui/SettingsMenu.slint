@@ -11,8 +11,7 @@ export component SettingsMenu inherits Rectangle {
     callback speed-mode-requested();
     callback speed-changed(float);
 
-    width: 187px;
-    // The menu grows with its rows: the settings popup reads this height.
+    width: 240px;
     height: rows.preferred-height;
     border-radius: 10px;
     border-width: 1px;
@@ -43,6 +42,15 @@ export component SettingsMenu inherits Rectangle {
         : speed
     }
 
+    function speed-fill-color() -> color {
+        if (root.playback-speed <= 1.0) {
+            let t = clamp(root.playback-speed, 0.0, 1.0);
+            return rgb(76, Math.round(245 * (1 - t) + 139 * t), Math.round(139 * (1 - t) + 245 * t));
+        }
+        let t = clamp(root.playback-speed - 1.0, 0.0, 1.0);
+        return rgb(Math.round(76 * (1 - t) + 229 * t), Math.round(139 * (1 - t) + 83 * t), Math.round(245 * (1 - t) + 75 * t));
+    }
+
     rows := VerticalLayout {
         padding: 8px;
         spacing: 2px;
@@ -58,8 +66,6 @@ export component SettingsMenu inherits Rectangle {
                 spacing: 10px;
                 cross-axis-alignment: center;
 
-                TuneIcon { ink: Theme.fg; }
-
                 Text {
                     text: "Sources";
                     color: Theme.fg;
@@ -69,14 +75,19 @@ export component SettingsMenu inherits Rectangle {
 
                 Rectangle { horizontal-stretch: 1; }
 
-                Text {
-                    text: root.source-quality-label;
-                    color: Theme.muted;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    cross-axis-alignment: center;
 
-                ChevronRightIcon { ink: Theme.muted; }
+                    Text {
+                        text: root.source-quality-label;
+                        color: Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    ChevronRightIcon { ink: Theme.muted; }
+                }
             }
 
             sources-touch := TouchArea {
@@ -95,8 +106,6 @@ export component SettingsMenu inherits Rectangle {
                 spacing: 10px;
                 cross-axis-alignment: center;
 
-                SpeedIcon { ink: Theme.fg; }
-
                 Text {
                     text: "Playback Speed";
                     color: Theme.fg;
@@ -106,14 +115,19 @@ export component SettingsMenu inherits Rectangle {
 
                 Rectangle { horizontal-stretch: 1; }
 
-                Text {
-                    text: root.speed-label;
-                    color: Theme.muted;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    cross-axis-alignment: center;
 
-                ChevronRightIcon { ink: Theme.muted; }
+                    Text {
+                        text: root.speed-label;
+                        color: Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    ChevronRightIcon { ink: Theme.muted; }
+                }
             }
 
             speed-touch := TouchArea {
@@ -125,44 +139,12 @@ export component SettingsMenu inherits Rectangle {
             padding: 8px;
             spacing: 12px;
 
-            HorizontalLayout {
-                spacing: 8px;
-                cross-axis-alignment: center;
-
-                Rectangle {
-                    width: 28px;
-                    height: 28px;
-                    border-radius: 6px;
-                    background: back-touch.pressed ? Theme.elevated : (back-touch.has-hover ? #ffffff14 : transparent);
-
-                    Icon {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        glyph: "\u{e5cb}";
-                        ink: Theme.fg;
-                    }
-
-                    back-touch := TouchArea {
-                        clicked => { root.close-requested(); }
-                    }
-                }
-
-                Text {
-                    text: "Playback Speed";
-                    color: Theme.fg;
-                    font-size: 13px;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
-
-                Rectangle { horizontal-stretch: 1; }
-
-                Text {
-                    text: root.speed-label;
-                    color: Theme.muted;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
+            Text {
+                text: "Playback Speed";
+                color: Theme.fg;
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
             }
 
             Rectangle {
@@ -170,97 +152,122 @@ export component SettingsMenu inherits Rectangle {
                 border-radius: 8px;
                 background: #ffffff08;
 
-                VerticalLayout {
-                    padding-left: 12px;
-                    padding-right: 12px;
-                    padding-top: 8px;
-                    padding-bottom: 8px;
-                    spacing: 6px;
+                track := Rectangle {
+                    y: (parent.height - 4px) / 2;
+                    width: parent.width;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.border;
+                }
 
-                    Rectangle {
-                        height: 18px;
+                // The notches mark the snap points 0, 0.5, 1.0, 1.5 and 2.0.
+                // They sit on the track line and are drawn on top of it.
+                Rectangle {
+                    x: 0px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.25 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.5 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.75 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width - 2px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
 
-                        track := Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            height: 4px;
-                            border-radius: 2px;
-                            background: Theme.border;
+                fill := Rectangle {
+                    y: (parent.height - 4px) / 2;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: root.speed-fill-color();
+                    x: root.playback-speed >= 1.0 ? parent.width / 2 : parent.width / 2 - parent.width * 0.5 * clamp(1.0 - root.playback-speed, 0.0, 1.0);
+                    width: root.playback-speed >= 1.0 ? parent.width * 0.5 * clamp(root.playback-speed - 1.0, 0.0, 1.0) : parent.width * 0.5 * clamp(1.0 - root.playback-speed, 0.0, 1.0);
+                }
+
+                knob := Rectangle {
+                    x: parent.width * clamp(root.playback-speed / 2.0, 0.0, 1.0) - self.width / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 14px;
+                    height: 14px;
+                    border-radius: 7px;
+                    background: speed-area.has-hover ? #5a9bf5 : Theme.accent;
+                }
+
+                speed-area := TouchArea {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    moved => {
+                        root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
+                    }
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down) {
+                            root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
                         }
-
-                        Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            width: parent.width * clamp(root.playback-speed / 2.0, 0.0, 1.0);
-                            height: 4px;
-                            border-radius: 2px;
-                            background: Theme.accent;
-                        }
-
-                        Rectangle {
-                            x: parent.width * 0.25 - self.width / 2;
-                            y: (parent.height - self.height) / 2;
-                            width: 4px;
-                            height: 4px;
-                            border-radius: 2px;
-                            background: #ffffff80;
-                        }
-
-                        Rectangle {
-                            x: parent.width * 0.5 - self.width / 2;
-                            y: (parent.height - self.height) / 2;
-                            width: 4px;
-                            height: 4px;
-                            border-radius: 2px;
-                            background: #ffffff80;
-                        }
-
-                        Rectangle {
-                            x: parent.width * 0.75 - self.width / 2;
-                            y: (parent.height - self.height) / 2;
-                            width: 4px;
-                            height: 4px;
-                            border-radius: 2px;
-                            background: #ffffff80;
-                        }
-
-                        Rectangle {
-                            x: parent.width - self.width;
-                            y: (parent.height - self.height) / 2;
-                            width: 4px;
-                            height: 4px;
-                            border-radius: 2px;
-                            background: #ffffff80;
-                        }
-
-                        knob := Rectangle {
-                            x: parent.width * clamp(root.playback-speed / 2.0, 0.0, 1.0) - self.width / 2;
-                            y: (parent.height - self.height) / 2;
-                            width: 14px;
-                            height: 14px;
-                            border-radius: 7px;
-                            background: speed-area.has-hover || speed-area.pressed ? #5a9bf5 : Theme.accent;
-                        }
-
-                        speed-area := TouchArea {
-                            pointer-event(event) => {
-                                if event.kind == PointerEventKind.down {
-                                    root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
-                                }
-                                if event.kind == PointerEventKind.up {
-                                    root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
-                                }
-                            }
-                            moved => {
-                                root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
-                            }
+                        if (event.kind == PointerEventKind.up) {
+                            root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
                         }
                     }
+                }
 
-                    HorizontalLayout {
-                        Text { text: "0"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; }
-                        Text { text: "0.5"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
-                        Text { text: "1"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
-                        Text { text: "1.5"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: center; }
-                        Text { text: "2"; color: Theme.muted; font-size: 10px; horizontal-stretch: 1; horizontal-alignment: right; }
+                // The labels under the slider name the snap points, so the
+                // user knows where 0, 0.5, 1.0, 1.5 and 2.0 sit without guessing.
+                Rectangle {
+                    width: parent.width;
+                    height: 16px;
+                    Text {
+                        x: 0px;
+                        text: "0";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.25 - 10px;
+                        text: "0.5x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.5 - 10px;
+                        text: "1x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.75 - 10px;
+                        text: "1.5x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width - 12px;
+                        text: "2x";
+                        color: Theme.muted;
+                        font-size: 10px;
                     }
                 }
             }

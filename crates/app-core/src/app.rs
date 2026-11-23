@@ -3545,7 +3545,7 @@ fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool)
 fn video_label(stream: &media_model::VideoStream) -> String {
     match (stream.width, stream.height) {
         (Some(_), Some(height)) if height >= 720 => format!("{height}p"),
-        (Some(width), Some(height)) => format!("{width}?{height}"),
+        (Some(width), Some(height)) => format!("{width}×{height}"),
         (None, Some(height)) => format!("{height}p"),
         _ => stream.format_id.clone(),
     }
@@ -3555,7 +3555,7 @@ fn video_label(stream: &media_model::VideoStream) -> String {
 fn video_detail(stream: &media_model::VideoStream) -> String {
     let mut parts = Vec::new();
     if let (Some(width), Some(height)) = (stream.width, stream.height) {
-        parts.push(format!("{width}?{height}"));
+        parts.push(format!("{width}×{height}"));
     }
     if let Some(fps) = stream.fps
         && fps > 0.0
@@ -3571,7 +3571,7 @@ fn video_detail(stream: &media_model::VideoStream) -> String {
     if !stream.ext.is_empty() {
         parts.push(stream.ext.clone());
     }
-    parts.join(" ? ")
+    parts.join(" · ")
 }
 
 /// The prominent label of an audio stream: its bitrate.
@@ -3601,7 +3601,7 @@ fn audio_detail(stream: &media_model::AudioStream) -> String {
         parts.push(note.clone());
     }
     parts.push(stream.format_id.clone());
-    parts.join(" ? ")
+    parts.join(" · ")
 }
 
 /// Turns a bitrate in kilobits per second into a human line.
@@ -3673,11 +3673,19 @@ fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
 
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
 fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings) -> Resolver {
-    let extra_args = settings.ytdlp_extra_args();
+    let deno_path = ensure_deno(ytdlp, settings);
+    let extra_args = settings.ytdlp_extra_args(deno_path.as_deref());
     if !extra_args.is_empty() {
         app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
     }
     let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args);
+    // The YouTube extractor needs its own arguments; they are added to every
+    // YouTube request and never to the request of another source.
+    let youtube_args = source_youtube::ytdlp_args();
+    if !youtube_args.is_empty() {
+        app_logging::notice(format!("yt-dlp youtube args enabled: {}", youtube_args.join(" ")));
+    }
+    resolver = resolver.with_service_args(Service::YouTube, youtube_args);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
@@ -3688,6 +3696,39 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
         }
     }
     resolver
+}
+
+/// Ensures the Deno runtime is installed when the settings request it.
+///
+/// The Deno binary is downloaded next to `yt-dlp` inside the tool directory
+/// and never writes outside of it: `DENO_DIR` points at `tools/deno-files`
+/// when the runtime is spawned, so all caches and configuration stay inside
+/// the portable package.
+fn ensure_deno(ytdlp: &YtDlp, settings: &Settings) -> Option<std::path::PathBuf> {
+    if settings.js_runtime() != settings::BUNDLED_JS_RUNTIME {
+        return None;
+    }
+    let platform = ytdlp_tool::platform::Platform::current();
+    let binary = ytdlp.paths().root().join(platform.deno_binary_name());
+    if binary.is_file() {
+        // The directory the runtime writes its files to is part of the
+        // portable folder, so it is created next to the runtime.
+        let files = ytdlp.paths().deno_files_dir();
+        if let Err(error) = std::fs::create_dir_all(&files) {
+            app_logging::warning(format!(
+                "the deno files directory could not be created: dir={} error={error}",
+                files.display()
+            ));
+        }
+        return Some(binary);
+    }
+    match ytdlp_tool::deno::install(ytdlp.paths()) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            app_logging::warning(format!("the deno runtime could not be installed: {error}"));
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4087,7 +4128,7 @@ mod tests {
     fn labels_carry_the_size_the_user_asked_for() {
         let lists = source_lists(&source());
         assert_eq!(lists.video[0].label, "1080p");
-        assert!(lists.video[0].detail.contains("1920?1080"));
+        assert!(lists.video[0].detail.contains("1920×1080"));
         assert!(lists.audio[0].label.contains("128"));
     }
 

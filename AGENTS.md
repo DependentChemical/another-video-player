@@ -6,6 +6,38 @@ written in Rust, it draws its interface with Slint and it plays with libmpv.
 This file is the contract for every agent and every contributor working in
 this repository. Read it before changing anything.
 
+## ⚠️ IMPORTANT and URGENT: check `yt-dlp` for a new stable release
+
+> **Reminder: check in the background for a newer stable `yt-dlp` release
+> before and after touching the resolver, the extractor arguments or the
+> JavaScript runtime.** This is an important reminder, not a hard block, but
+> most YouTube failures are not Flatline bugs: they are a `yt-dlp` that has
+> fallen behind YouTube.
+
+The YouTube extractor arguments in `crates/sources/source-youtube` are a
+**quick fix**, not a solution. `--extractor-args
+"youtube:player_js_variant=tv"` keeps the `tv` player variant alive while
+YouTube breaks the default web player. It does not repair the underlying
+n-challenge handling, and it will stop working the day YouTube changes the
+variant too.
+
+What every agent and contributor owes the project:
+
+1. **Check in the background, always.** Query
+   `https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest` and compare
+   it with the version Flatline manages. The player already does this
+   (`ytdlp_tool::update::check`), but the check has to happen even when the
+   work at hand looks unrelated to YouTube.
+2. **Prefer the real fix.** When a new stable `yt-dlp` is out, the answer to
+   a broken resolve is the updated extractor, not another workaround in
+   Flatline. Remove the quick fix once the new release carries the fix.
+3. **Record what was found.** Write the version that was checked for and the
+   version that is current into the commit that touches the resolver, so the
+   next agent does not have to guess whether the check happened.
+4. **Do not pin the JavaScript runtime to hide the symptom.** The bundled
+   Deno is always the newest release, and a `yt-dlp` that is too old fails
+   with the EJS challenge, not with the runtime.
+
 ## Release from `dev` to `main`
 
 Work on `dev` by default. Keep `main` for changes that have been tested and
@@ -145,7 +177,8 @@ This sequence mirrors the `dev-test` workflow and the release build pipeline.
 - `crates/stream-resolver` — turns a URL into a catalog of streams and
   decides which streams to play.
 - `crates/updater` — checks for a newer Flatline release and installs it.
-- `crates/ytdlp-tool` — finds, installs and updates the `yt-dlp` executable.
+- `crates/ytdlp-tool` — finds, installs and updates the `yt-dlp` executable,
+  and provisions the Deno runtime that solves the EJS challenges next to it.
 - `crates/storyboard` — cuts preview images out of a media with `ffmpeg`.
 - `crates/ui-kit` — the Slint components, the theme and the widgets.
 - `crates/web-session` — knows when a service demands a signed-in session and

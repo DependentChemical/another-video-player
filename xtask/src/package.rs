@@ -59,6 +59,9 @@ pub fn package() -> Result<PathBuf, String> {
     // The tool that resolves the URLs, so the folder works offline.
     copy_ytdlp(&staging, platform)?;
 
+    // The JavaScript runtime yt-dlp uses to solve YouTube EJS challenges.
+    copy_deno(&staging, platform)?;
+
     // Files bundled with the player, placed next to the executable.
     copy_includes(&root, &staging)?;
 
@@ -153,6 +156,35 @@ fn copy_ytdlp(staging: &Path, platform: Platform) -> Result<(), String> {
 /// The name of the sign-in helper on this platform.
 fn session_helper_name() -> &'static str {
     if cfg!(windows) { "flatline-session.exe" } else { "flatline-session" }
+}
+
+/// Puts a Deno runtime next to the player.
+///
+/// The runtime is downloaded from the newest Deno release and placed inside
+/// `tools/`, so the folder works offline and the runtime is portable. The
+/// directory the runtime writes its files to at runtime is created beside
+/// it, so nothing is written to the user's home.
+fn copy_deno(staging: &Path, platform: Platform) -> Result<(), String> {
+    let tools = staging.join("tools");
+    std::fs::create_dir_all(&tools).map_err(|error| error.to_string())?;
+    let destination = tools.join(platform.deno_binary_name());
+    if destination.is_file() {
+        return Ok(());
+    }
+
+    ytdlp_tool::deno::download_for_platform(platform, &tools)
+        .map_err(|error| format!("deno could not be downloaded: {error}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions =
+            std::fs::metadata(&destination).map_err(|error| error.to_string())?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&destination, permissions).map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 /// Packs the folder into a zip archive.

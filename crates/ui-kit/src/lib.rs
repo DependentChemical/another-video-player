@@ -26,6 +26,23 @@ const TOAST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How many toasts are kept at once; newer ones push out the oldest.
 const TOAST_LIMIT: usize = 5;
 
+/// The number of lines a notification shows before the rest is cut off.
+///
+/// The component that draws the toast elides the text that does not fit,
+/// so the user sees four lines and an ellipsis.
+const TOAST_MAX_LINES: usize = 4;
+
+/// The characters one line of a notification holds.
+///
+/// The text of a toast is drawn 334px wide in a 13px font, which fits about
+/// this many characters. The budget only keeps the text a toast carries
+/// from growing without bound; the number of lines the user sees is the
+/// hard limit of the component that draws it.
+const TOAST_LINE_CHARS: usize = 64;
+
+/// The mark that says the text was cut off.
+const TOAST_ELLIPSIS: char = '\u{2026}';
+
 /// How often expired toasts are swept away.
 const TOAST_SWEEP: Duration = Duration::from_millis(500);
 
@@ -113,7 +130,9 @@ impl ToastStore {
     fn show(&mut self, text: &str, now: Instant) {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.toasts.push(ActiveToast { item: ToastItem { text: text.into(), id }, shown_at: now });
+        let text = truncate_toast(text);
+        let text = slint::SharedString::from(&*text);
+        self.toasts.push(ActiveToast { item: ToastItem { text, id }, shown_at: now });
         if self.toasts.len() > TOAST_LIMIT {
             let excess = self.toasts.len() - TOAST_LIMIT;
             self.toasts.drain(..excess);
@@ -135,6 +154,49 @@ impl ToastStore {
     /// The items the Slint model expects.
     fn items(&self) -> Vec<ToastItem> {
         self.toasts.iter().map(|toast| toast.item.clone()).collect()
+    }
+}
+
+/// Shortens a notification to the lines a toast shows.
+///
+/// A line is a piece of the text between two line breaks; a piece that is
+/// too long for one line is cut at the last word that fits. The text is cut
+/// after the last line that fits and marked with an ellipsis, so the user
+/// can see that there was more. A text that fits is left alone.
+fn truncate_toast(text: &str) -> Cow<'_, str> {
+    let mut lines: Vec<&str> = Vec::new();
+
+    for piece in text.split('\n') {
+        if lines.len() == TOAST_MAX_LINES {
+            return Cow::Owned(cut_toast(&lines));
+        }
+        if piece.chars().count() > TOAST_LINE_CHARS {
+            lines.push(cut_at_word_boundary(piece));
+            return Cow::Owned(cut_toast(&lines));
+        }
+        lines.push(piece);
+    }
+
+    Cow::Borrowed(text)
+}
+
+/// Builds the shortened text of a toast from the lines that are kept.
+///
+/// The ellipsis marks the cut, so the user knows the text was longer.
+fn cut_toast(lines: &[&str]) -> String {
+    let mut cut = lines.join("\n");
+    cut.push(TOAST_ELLIPSIS);
+    cut
+}
+
+/// Cuts a piece of text at the last word that fits on one line.
+fn cut_at_word_boundary(piece: &str) -> &str {
+    let cut =
+        piece.char_indices().nth(TOAST_LINE_CHARS).map(|(index, _)| index).unwrap_or(piece.len());
+    let head = &piece[..cut];
+    match head.rfind(char::is_whitespace) {
+        Some(index) => head[..index].trim_end(),
+        None => head.trim_end(),
     }
 }
 
@@ -1246,6 +1308,52 @@ mod tests {
     fn the_unassigned_italic_h_is_shown_as_a_planck_constant() {
         assert_eq!(display_title("a\u{1D455}b"), "a\u{210E}b");
         assert_eq!(display_title("plain"), "plain");
+    }
+
+    #[test]
+    fn a_short_notification_is_left_alone() {
+        assert_eq!(truncate_toast("hello"), "hello");
+        assert_eq!(truncate_toast("one\ntwo"), "one\ntwo");
+    }
+
+    #[test]
+    fn a_notification_keeps_at_most_four_lines() {
+        let text = "one\ntwo\nthree\nfour\nfive";
+
+        let cut = truncate_toast(text);
+
+        assert_eq!(cut, "one\ntwo\nthree\nfour\u{2026}");
+        assert_eq!(cut.lines().count(), TOAST_MAX_LINES);
+    }
+
+    #[test]
+    fn a_long_notification_is_cut_at_a_word_and_marked() {
+        let text = "word ".repeat(40);
+
+        let cut = truncate_toast(&text);
+
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
+        assert!(cut.chars().count() <= TOAST_LINE_CHARS + 1, "{cut}");
+        assert!(!cut.contains("  "), "{cut}");
+    }
+
+    #[test]
+    fn a_notification_without_a_word_boundary_is_cut_all_the_same() {
+        let text = "x".repeat(200);
+
+        let cut = truncate_toast(&text);
+
+        assert_eq!(cut.chars().count(), TOAST_LINE_CHARS + 1);
+        assert!(cut.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_toast_holds_the_cut_text() {
+        let mut store = ToastStore::default();
+        let now = Instant::now();
+        store.show("one\ntwo\nthree\nfour\nfive", now);
+
+        assert_eq!(store.toasts[0].item.text, "one\ntwo\nthree\nfour\u{2026}");
     }
 
     #[test]

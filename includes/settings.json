@@ -131,6 +131,16 @@
       "maximum": 10,
       "default": 3,
       "value": null
+    },
+    "js-runtime": {
+      "display-name": "JavaScript Runtime",
+      "description": "The JavaScript runtime yt-dlp uses to solve YouTube EJS challenges",
+      "type": "select",
+      "options": [
+        "deno"
+      ],
+      "default": "deno",
+      "value": "deno"
     }
   }
 }
