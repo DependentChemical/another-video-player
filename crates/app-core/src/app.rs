@@ -3545,7 +3545,7 @@ fn format_saved_selection(format_id: &str, source: &MediaSource, is_audio: bool)
 fn video_label(stream: &media_model::VideoStream) -> String {
     match (stream.width, stream.height) {
         (Some(_), Some(height)) if height >= 720 => format!("{height}p"),
-        (Some(width), Some(height)) => format!("{width}?{height}"),
+        (Some(width), Some(height)) => format!("{width}×{height}"),
         (None, Some(height)) => format!("{height}p"),
         _ => stream.format_id.clone(),
     }
@@ -3555,7 +3555,7 @@ fn video_label(stream: &media_model::VideoStream) -> String {
 fn video_detail(stream: &media_model::VideoStream) -> String {
     let mut parts = Vec::new();
     if let (Some(width), Some(height)) = (stream.width, stream.height) {
-        parts.push(format!("{width}?{height}"));
+        parts.push(format!("{width}×{height}"));
     }
     if let Some(fps) = stream.fps
         && fps > 0.0
@@ -3571,7 +3571,7 @@ fn video_detail(stream: &media_model::VideoStream) -> String {
     if !stream.ext.is_empty() {
         parts.push(stream.ext.clone());
     }
-    parts.join(" ? ")
+    parts.join(" · ")
 }
 
 /// The prominent label of an audio stream: its bitrate.
@@ -4087,7 +4087,7 @@ mod tests {
     fn labels_carry_the_size_the_user_asked_for() {
         let lists = source_lists(&source());
         assert_eq!(lists.video[0].label, "1080p");
-        assert!(lists.video[0].detail.contains("1920?1080"));
+        assert!(lists.video[0].detail.contains("1920×1080"));
         assert!(lists.audio[0].label.contains("128"));
     }
 

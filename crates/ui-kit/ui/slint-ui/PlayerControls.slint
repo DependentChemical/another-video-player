@@ -15,7 +15,7 @@ export component PlayerControls inherits Rectangle {
     in property <bool> at-live-edge: true;
     in property <bool> fullscreen: false;
     in property <bool> settings-open: false;
-    in property <bool> settings-speed-mode: false;
+    in-out property <bool> settings-speed-mode: false;
     in property <string> source-quality-label: "Auto";
     in property <float> playback-speed: 1.0;
     in property <bool> has-media: false;
@@ -204,7 +204,7 @@ export component PlayerControls inherits Rectangle {
                 }
             }
 
-            GearButton {
+            gear-button := GearButton {
                 width: 32px;
                 height: 32px;
                 active: root.settings-open;
@@ -283,10 +283,14 @@ export component PlayerControls inherits Rectangle {
     // options menu of a YouTube video: the rect's bottom edge is the top
     // edge of the bar and the panel stretches up by the menu's own height,
     // so the menu grows with its rows and stays pinned to the bar.
+    // The overlay covers the whole video area so a click anywhere outside
+    // the menu dismisses it, and the menu's right edge aligns with the
+    // right edge of the gear button.
     if root.settings-open: Rectangle {
+        x: 0;
+        y: -(root.container-height - Theme.controls-height);
         width: root.width;
-        height: settings-menu.height;
-        y: -settings-menu.height;
+        height: root.container-height - Theme.controls-height;
         background: transparent;
 
         TouchArea {
@@ -296,13 +300,15 @@ export component PlayerControls inherits Rectangle {
         }
 
         settings-menu := SettingsMenu {
+            x: gear-button.x + gear-button.width - self.width;
+            y: parent.height - self.height;
             open: true;
             speed-mode: root.settings-speed-mode;
             source-quality-label: root.source-quality-label;
             playback-speed: root.playback-speed;
             close-requested => { root.settings-closed(); }
             sources-requested => { root.sources-requested(); }
-            speed-mode-requested => { root.speed-mode-requested(); }
+            speed-mode-requested => { root.settings-speed-mode = true; }
             speed-changed(value) => { root.speed-changed(value); }
         }
     }
