@@ -5,7 +5,6 @@ export component TopBar inherits Rectangle {
     in-out property <string> url: "";
     in property <string> app-name: "Flatline";
     callback load-requested();
-    callback url-edited(string);
     callback pointer-activity();
     callback brand-clicked();
 
@@ -76,7 +75,9 @@ export component TopBar inherits Rectangle {
                 color: Theme.muted;
                 font-size: 13px;
                 vertical-alignment: center;
-                visible: url-input.text == "" && !url-input.has-focus;
+                // The placeholder is the resting state of an empty field, so
+                // it shows whether the field has the focus or not.
+                visible: url-input.text == "";
             }
 
             url-input := TextInput {
@@ -88,9 +89,6 @@ export component TopBar inherits Rectangle {
                 color: Theme.fg;
                 font-size: 13px;
                 vertical-alignment: center;
-                edited => {
-                    root.url-edited(self.text);
-                }
                 accepted => {
                     root.load-requested();
                 }

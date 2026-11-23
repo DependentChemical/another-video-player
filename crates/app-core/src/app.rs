@@ -29,9 +29,24 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A URL was resolved and can start playing.
-    Resolved(Result<ResolvedMedia, (String, String)>),
-    /// A URL was resolved while something else plays, so the user decides.
-    Pending(Result<PendingMedia, String>),
+    Resolved(Result<ResolvedMedia, ResolveFailure>),
+    /// A URL the user submitted was resolved and waits for the user's choice.
+    Pending(PendingMedia),
+    /// A URL the user submitted could not be processed.
+    UrlEntryFailed {
+        /// The URL that failed.
+        url: String,
+        /// The error message.
+        error: String,
+        /// The hard deadline that was reached, when the resolver hit one.
+        ///
+        /// A timeout is the only failure a different network stack can
+        /// still fix, so it is the only one that is retried. Every other
+        /// failure ends the entry with the error modal.
+        timeout_seconds: Option<u64>,
+        /// The entry generation the failure belongs to.
+        epoch: u64,
+    },
     /// A service asks the user to sign in.
     SigningIn(Service),
     /// The cookie file for a service is being regenerated.
@@ -71,13 +86,6 @@ pub enum Message {
         delay_seconds: u64,
         /// The kind of error being retried.
         kind: RetryKind,
-    },
-    /// Background URL preview processing failed.
-    UrlPreviewFailed {
-        /// The URL that failed.
-        url: String,
-        /// The error message.
-        error: String,
     },
 }
 
@@ -138,9 +146,57 @@ pub struct ResolvedMedia {
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
+/// The state of the URL the user submitted.
+///
+/// Only one URL is processed at a time. The generation tells the results
+/// apart: a result of an entry that was replaced belongs to a URL the
+/// user no longer waits for, so it is discarded instead of reported.
 #[derive(Debug, Default)]
-struct UrlEntryRetryState {
-    attempted: Option<String>,
+struct UrlEntryState {
+    /// The URL that is being processed.
+    url: Option<String>,
+    /// The generation of the entry that is running.
+    epoch: u64,
+    /// Whether the one-shot IPv4 retry was already used for this URL.
+    ipv4_retry_used: bool,
+}
+
+impl UrlEntryState {
+    /// Starts a new entry for `url`.
+    fn begin(&mut self, url: &str, epoch: u64) {
+        self.url = Some(url.to_string());
+        self.epoch = epoch;
+        self.ipv4_retry_used = false;
+    }
+
+    /// Whether `epoch` is the generation of the entry that is running.
+    fn is_current(&self, epoch: u64) -> bool {
+        epoch != 0 && self.epoch == epoch
+    }
+
+    /// Whether the IPv4 retry may still be used for `url`.
+    fn may_retry_with_ipv4(&self, url: &str) -> bool {
+        !self.ipv4_retry_used && self.url.as_deref() == Some(url)
+    }
+
+    /// Notes that the IPv4 retry was used for this URL.
+    fn mark_ipv4_retry(&mut self) {
+        self.ipv4_retry_used = true;
+    }
+}
+
+/// A resolve that failed.
+///
+/// The failure carries whether the resolver hit its hard deadline, so the
+/// caller does not have to guess from the wording of the message.
+#[derive(Debug, Clone)]
+pub struct ResolveFailure {
+    /// The URL that failed.
+    pub url: String,
+    /// The message shown to the user.
+    pub message: String,
+    /// Whether the resolver hit its hard deadline.
+    pub hard_timeout: bool,
 }
 /// A URL that was resolved while another media plays.
 ///
@@ -160,7 +216,7 @@ pub struct PendingMedia {
     pub resolved_at: i64,
     /// The resolved source.
     pub source: MediaSource,
-    /// The manual-work generation this resolve belongs to.
+    /// The URL entry generation this resolve belongs to.
     pub epoch: u64,
     /// SponsorBlock segments fetched for the media, kept only in memory.
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
@@ -402,10 +458,13 @@ impl YtdlpSlot {
         }
     }
 
+    /// Starts a new run and returns its cancel flag and its process id.
+    ///
+    /// The run that is still going is stopped first and its process is
+    /// killed, so a slot never has two processes at the same time.
     fn begin(&mut self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
-        self.cancel.store(true, Ordering::SeqCst);
-        self.cancel = Arc::new(AtomicBool::new(false));
-        self.pid.store(0, Ordering::SeqCst);
+        let (_, pid) = self.cancel();
+        terminate_pid(pid.load(Ordering::SeqCst));
         self.active = true;
         (self.cancel.clone(), self.pid.clone())
     }
@@ -417,6 +476,7 @@ impl YtdlpSlot {
         }
     }
 
+    /// Stops the run that is going and returns its cancel flag and process.
     fn cancel(&mut self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
         self.cancel.store(true, Ordering::SeqCst);
         self.active = false;
@@ -427,12 +487,16 @@ impl YtdlpSlot {
     }
 }
 
-/// Coordinates yt-dlp access across playback, URL preview, and thumbnail work.
+/// Coordinates yt-dlp access across playback, URL entry, and thumbnail work.
+///
+/// Every kind of work has its own slot, so one kind of work can be
+/// stopped without touching the others. The URL entry slot holds the one
+/// URL that is processed at a time.
 #[derive(Debug)]
 struct YtdlpControl {
     tool: Mutex<YtDlp>,
     playback: Mutex<YtdlpSlot>,
-    url_preview: Mutex<YtdlpSlot>,
+    url_entry: Mutex<YtdlpSlot>,
     thumbnail: Mutex<YtdlpSlot>,
 }
 
@@ -463,7 +527,7 @@ impl YtdlpControl {
         Self {
             tool: Mutex::new(tool),
             playback: Mutex::new(YtdlpSlot::idle()),
-            url_preview: Mutex::new(YtdlpSlot::idle()),
+            url_entry: Mutex::new(YtdlpSlot::idle()),
             thumbnail: Mutex::new(YtdlpSlot::idle()),
         }
     }
@@ -476,9 +540,23 @@ impl YtdlpControl {
         *self.tool.lock().expect("the yt-dlp tool is not poisoned") = tool;
     }
 
-    fn begin_playback(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
+    /// Starts the playback resolve for `epoch`, when it is still the resolve
+    /// the player waits for.
+    ///
+    /// Returns `None` when the resolve was superseded before it could start.
+    /// The slot is then left alone, so a superseded resolve cannot take it
+    /// away from the resolve that replaced it.
+    fn begin_playback(
+        &self,
+        epoch_state: &AtomicU64,
+        epoch: u64,
+    ) -> Option<(Arc<AtomicBool>, Arc<AtomicU32>)> {
+        let mut playback = self.playback.lock().expect("yt-dlp playback slot poisoned");
+        if epoch_state.load(Ordering::SeqCst) != epoch {
+            return None;
+        }
         self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").cancel();
-        self.playback.lock().expect("yt-dlp playback slot poisoned").begin()
+        Some(playback.begin())
     }
 
     fn cancel_playback(&self) {
@@ -490,23 +568,36 @@ impl YtdlpControl {
         self.playback.lock().expect("yt-dlp playback slot poisoned").finish(cancel);
     }
 
-    fn begin_url_preview(&self) -> (Arc<AtomicBool>, Arc<AtomicU32>) {
-        self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
-        self.url_preview.lock().expect("yt-dlp url slot poisoned").begin()
+    /// Starts the URL entry for `epoch`, when it is still the entry the user
+    /// waits for.
+    ///
+    /// Returns `None` when the entry was replaced before it could start.
+    /// The slot is then left alone, so an entry that was replaced cannot
+    /// take it away from the entry that replaced it.
+    fn begin_url_entry(
+        &self,
+        epoch_state: &AtomicU64,
+        epoch: u64,
+    ) -> Option<(Arc<AtomicBool>, Arc<AtomicU32>)> {
+        let mut slot = self.url_entry.lock().expect("yt-dlp url entry slot poisoned");
+        if epoch_state.load(Ordering::SeqCst) != epoch {
+            return None;
+        }
+        Some(slot.begin())
     }
 
-    fn cancel_url_preview(&self) {
-        let (_, pid) = self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
+    fn cancel_url_entry(&self) {
+        let (_, pid) = self.url_entry.lock().expect("yt-dlp url entry slot poisoned").cancel();
         terminate_pid(pid.load(Ordering::SeqCst));
     }
 
-    fn finish_url_preview(&self, cancel: &Arc<AtomicBool>) {
-        self.url_preview.lock().expect("yt-dlp url slot poisoned").finish(cancel);
+    fn finish_url_entry(&self, cancel: &Arc<AtomicBool>) {
+        self.url_entry.lock().expect("yt-dlp url entry slot poisoned").finish(cancel);
     }
 
     fn try_begin_thumbnail(&self) -> Option<(Arc<AtomicBool>, Arc<AtomicU32>)> {
         let playback = self.playback.lock().expect("yt-dlp playback slot poisoned");
-        let url = self.url_preview.lock().expect("yt-dlp url slot poisoned");
+        let url = self.url_entry.lock().expect("yt-dlp url entry slot poisoned");
         let mut thumb = self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned");
         if playback.active || url.active || thumb.active {
             return None;
@@ -525,7 +616,7 @@ impl YtdlpControl {
 
     fn cancel_all(&self) {
         let (_, p1) = self.playback.lock().expect("yt-dlp playback slot poisoned").cancel();
-        let (_, p2) = self.url_preview.lock().expect("yt-dlp url slot poisoned").cancel();
+        let (_, p2) = self.url_entry.lock().expect("yt-dlp url entry slot poisoned").cancel();
         let (_, p3) = self.thumbnail.lock().expect("yt-dlp thumbnail slot poisoned").cancel();
         terminate_pid(p1.load(Ordering::SeqCst));
         terminate_pid(p2.load(Ordering::SeqCst));
@@ -543,7 +634,7 @@ pub struct App {
     engine: Engine,
     resolver: Arc<Mutex<Resolver>>,
     ytdlp_epoch: Arc<AtomicU64>,
-    url_preview_epoch: Arc<AtomicU64>,
+    url_entry_epoch: Arc<AtomicU64>,
     ytdlp: Arc<YtdlpControl>,
     settings: Settings,
     session: Session,
@@ -566,8 +657,8 @@ pub struct App {
     /// The last application release version shown to the user.
     /// Whether -4 was auto-enabled for the current playback retry sequence.
     auto_force_ipv4: AtomicBool,
-    /// One-shot retry guard for URL bar entry failures.
-    url_entry_retry: Mutex<UrlEntryRetryState>,
+    /// The URL the user submitted and the generation it belongs to.
+    url_entry: Mutex<UrlEntryState>,
     notified_app_update: Mutex<Option<String>>,
     /// The last yt-dlp release version shown to the user.
     notified_tool_update: Mutex<Option<String>>,
@@ -612,7 +703,7 @@ impl App {
             engine,
             resolver: Arc::new(Mutex::new(resolver)),
             ytdlp_epoch: Arc::new(AtomicU64::new(0)),
-            url_preview_epoch: Arc::new(AtomicU64::new(0)),
+            url_entry_epoch: Arc::new(AtomicU64::new(0)),
             ytdlp: Arc::new(YtdlpControl::new(ytdlp.clone())),
             settings,
             session,
@@ -626,7 +717,7 @@ impl App {
             paths: paths.clone(),
             stream_buffer,
             pending: Mutex::new(None),
-            url_entry_retry: Mutex::new(UrlEntryRetryState::default()),
+            url_entry: Mutex::new(UrlEntryState::default()),
             auto_force_ipv4: AtomicBool::new(false),
             notified_app_update: Mutex::new(None),
             notified_tool_update: Mutex::new(None),
@@ -646,36 +737,41 @@ impl App {
         &self.engine
     }
 
-    /// Takes a URL from the user.
+    /// Processes a URL the user submitted.
     ///
-    /// When nothing plays, the URL is resolved and played right away and
-    /// becomes the active queue. When a media is already playing, playback is
-    /// left alone: the URL is resolved in the background and the user is
-    /// asked what to do with it through the pending dialog.
+    /// One URL is processed at a time. A new URL is a hard interrupt for
+    /// the one that is still running: the older entry is cancelled, its
+    /// process is killed and its result is discarded, so it can neither
+    /// report an error nor keep a process alive. Playback and thumbnail
+    /// work keep their own rules and are not interrupted.
     ///
     /// The work happens in the background; the result arrives through
     /// [`App::poll`].
-    pub fn load(&self, url: String) {
+    pub fn submit_url(&self, url: String) {
         let url = url.trim().to_string();
         if url.is_empty() {
             return;
         }
         app_logging::notice(format!(
-            "manual load requested: url={url} current_media={}",
-            self.has_media()
+            "url entry submitted: url={url} current_media={} playing={}",
+            self.has_media(),
+            self.is_playing()
         ));
-        // A manual request preempts any active or queued `yt-dlp` work so it
-        // is handled immediately.
-        let epoch = self.preempt_ytdlp();
-        self.ytdlp.cancel_url_preview();
-        self.clear_retry();
-        self.auto_force_ipv4.store(false, Ordering::SeqCst);
-        if self.is_playing() {
-            self.resolve_pending(url, epoch);
-        } else {
-            self.prepare_current(&url, "", None, None, None);
-            self.consume_current_with_epoch(epoch, PlaybackReason::Manual);
+        // The generation moves first: an entry that was replaced can no
+        // longer take the slot away from the entry that replaced it.
+        let epoch = self.url_entry_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        // The entry that is still running is stopped before the new one
+        // starts, so the two never run at the same time.
+        self.ytdlp.cancel_url_entry();
+        {
+            let mut state = self.url_entry.lock().expect("the url entry state is not poisoned");
+            state.begin(&url, epoch);
         }
+        // The notification follows the cancellation, so it never describes
+        // an entry that was already replaced.
+        self.toast("Parsing video".to_string());
+        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+        self.start_url_entry(url, epoch, resolver);
     }
 
     /// Whether a media is loaded in the player.
@@ -699,9 +795,9 @@ impl App {
         matches!(self.queue.current(), Ok(Some(entry)) if entry.url == url)
     }
 
-    /// Whether `epoch` is still the current manual-work generation.
-    pub fn is_current_epoch(&self, epoch: u64) -> bool {
-        !self.is_ytdlp_stale(epoch)
+    /// Whether `epoch` is the generation of the URL entry that is running.
+    pub fn is_current_url_entry(&self, epoch: u64) -> bool {
+        self.url_entry.lock().expect("the url entry state is not poisoned").is_current(epoch)
     }
 
     /// Returns the URL currently being resolved, if any.
@@ -714,34 +810,29 @@ impl App {
         self.state.lock().expect("the state is not poisoned").current_url.clone()
     }
 
-    /// Processes URL bar input in the background.
-    pub fn preview_url(&self, url: String) {
-        let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
-        self.preview_url_with_resolver(url, resolver);
-    }
-
-    /// Processes URL bar input using a specific resolver.
+    /// Resolves a URL the user submitted, in the background.
     ///
-    /// Used by the one-shot URL-entry `-4` retry so playback retries keep their
-    /// own resolver behavior.
-    fn preview_url_with_resolver(&self, url: String, resolver: Resolver) {
-        let url = url.trim().to_string();
-        if url.is_empty() || url.to_ascii_lowercase().starts_with("test://") {
-            self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
-            self.ytdlp.cancel_url_preview();
-            return;
-        }
-        let epoch = self.url_preview_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        self.ytdlp.cancel_url_preview();
-
+    /// The entry owns its `yt-dlp` slot for the whole run. A result that
+    /// belongs to an entry that has been replaced is dropped here, before
+    /// it can reach the user.
+    fn start_url_entry(&self, url: String, epoch: u64, resolver: Resolver) {
         let session = self.session.clone();
         let outbox = Arc::clone(&self.outbox);
-        let epoch_state = Arc::clone(&self.url_preview_epoch);
+        let epoch_state = Arc::clone(&self.url_entry_epoch);
         let ytdlp = Arc::clone(&self.ytdlp);
+        let cache = self.cache.clone();
         self.runtime.handle().spawn(async move {
-            let (cancel, pid) = ytdlp.begin_url_preview();
-            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
-                ytdlp.finish_url_preview(&cancel);
+            let Some((cancel, pid)) = ytdlp.begin_url_entry(&epoch_state, epoch) else {
+                app_logging::debug(format!(
+                    "url entry discarded before it started: url={url} epoch={epoch}"
+                ));
+                return;
+            };
+            if cancel.load(Ordering::SeqCst) {
+                ytdlp.finish_url_entry(&cancel);
+                app_logging::debug(format!(
+                    "url entry discarded before it started: url={url} epoch={epoch}"
+                ));
                 return;
             }
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
@@ -756,24 +847,62 @@ impl App {
                 &sender,
             )
             .await;
-            ytdlp.finish_url_preview(&cancel);
+            ytdlp.finish_url_entry(&cancel);
             if cancel.load(Ordering::SeqCst)
                 || epoch_state.load(Ordering::SeqCst) != epoch
                 || matches!(result, Err(stream_resolver::Error::Cancelled))
             {
+                app_logging::debug(format!(
+                    "url entry discarded because it was replaced: url={url} epoch={epoch}"
+                ));
                 return;
             }
-            if let Err(error) = result {
-                let raw = error.to_string();
-                let mapped = if is_hard_timeout(RetryErrorKind::Resolver, &raw) {
-                    format!("Failed to process URL, timeout: {raw}")
-                } else {
-                    format!("Failed to process URL: {raw}")
-                };
-                let _ = outbox.lock().map(|sender| {
-                    sender.send(Box::new(Message::UrlPreviewFailed { url, error: mapped }))
-                });
-            }
+            let message = match result {
+                Ok(source) => {
+                    let sponsorblock_segments = if source_youtube::matches_url(&url) {
+                        source_youtube::sponsorblock::fetch_for_url(&url)
+                    } else {
+                        Vec::new()
+                    };
+                    let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
+                    let thumbnail = thumbnail_id.as_deref().and_then(|id| cache.mid_path(id));
+                    app_logging::notice(format!(
+                        "url entry resolved: url={url} epoch={epoch} title=\"{}\" sponsorblock_segments={}",
+                        source.title,
+                        sponsorblock_segments.len()
+                    ));
+                    Message::Pending(PendingMedia {
+                        url,
+                        title: source.title.clone(),
+                        source,
+                        thumbnail,
+                        thumbnail_id,
+                        resolved_at: unix_time(),
+                        epoch,
+                        sponsorblock_segments,
+                    })
+                }
+                Err(error) => {
+                    // The hard deadline is the only failure a different
+                    // network stack can still fix, so it is the only one
+                    // that is reported as a timeout.
+                    let timeout_seconds = match &error {
+                        stream_resolver::Error::HardTimeout { seconds, .. } => Some(*seconds),
+                        _ => None,
+                    };
+                    let raw = error.to_string();
+                    let mapped = if timeout_seconds.is_some() {
+                        format!("Failed to process URL, timeout: {raw}")
+                    } else {
+                        format!("Failed to process URL: {raw}")
+                    };
+                    app_logging::warning(format!(
+                        "url entry failed: url={url} epoch={epoch} timeout_seconds={timeout_seconds:?} error={mapped}"
+                    ));
+                    Message::UrlEntryFailed { url, error: mapped, timeout_seconds, epoch }
+                }
+            };
+            let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
         });
     }
 
@@ -816,7 +945,13 @@ impl App {
         let ytdlp = Arc::clone(&self.ytdlp);
 
         self.runtime.handle().spawn(async move {
-            let (cancel, pid) = ytdlp.begin_playback();
+            let Some((cancel, pid)) = ytdlp.begin_playback(&epoch_state, epoch) else {
+                app_logging::debug(format!(
+                    "discarding a playback resolve that was superseded before it started: url={url} reason={} epoch={epoch}",
+                    reason.as_str()
+                ));
+                return;
+            };
             let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
             let result = resolve_with_session(
@@ -866,94 +1001,17 @@ impl App {
                     }))
                 }
                 Err(error) => {
+                    let hard_timeout =
+                        matches!(error, stream_resolver::Error::HardTimeout { .. });
                     app_logging::warning(format!(
-                        "playback source could not be resolved: url={url} reason={} error={error}",
+                        "playback source could not be resolved: url={url} reason={} hard_timeout={hard_timeout} error={error}",
                         reason.as_str()
                     ));
-                    Message::Resolved(Err((url, error.to_string())))
-                }
-            };
-            let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
-        });
-    }
-
-    /// Resolves a URL in the background, caches its thumbnail and waits for
-    /// the user to decide.
-    ///
-    /// The actual `yt-dlp` runs are serialized through the gate, but the gate is
-    /// never held while waiting for a sign-in window.
-    fn resolve_pending(&self, url: String, epoch: u64) {
-        app_logging::debug(format!("resolving a pending video in the background: url={url}"));
-        let resolver = Arc::clone(&self.resolver);
-        let session = self.session.clone();
-        let outbox = Arc::clone(&self.outbox);
-        let cache = self.cache.clone();
-        let epoch_state = Arc::clone(&self.ytdlp_epoch);
-
-        let ytdlp = Arc::clone(&self.ytdlp);
-        self.runtime.handle().spawn(async move {
-            let (cancel, pid) = ytdlp.begin_url_preview();
-            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
-                ytdlp.finish_url_preview(&cancel);
-                return;
-            }
-            let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
-            let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(
-                &resolver,
-                &session,
-                &epoch_state,
-                epoch,
-                &cancel,
-                &pid,
-                &url,
-                &sender,
-            )
-            .await;
-            ytdlp.finish_url_preview(&cancel);
-            let cancelled = cancel.load(Ordering::SeqCst)
-                || epoch_state.load(Ordering::SeqCst) != epoch
-                || matches!(result, Err(stream_resolver::Error::Cancelled));
-            if cancelled {
-                app_logging::debug(format!("discarding a cancelled pending resolve: url={url}"));
-                return;
-            }
-            let message = match result {
-                Ok(source) => {
-                    let sponsorblock_segments = if source_youtube::matches_url(&url) {
-                        source_youtube::sponsorblock::fetch_for_url(&url)
-                    } else {
-                        Vec::new()
-                    };
-                    let thumbnail_id = cache.fetch(&url, source.thumbnail.as_deref()).ok();
-                    let thumbnail = thumbnail_id.as_deref().and_then(|id| cache.mid_path(id));
-                    app_logging::debug(format!(
-                        "pending video resolved: url={url} title=\"{}\" sponsorblock_segments={}",
-                        source.title,
-                        sponsorblock_segments.len()
-                    ));
-                    Message::Pending(Ok(PendingMedia {
+                    Message::Resolved(Err(ResolveFailure {
                         url,
-                        title: source.title.clone(),
-                        source,
-                        thumbnail,
-                        thumbnail_id,
-                        resolved_at: unix_time(),
-                        epoch,
-                        sponsorblock_segments,
+                        message: error.to_string(),
+                        hard_timeout,
                     }))
-                }
-                Err(error) => {
-                    let raw = error.to_string();
-                    let mapped = if is_hard_timeout(RetryErrorKind::Resolver, &raw) {
-                        format!("Failed to process URL, timeout: {raw}")
-                    } else {
-                        format!("Failed to process URL: {raw}")
-                    };
-                    app_logging::warning(format!(
-                        "pending video could not be resolved: url={url} error={mapped}"
-                    ));
-                    Message::UrlPreviewFailed { url, error: mapped }
                 }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
@@ -2148,7 +2206,13 @@ impl App {
     }
 
     /// Handles a resolver error by scheduling a retry.
-    pub fn handle_resolver_error(&self, url: String, error: String) {
+    ///
+    /// A playback resolve keeps the regular retries: the IPv4 fallback is
+    /// enabled once and the retry is scheduled with its backoff. A URL the
+    /// user submitted does not come through here; it ends in the error
+    /// modal instead.
+    pub fn handle_resolver_error(&self, failure: ResolveFailure) {
+        let ResolveFailure { url, message, hard_timeout } = failure;
         if !self.expects_resolved_url(&url) {
             return;
         }
@@ -2158,7 +2222,7 @@ impl App {
                 state.resolving_url = None;
             }
         }
-        if self.handle_ytdlp_timeout(&error) {
+        if hard_timeout || self.handle_ytdlp_timeout(&message) {
             if !self.auto_force_ipv4.swap(true, Ordering::SeqCst) {
                 self.enable_playback_ipv4_fallback(&url);
             }
@@ -2167,12 +2231,12 @@ impl App {
                 url,
                 RetryErrorKind::Resolver,
                 RetryKind::Resolver,
-                format!("Failed to process URL, timeout: {error}"),
+                format!("Failed to process URL, timeout: {message}"),
             );
             return;
         }
-        self.notify_tool_update_if_needed(&error);
-        self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, error);
+        self.notify_tool_update_if_needed(&message);
+        self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, message);
     }
 
     /// Enables `-4` for subsequent playback retries in the current sequence.
@@ -2643,11 +2707,14 @@ impl App {
 
     /// Invalidates queued/active playback resolve work started before this point.
     fn preempt_ytdlp(&self) -> u64 {
+        // The generation moves first: a resolve that was superseded can no
+        // longer take the slot away from the resolve that replaced it.
+        let epoch = self.ytdlp_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.ytdlp.cancel_playback();
-        self.ytdlp.cancel_url_preview();
+        self.ytdlp.cancel_url_entry();
         self.ytdlp.cancel_thumbnail();
         self.ytdlp.kill_all();
-        self.ytdlp_epoch.fetch_add(1, Ordering::SeqCst) + 1
+        epoch
     }
 
     /// Whether a `yt-dlp` run started for `epoch` has been superseded.
@@ -2655,16 +2722,21 @@ impl App {
         self.ytdlp_epoch.load(Ordering::SeqCst) != epoch
     }
 
+    /// Reacts to a timeout in the playback work.
+    ///
+    /// Only the playback and the thumbnail refresh are stopped: the URL the
+    /// user submitted is processed on its own terms and keeps running, so a
+    /// playback timeout never cancels the entry the user is waiting for.
     fn handle_ytdlp_timeout(&self, error: &str) -> bool {
         let lower = error.to_ascii_lowercase();
         if !(lower.contains("timed out") || lower.contains("did not respond within")) {
             return false;
         }
         app_logging::warning(format!(
-            "yt-dlp timeout detected; cancelling active yt-dlp requests without killing unrelated processes: {error}"
+            "yt-dlp timeout detected; cancelling the active playback work: {error}"
         ));
-        self.ytdlp.cancel_all();
-        self.url_preview_epoch.fetch_add(1, Ordering::SeqCst);
+        self.ytdlp.cancel_playback();
+        self.ytdlp.cancel_thumbnail();
         true
     }
 
@@ -3099,22 +3171,21 @@ impl App {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
     }
 
-    /// Retries a URL entry resolution once with -4 when a hard timeout occurs.
+    /// Retries a URL entry once with IPv4 when the hard timeout was hit.
     ///
-    /// Returns true when a retry was scheduled. URL-bar parsing is a one-shot
-    /// probe and must not mutate playback resolver state.
-    pub fn retry_url_entry_with_force_ipv4(&self, url: &str) -> bool {
+    /// The hard timeout is the only failure a different network stack can
+    /// still fix, so it is the only one that is retried. The retry happens
+    /// once per URL: a second failure ends the entry with the error modal.
+    ///
+    /// The resolver is copied for the retry, so the playback resolver keeps
+    /// its own behaviour.
+    ///
+    /// Returns true when the retry was started.
+    pub fn retry_url_entry_with_force_ipv4(&self, url: &str, epoch: u64, seconds: u64) -> bool {
         let normalized = url.trim().to_string();
         if normalized.is_empty() {
             return false;
         }
-        let mut guard = self.url_entry_retry.lock().expect("url entry retry state poisoned");
-        if guard.attempted.as_deref() == Some(normalized.as_str()) {
-            return false;
-        }
-        guard.attempted = Some(normalized.clone());
-        drop(guard);
-
         let forced = {
             let resolver = self.resolver.lock().expect("the resolver is not poisoned");
             if resolver.forces_ipv4() {
@@ -3122,28 +3193,34 @@ impl App {
             }
             resolver.clone().with_force_ipv4()
         };
+        {
+            let mut state = self.url_entry.lock().expect("the url entry state is not poisoned");
+            if !state.may_retry_with_ipv4(&normalized) {
+                return false;
+            }
+            state.mark_ipv4_retry();
+        }
 
         app_logging::warning(format!(
-            "URL entry failed with hard timeout; retrying once with -4: url={normalized}"
+            "url entry hit the hard timeout; retrying once with IPv4: url={normalized} epoch={epoch} timeout_seconds={seconds}"
         ));
-        let _ = self.outbox.lock().map(|sender| {
-            sender.send(Box::new(Message::Toast(
-                "Connection timed out; retrying once with IPv4...".to_string(),
-            )))
-        });
-        self.preview_url_with_resolver(normalized, forced);
+        // The error comes first, the retry that follows it second.
+        self.toast(format!(
+            "Could not process the URL: it did not answer within {seconds} seconds"
+        ));
+        self.toast("Retrying once with IPv4...".to_string());
+        self.start_url_entry(normalized, epoch, forced);
         true
     }
 
-    /// Reports that URL entry processing failed after retry/handling.
-    pub fn report_url_entry_failure(&self, message: String) {
-        self.url_entry_retry.lock().expect("url entry retry state poisoned").attempted = None;
-        self.report(message);
-    }
-
-    /// Clears one-shot URL entry retry state after success/cancel.
-    pub fn clear_url_entry_retry(&self) {
-        self.url_entry_retry.lock().expect("url entry retry state poisoned").attempted = None;
+    /// Ends the URL entry that is running.
+    ///
+    /// The process it started is killed and its result is discarded, so
+    /// nothing of it can reach the user afterwards.
+    pub fn cancel_url_entry(&self) {
+        self.url_entry_epoch.fetch_add(1, Ordering::SeqCst);
+        self.ytdlp.cancel_url_entry();
+        app_logging::notice("the url entry was cancelled");
     }
 
     /// Clears auto-enabled playback IPv4 fallback after a successful resolve.
@@ -3839,6 +3916,56 @@ mod tests {
     }
 
     #[test]
+    fn a_new_url_replaces_the_entry_that_is_running() {
+        let mut state = UrlEntryState::default();
+        state.begin("https://example.com/one", 1);
+        assert!(state.is_current(1));
+
+        state.begin("https://example.com/two", 2);
+
+        assert!(!state.is_current(1));
+        assert!(state.is_current(2));
+    }
+
+    #[test]
+    fn an_entry_that_never_started_is_not_the_current_one() {
+        let state = UrlEntryState::default();
+
+        assert!(!state.is_current(0));
+        assert!(!state.is_current(1));
+    }
+
+    #[test]
+    fn the_ipv4_retry_is_used_once_per_url() {
+        let mut state = UrlEntryState::default();
+        state.begin("https://example.com/one", 1);
+
+        assert!(state.may_retry_with_ipv4("https://example.com/one"));
+        state.mark_ipv4_retry();
+
+        assert!(!state.may_retry_with_ipv4("https://example.com/one"));
+    }
+
+    #[test]
+    fn the_ipv4_retry_only_belongs_to_the_url_that_is_running() {
+        let mut state = UrlEntryState::default();
+        state.begin("https://example.com/one", 1);
+
+        assert!(!state.may_retry_with_ipv4("https://example.com/two"));
+    }
+
+    #[test]
+    fn a_new_url_may_retry_with_ipv4_again() {
+        let mut state = UrlEntryState::default();
+        state.begin("https://example.com/one", 1);
+        state.mark_ipv4_retry();
+
+        state.begin("https://example.com/two", 2);
+
+        assert!(state.may_retry_with_ipv4("https://example.com/two"));
+    }
+
+    #[test]
     fn bitrates_are_readable() {
         assert_eq!(format_bitrate(128), "128 kb/s");
         assert_eq!(format_bitrate(4500), "4.5 Mb/s");
@@ -4097,5 +4224,29 @@ mod tests {
         assert!(!remaining.iter().any(|other| other.id == entry.id));
         // The yt-dlp run is cleared so the next entry can start one.
         assert!(ytdlp.try_begin_thumbnail().is_some());
+    }
+
+    #[test]
+    fn a_replaced_entry_cannot_take_the_slot_from_the_entry_that_replaced_it() {
+        let ytdlp =
+            Arc::new(YtdlpControl::new(YtDlp::new("yt-dlp", ytdlp_tool::ToolPaths::new("tools"))));
+        let epoch_state = AtomicU64::new(2);
+
+        // The entry for generation 1 was replaced, so it never starts and
+        // leaves the slot alone.
+        assert!(ytdlp.begin_url_entry(&epoch_state, 1).is_none());
+
+        // The entry for generation 2 takes the slot.
+        assert!(ytdlp.begin_url_entry(&epoch_state, 2).is_some());
+    }
+
+    #[test]
+    fn a_superseded_playback_resolve_cannot_take_the_slot() {
+        let ytdlp =
+            Arc::new(YtdlpControl::new(YtDlp::new("yt-dlp", ytdlp_tool::ToolPaths::new("tools"))));
+        let epoch_state = AtomicU64::new(5);
+
+        assert!(ytdlp.begin_playback(&epoch_state, 4).is_none());
+        assert!(ytdlp.begin_playback(&epoch_state, 5).is_some());
     }
 }
