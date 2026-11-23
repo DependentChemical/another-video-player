@@ -95,10 +95,13 @@ export component MainWindow inherits Window {
     in property <string> update-notes: "";
     in property <string> update-action-label: "Yes, download and install";
     in-out property <bool> update-installing: false;
-    in-out property <string> update-status-text: "Downloading update…";
+    in-out property <string> update-status-text: "Downloading update?";
     in property <string> update-error: "";
     // The progress of the download of an update package.
     in-out property <float> update-download-progress: 0;
+    in-out property <bool> error-open: false;
+    in property <string> error-title: "URL could not be processed";
+    in property <string> error-message: "";
     // The drawer that opens under the top bar when the mascot is clicked.
     in-out property <bool> sidebar-open: false;
     // The queue and history lists shown from the sidebar.
@@ -145,6 +148,7 @@ export component MainWindow inherits Window {
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
+    callback error-dismissed();
     callback queue-requested();
     callback playlists-requested();
     callback playlist-selected(string);
@@ -600,4 +604,58 @@ export component MainWindow inherits Window {
             }
         }
     }
+    if root.error-open: Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #00000099;
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(520px, parent.width - 40px);
+            background: Theme.panel;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+                Text {
+                    text: root.error-title;
+                    color: Theme.fg;
+                    font-size: 20px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.error-message;
+                    color: Theme.muted;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    Rectangle {
+                        width: 80px;
+                        height: 34px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: err-close.pressed ? Theme.elevated : (err-close.has-hover ? Theme.elevated : Theme.panel);
+                        Text {
+                            text: "OK";
+                            color: Theme.fg;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        err-close := TouchArea {
+                            clicked => {
+                                root.error-open = false;
+                                root.error-dismissed();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }

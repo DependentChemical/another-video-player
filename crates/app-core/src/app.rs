@@ -138,6 +138,10 @@ pub struct ResolvedMedia {
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
+#[derive(Debug, Default)]
+struct UrlEntryRetryState {
+    attempted: Option<String>,
+}
 /// A URL that was resolved while another media plays.
 ///
 /// The user chooses what happens next: the media is either appended to the
@@ -560,6 +564,8 @@ pub struct App {
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
     /// The last application release version shown to the user.
+    /// One-shot retry guard for URL bar entry failures.
+    url_entry_retry: Mutex<UrlEntryRetryState>,
     notified_app_update: Mutex<Option<String>>,
     /// The last yt-dlp release version shown to the user.
     notified_tool_update: Mutex<Option<String>>,
@@ -618,6 +624,7 @@ impl App {
             paths: paths.clone(),
             stream_buffer,
             pending: Mutex::new(None),
+            url_entry_retry: Mutex::new(UrlEntryRetryState::default()),
             notified_app_update: Mutex::new(None),
             notified_tool_update: Mutex::new(None),
         };
@@ -933,10 +940,7 @@ impl App {
                 }
                 Err(error) => {
                     let raw = error.to_string();
-                    let mapped = if raw.to_ascii_lowercase().contains("timed out")
-                        || raw.to_ascii_lowercase().contains("did not respond within")
-                    {
-                        ytdlp.kill_all();
+                    let mapped = if is_hard_timeout(RetryErrorKind::Resolver, &raw) {
                         format!("Failed to process URL, timeout: {raw}")
                     } else {
                         format!("Failed to process URL: {raw}")
@@ -3065,12 +3069,56 @@ impl App {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
     }
 
+    /// Retries a URL entry resolution once with -4 when a hard timeout occurs.
+    ///
+    /// Returns true when a retry was scheduled.
+    pub fn retry_url_entry_with_force_ipv4(&self, url: &str) -> bool {
+        let normalized = url.trim().to_string();
+        if normalized.is_empty() {
+            return false;
+        }
+        let mut guard = self.url_entry_retry.lock().expect("url entry retry state poisoned");
+        if guard.attempted.as_deref() == Some(normalized.as_str()) {
+            return false;
+        }
+        guard.attempted = Some(normalized.clone());
+        drop(guard);
+
+        let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
+        if resolver.forces_ipv4() {
+            return false;
+        }
+        *resolver = resolver.clone().with_force_ipv4();
+        drop(resolver);
+
+        app_logging::warning(format!(
+            "URL entry failed with hard timeout; retrying once with -4: url={normalized}"
+        ));
+        let _ = self.outbox.lock().map(|sender| {
+            sender.send(Box::new(Message::Toast(
+                "Connection timed out; retrying once with IPv4...".to_string(),
+            )))
+        });
+        self.preview_url(normalized);
+        true
+    }
+
+    /// Reports that URL entry processing failed after retry/handling.
+    pub fn report_url_entry_failure(&self, message: String) {
+        self.url_entry_retry.lock().expect("url entry retry state poisoned").attempted = None;
+        self.report(message);
+    }
+
+    /// Clears one-shot URL entry retry state after success/cancel.
+    pub fn clear_url_entry_retry(&self) {
+        self.url_entry_retry.lock().expect("url entry retry state poisoned").attempted = None;
+    }
+
     /// Sends an informational toast to the user interface.
     fn toast(&self, text: String) {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Toast(text))));
     }
 }
-
 /// The queue entries that lack a valid cached thumbnail but can still be
 /// downloaded, because the extractor reported a remote thumbnail URL.
 ///
@@ -3528,6 +3576,44 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
     resolver
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn sign_in_and_resolve(
+    resolver: &Resolver,
+    session: &Session,
+    epoch_state: &AtomicU64,
+    epoch: u64,
+    cancel: &Arc<AtomicBool>,
+    pid: &Arc<AtomicU32>,
+    url: &str,
+    notice: &Sender<Box<Message>>,
+    service: media_model::Service,
+    original_error: stream_resolver::Error,
+) -> Result<MediaSource, stream_resolver::Error> {
+    use stream_resolver::Error as ResolveError;
+    match session.sign_in(service, url, notice) {
+        Ok(()) => {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                return Err(ResolveError::Cancelled);
+            }
+            resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await
+        }
+        Err(crate::session::Error::Declined) => {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                return Err(ResolveError::Cancelled);
+            }
+            let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
+            Err(original_error)
+        }
+        Err(problem) => {
+            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                return Err(ResolveError::Cancelled);
+            }
+            let message = original_error.to_string();
+            Err(ResolveError::Tool(format!("{message} ({problem})")))
+        }
+    }
+}
+
 /// Resolves a URL, offering sign-in when the service requires it.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_with_session(
@@ -3558,30 +3644,60 @@ async fn resolve_with_session(
     }
 
     let message = error.to_string();
+    if is_hard_timeout(RetryErrorKind::Resolver, &message) && !resolver.forces_ipv4() {
+        app_logging::warning(format!("hard timeout resolving {url}; retrying once with yt-dlp -4"));
+        let _ = notice.send(Box::new(Message::Toast(
+            "Connection timed out; retrying once with IPv4...".to_string(),
+        )));
+        let ipv4 = resolver.clone().with_force_ipv4();
+        let retry = ipv4.resolve_with_cancel(url, cancel.clone(), pid.clone()).await;
+        match retry {
+            Ok(source) => return Ok(source),
+            Err(err)
+                if matches!(err, ResolveError::Cancelled)
+                    || cancel.load(Ordering::SeqCst)
+                    || epoch_state.load(Ordering::SeqCst) != epoch =>
+            {
+                return Err(ResolveError::Cancelled);
+            }
+            Err(err) => {
+                let retry_message = err.to_string();
+                let Some(service) = web_session::challenge_service(url, &retry_message) else {
+                    return Err(err);
+                };
+                return sign_in_and_resolve(
+                    resolver,
+                    session,
+                    epoch_state,
+                    epoch,
+                    cancel,
+                    pid,
+                    url,
+                    notice,
+                    service,
+                    err,
+                )
+                .await;
+            }
+        }
+    }
+
     let Some(service) = web_session::challenge_service(url, &message) else {
         return Err(error);
     };
-    match session.sign_in(service, url, notice) {
-        Ok(()) => {
-            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
-                return Err(ResolveError::Cancelled);
-            }
-            resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await
-        }
-        Err(crate::session::Error::Declined) => {
-            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
-                return Err(ResolveError::Cancelled);
-            }
-            let _ = notice.send(Box::new(Message::Problem("User did not sign-in".to_string())));
-            Err(error)
-        }
-        Err(problem) => {
-            if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
-                return Err(ResolveError::Cancelled);
-            }
-            Err(ResolveError::Tool(format!("{message} ({problem})")))
-        }
-    }
+    sign_in_and_resolve(
+        resolver,
+        session,
+        epoch_state,
+        epoch,
+        cancel,
+        pid,
+        url,
+        notice,
+        service,
+        error,
+    )
+    .await
 }
 
 /// Everything that can go wrong while running the application.

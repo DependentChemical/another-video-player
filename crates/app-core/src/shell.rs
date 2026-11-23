@@ -117,6 +117,12 @@ impl Shell {
                 update.borrow_mut().take();
             });
         }
+        {
+            let ui_for_error = Rc::clone(&ui);
+            ui.on_error_dismissed(move || {
+                ui_for_error.close_url_error();
+            });
+        }
 
         // Window exit is distinct from pointer movement within the client area.
         {
@@ -963,6 +969,7 @@ fn tick(
                     app_logging::debug("discarded a pending video that was superseded");
                     continue;
                 }
+                app.clear_url_entry_retry();
                 let in_playlist = app.active_playlist_name().is_some();
                 ui.show_pending(
                     &pending.title,
@@ -973,10 +980,15 @@ fn tick(
                 app.set_pending(pending);
             }
             Message::Pending(Err(error)) => {
-                ui.show_toast(&error);
+                ui.show_url_error(&error);
+                app.report_url_entry_failure(error);
             }
-            Message::UrlPreviewFailed { url: _, error } => {
-                ui.show_toast(&error);
+            Message::UrlPreviewFailed { url, error } => {
+                if app.retry_url_entry_with_force_ipv4(&url) {
+                    break;
+                }
+                ui.show_url_error(&error);
+                app.report_url_entry_failure(error);
             }
             Message::SigningIn(service) => {
                 ui.show_toast(&format!("Sign in to {} to continue", service.label()));

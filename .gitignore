@@ -15,6 +15,9 @@
 # Research material and scratch files (reference projects, screenshots, logs)
 /.ref/
 
+# Diagnosis artifacts (manual repro logs, URL corpora, scripts)
+/.diagnosis/
+
 # Editor / OS
 .idea/
 .vscode/
