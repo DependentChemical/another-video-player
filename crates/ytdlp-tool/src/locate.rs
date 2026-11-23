@@ -51,7 +51,7 @@ impl YtDlp {
 
     /// Builds a command that runs `yt-dlp` with the given arguments.
     pub fn command(&self) -> Command {
-        let command = match &self.interpreter {
+        let mut command = match &self.interpreter {
             Some(interpreter) => {
                 let mut command = Command::new(interpreter);
                 command.arg(&self.program);
@@ -59,6 +59,7 @@ impl YtDlp {
             }
             None => Command::new(&self.program),
         };
+        command.env("BUN_DIR", self.tools.root().join("bun-data"));
         #[cfg(windows)]
         let command = {
             let mut command = command;

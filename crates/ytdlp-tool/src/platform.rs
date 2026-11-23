@@ -52,6 +52,30 @@ impl Platform {
         }
     }
 
+    /// The name the managed Bun runtime is stored under.
+    ///
+    /// The release artifacts are named `bun-windows-x64.zip` and
+    /// `bun-linux-x64-baseline.zip`, but the player always looks for the same
+    /// name in its tool directory, so the build renames the download.
+    pub fn bun_binary_name(self) -> &'static str {
+        match self {
+            Platform::Windows => "bun.exe",
+            _ => "bun",
+        }
+    }
+
+    /// The release artifact that carries the Bun runtime for this platform.
+    ///
+    /// The version is pinned in [`crate::update::BUN_VERSION`] so the player
+    /// does not drift behind the yt-dlp EJS scripts it ships with.
+    pub fn bun_asset(self) -> &'static str {
+        match self {
+            Platform::Windows => "bun-windows-x64.zip",
+            Platform::Linux => "bun-linux-x64-baseline.zip",
+            Platform::MacOs => "bun-darwin-x64-baseline.zip",
+        }
+    }
+
     /// The name of the player executable on the platform.
     pub fn executable_name(self) -> &'static str {
         match self {

@@ -3673,7 +3673,8 @@ fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
 
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
 fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings) -> Resolver {
-    let extra_args = settings.ytdlp_extra_args();
+    let bun_path = ensure_bun(ytdlp, settings);
+    let extra_args = settings.ytdlp_extra_args(bun_path.as_deref());
     if !extra_args.is_empty() {
         app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
     }
@@ -3688,6 +3689,30 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
         }
     }
     resolver
+}
+
+/// Ensures the Bun runtime is installed when the settings request it.
+///
+/// The Bun binary is downloaded next to `yt-dlp` inside the tool directory and
+/// never writes outside of it: `BUN_DIR` is set to `tools/bun-data` when the
+/// runtime is spawned, so all caches and logs stay inside the portable
+/// package.
+fn ensure_bun(ytdlp: &YtDlp, settings: &Settings) -> Option<std::path::PathBuf> {
+    if settings.js_runtime() != "bun" {
+        return None;
+    }
+    let binary =
+        ytdlp.paths().root().join(ytdlp_tool::platform::Platform::current().bun_binary_name());
+    if binary.is_file() {
+        return Some(binary);
+    }
+    match ytdlp_tool::update::install_bun(ytdlp.paths()) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            app_logging::warning(format!("the bun runtime could not be installed: {error}"));
+            None
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -103,8 +103,21 @@ impl Settings {
             .to_ascii_uppercase()
     }
 
+/// The JavaScript runtime yt-dlp uses to solve EJS challenges.
+    pub fn js_runtime(&self) -> String {
+        self.document
+            .pointer("/YtDlp-Settings/js-runtime/value")
+            .and_then(|v| v.as_str().map(String::from))
+            .or_else(|| {
+                self.document
+                    .pointer("/YtDlp-Settings/js-runtime/default")
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+            .unwrap_or_else(|| "bun".to_string())
+    }
+
     /// Extra yt-dlp CLI arguments derived from settings.
-    pub fn ytdlp_extra_args(&self) -> Vec<String> {
+    pub fn ytdlp_extra_args(&self, bun_path: Option<&std::path::Path>) -> Vec<String> {
         let mut args = Vec::new();
         if self.bool_setting("/YtDlp-Settings/force-ipv4", false) {
             args.push("-4".to_string());
@@ -119,6 +132,19 @@ impl Settings {
         if extractor_retries != 3 {
             args.push("--extractor-retries".to_string());
             args.push(extractor_retries.to_string());
+        }
+        // If the JavaScript runtime is set to "bun" and a bun binary path is supplied,
+        // tell yt-dlp to use it for EJS challenge solving.
+        if let Some(path) = bun_path
+            && self
+                .document
+                .pointer("/YtDlp-Settings/js-runtime/value")
+                .and_then(Value::as_str)
+                == Some("bun")
+        {
+            let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            args.push("--js-runtimes".to_string());
+            args.push(format!("bun:{}", abs.display()));
         }
         args
     }
@@ -687,7 +713,7 @@ mod tests {
         )
         .expect("settings parse");
         assert_eq!(
-            settings.ytdlp_extra_args(),
+            settings.ytdlp_extra_args(None),
             vec!["-4", "--socket-timeout", "20", "--extractor-retries", "5"]
         );
         assert_eq!(settings.ytdlp_socket_timeout_seconds(), 20);

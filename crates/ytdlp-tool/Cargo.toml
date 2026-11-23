@@ -16,3 +16,4 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 ureq = { workspace = true }
 yt-dlp = { workspace = true }
+zip = { workspace = true }
