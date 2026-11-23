@@ -174,8 +174,7 @@ fn copy_bun(staging: &Path, platform: Platform) -> Result<(), String> {
     let url = format!("https://github.com/oven-sh/bun/releases/download/{version}/{asset}");
     let archive = tools.join(format!("bun-{}.zip", platform.archive_name()));
     download(&url, &archive)?;
-    let archive_file =
-        std::fs::File::open(&archive).map_err(|error| error.to_string())?;
+    let archive_file = std::fs::File::open(&archive).map_err(|error| error.to_string())?;
     let mut archive_zip = zip::ZipArchive::new(&archive_file)
         .map_err(|error| format!("the bun archive could not be read: {error}"))?;
     let bin_name = platform.bun_binary_name().to_string();

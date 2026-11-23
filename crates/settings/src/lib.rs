@@ -103,7 +103,7 @@ impl Settings {
             .to_ascii_uppercase()
     }
 
-/// The JavaScript runtime yt-dlp uses to solve EJS challenges.
+    /// The JavaScript runtime yt-dlp uses to solve EJS challenges.
     pub fn js_runtime(&self) -> String {
         self.document
             .pointer("/YtDlp-Settings/js-runtime/value")
@@ -134,15 +134,14 @@ impl Settings {
             args.push(extractor_retries.to_string());
         }
         // If the JavaScript runtime is set to "bun" and a bun binary path is supplied,
-        // tell yt-dlp to use it for EJS challenge solving.
+        // tell yt-dlp to use it for EJS challenge solving. Clear default runtimes first
+        // so deno/node do not take precedence over the managed bun runtime.
         if let Some(path) = bun_path
-            && self
-                .document
-                .pointer("/YtDlp-Settings/js-runtime/value")
-                .and_then(Value::as_str)
+            && self.document.pointer("/YtDlp-Settings/js-runtime/value").and_then(Value::as_str)
                 == Some("bun")
         {
             let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            args.push("--no-js-runtimes".to_string());
             args.push("--js-runtimes".to_string());
             args.push(format!("bun:{}", abs.display()));
         }
@@ -717,5 +716,18 @@ mod tests {
             vec!["-4", "--socket-timeout", "20", "--extractor-retries", "5"]
         );
         assert_eq!(settings.ytdlp_socket_timeout_seconds(), 20);
+    }
+
+    #[test]
+    fn bun_runtime_clears_default_js_runtimes() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"js-runtime":{"value":"bun","default":"bun"}}}"#,
+        )
+        .expect("settings parse");
+        let args = settings.ytdlp_extra_args(Some(std::path::Path::new("tools/bun.exe")));
+        assert_eq!(args[0], "--no-js-runtimes");
+        assert_eq!(args[1], "--js-runtimes");
+        assert!(args[2].starts_with("bun:"));
+        assert!(args[2].contains("bun.exe"));
     }
 }

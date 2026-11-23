@@ -18,7 +18,7 @@ use crate::version::is_newer;
 /// Where the newest release is announced.
 pub const RELEASES_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 
-pub const BUN_VERSION: &str = "bun-v1.4.5";
+pub const BUN_VERSION: &str = "bun-v1.3.14";
 
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 
