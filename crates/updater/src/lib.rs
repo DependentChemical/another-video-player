@@ -198,13 +198,17 @@ fn write_helper(
     let (path, body) = {
         let path = directory.join(".flatline-update.cmd");
         let body = format!(
-            "@echo off\r\n:wait\r\ntimeout /t 1 /nobreak >nul\r\nmove /y \"{}\\flatline.exe\" \"{}\\flatline.exe\" >nul 2>&1 || goto wait\r\nrobocopy \"{}\" \"{}\" /E /MOVE >nul\r\ndel \"{}\"\r\nstart \"\" \"{}\"\r\nrmdir /s /q \"{}\"\r\ndel \"%~f0\"\r\n",
-            staging.display(),
+            "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"APP={}\"\r\nset \"STAGE={}\"\r\nset \"ARCHIVE={}\"\r\n:retry\r\nren \"{}\\flatline.exe\" \"flatline.exe.old\" >nul 2>&1\r\nif exist \"{}\\flatline.exe\" (\r\n  timeout /t 1 /nobreak >nul\r\n  goto retry\r\n)\r\nrobocopy \"{}\" \"{}\" /E /MOVE >nul\r\ndel \"{}\" >nul 2>&1\r\nstart \"\" \"{}\"\r\ntimeout /t 2 /nobreak >nul\r\ndel /f /q \"{}\\flatline.exe.old\" >nul 2>&1\r\nrmdir /s /q \"{}\" >nul 2>&1\r\ndel \"%~f0\"\r\n",
             directory.display(),
             staging.display(),
+            archive.display(),
+            directory.display(),
+            directory.display(),
+            directory.display(),
             directory.display(),
             archive.display(),
             executable.display(),
+            directory.display(),
             staging.display()
         );
         (path, body)
@@ -213,14 +217,17 @@ fn write_helper(
     let (path, body) = {
         let path = directory.join(".flatline-update.sh");
         let body = format!(
-            "#!/bin/sh\nmv -f \"{}\" \"{}\"\ncp -R \"{}\"/. \"{}\"/\nrm -rf \"{}\" \"{}\"\n\"{}\" &\nrm -- \"$0\"\n",
-            staging.join("flatline").display(),
+            "#!/bin/sh\nif [ -f \"{}\" ]; then\r\n  mv -f \"{}\" \"{}.old\"\r\n  while [ -f \"{}\" ]; do sleep 1; done\r\nfi\r\ncp -R \"{}\"/. \"{}\"/\n\"{}\" &\nsleep 2\r\nrm -f \"{}.old\" \"{}\"\r\nrm -rf \"{}\"\r\nrm -- \"$0\"\n",
+            executable.display(),
+            executable.display(),
+            executable.display(),
             executable.display(),
             staging.display(),
             directory.display(),
+            executable.display(),
+            executable.display(),
             staging.display(),
-            archive.display(),
-            executable.display()
+            archive.display()
         );
         (path, body)
     };
@@ -245,6 +252,9 @@ fn launch_helper(path: &Path) -> Result<(), Error> {
     std::process::Command::new("cmd")
         .args(["/C", &command])
         .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(io_error)?;
     std::process::exit(0)
