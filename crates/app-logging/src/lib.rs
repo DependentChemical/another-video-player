@@ -126,11 +126,16 @@ struct Global {
 /// The process wide logger.
 static LOGGER: OnceLock<Global> = OnceLock::new();
 
+/// The size in bytes past which the log file is cleared on startup.
+const MAX_LOG_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Starts the log queue and its background writer.
 ///
-/// The file is created when it is missing and appended to otherwise. Its
-/// parent directory is created when needed. Calling `init` again only changes
-/// the threshold; the original writer thread keeps owning the file.
+/// The file is created when it is missing and appended to otherwise. A file
+/// already holding more than [`MAX_LOG_FILE_BYTES`] is cleared first, so it
+/// cannot inflate without bound. Its parent directory is created when
+/// needed. Calling `init` again only changes the threshold; the original
+/// writer thread keeps owning the file.
 ///
 /// A file that cannot be opened is not fatal: the writer falls back to the
 /// standard error stream and logs the reason there, so a graphical build
@@ -144,13 +149,28 @@ pub fn init(path: impl AsRef<Path>, level: Level) {
         return;
     }
 
-    let sink = Sink::open(path.as_ref());
+    let path = path.as_ref();
+    clear_oversized_log(path);
+    let sink = Sink::open(path);
     let (sender, receiver) = channel();
     match spawn_writer(sink, receiver) {
         Ok(_thread) => {
             let _ = LOGGER.set(Global { sender, level: AtomicU8::new(level.rank()) });
         }
         Err(error) => emergency(&format!("the log writer thread could not be started: {error}")),
+    }
+}
+
+/// Empties the log file when it already holds more than [`MAX_LOG_FILE_BYTES`].
+///
+/// A log that keeps growing across runs inflates the file without limit, so
+/// startup clears it. A missing or small file is left untouched.
+fn clear_oversized_log(path: &Path) {
+    let Ok(len) = std::fs::metadata(path).map(|metadata| metadata.len()) else {
+        return;
+    };
+    if len > MAX_LOG_FILE_BYTES {
+        let _ = OpenOptions::new().write(true).truncate(true).open(path);
     }
 }
 
@@ -381,5 +401,48 @@ mod tests {
         assert!(lines[0].contains("[NOTICE] first"));
         assert!(lines[1].contains("[ERROR] second"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn temp_log_path(tag: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("flatline-logging-{tag}-{}-{unique}.log", std::process::id()))
+    }
+
+    #[test]
+    fn an_oversized_log_file_is_emptied_on_startup() {
+        let path = temp_log_path("oversized");
+        std::fs::write(&path, vec![b'x'; MAX_LOG_FILE_BYTES as usize + 1])
+            .expect("the oversized log file is written");
+
+        clear_oversized_log(&path);
+
+        assert_eq!(std::fs::metadata(&path).expect("the log file still exists").len(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_log_file_at_the_limit_is_kept_on_startup() {
+        let path = temp_log_path("at-limit");
+        std::fs::write(&path, vec![b'x'; MAX_LOG_FILE_BYTES as usize])
+            .expect("the log file is written");
+
+        clear_oversized_log(&path);
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("the log file still exists").len(),
+            MAX_LOG_FILE_BYTES
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_log_file_is_left_alone_on_startup() {
+        let path = temp_log_path("missing");
+        clear_oversized_log(&path);
+        assert!(!path.exists());
     }
 }

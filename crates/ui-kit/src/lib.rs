@@ -812,6 +812,19 @@ impl PlayerUi {
         self.window.set_update_download_progress(0.0);
     }
 
+    /// Shows a simple URL processing error modal.
+    pub fn show_url_error(&self, message: &str) {
+        self.window.set_error_title("URL could not be processed".into());
+        self.window.set_error_message(message.into());
+        self.window.set_error_open(true);
+    }
+
+    /// Closes the URL processing error modal.
+    pub fn close_url_error(&self) {
+        self.window.set_error_open(false);
+        self.window.set_error_message("".into());
+    }
+
     // ------------------------------------------------------------ events --
 
     /// Called when the user asks for the URL to be loaded.
@@ -941,6 +954,11 @@ impl PlayerUi {
     /// Called when the user declines the update.
     pub fn on_update_dismissed(&self, handler: impl Fn() + 'static) {
         self.window.on_update_dismissed(handler);
+    }
+
+    /// Called when the URL error modal is dismissed.
+    pub fn on_error_dismissed(&self, handler: impl Fn() + 'static) {
+        self.window.on_error_dismissed(handler);
     }
 
     /// Called when the user asks for the active queue.

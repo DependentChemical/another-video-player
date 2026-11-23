@@ -103,6 +103,53 @@ impl Settings {
             .to_ascii_uppercase()
     }
 
+    /// Extra yt-dlp CLI arguments derived from settings.
+    pub fn ytdlp_extra_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.bool_setting("/YtDlp-Settings/force-ipv4", false) {
+            args.push("-4".to_string());
+        }
+        let socket_timeout = self.u64_setting("/YtDlp-Settings/socket-timeout", 15).clamp(5, 120);
+        if socket_timeout != 15 {
+            args.push("--socket-timeout".to_string());
+            args.push(socket_timeout.to_string());
+        }
+        let extractor_retries =
+            self.u64_setting("/YtDlp-Settings/extractor-retries", 3).clamp(1, 10);
+        if extractor_retries != 3 {
+            args.push("--extractor-retries".to_string());
+            args.push(extractor_retries.to_string());
+        }
+        args
+    }
+
+    /// Configured yt-dlp socket timeout in seconds.
+    pub fn ytdlp_socket_timeout_seconds(&self) -> u64 {
+        self.u64_setting("/YtDlp-Settings/socket-timeout", 15).clamp(5, 120)
+    }
+
+    fn bool_setting(&self, base: &str, fallback: bool) -> bool {
+        let value_path = format!("{base}/value");
+        let default_path = format!("{base}/default");
+        self.document
+            .pointer(&value_path)
+            .and_then(Value::as_bool)
+            .or_else(|| self.document.pointer(&default_path).and_then(Value::as_bool))
+            .unwrap_or(fallback)
+    }
+
+    fn u64_setting(&self, base: &str, fallback: u64) -> u64 {
+        let value_path = format!("{base}/value");
+        let default_path = format!("{base}/default");
+        self.document
+            .pointer(&value_path)
+            .and_then(|v| {
+                v.as_u64().or_else(|| v.as_i64().and_then(|i| (i >= 0).then_some(i as u64)))
+            })
+            .or_else(|| self.document.pointer(&default_path).and_then(Value::as_u64))
+            .unwrap_or(fallback)
+    }
+
     /// Whether a SponsorBlock category should be skipped during playback.
     ///
     /// A category is skipped when its explicit `value` is `true`, or when the
@@ -631,5 +678,18 @@ mod tests {
 
         let missing = Settings::from_json(r#"{"Video-Settings":{}}"#).expect("settings parse");
         assert_eq!(missing.log_level(), "NOTICE");
+    }
+
+    #[test]
+    fn ytdlp_settings_emit_extra_args() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"force-ipv4":{"value":true,"default":false},"socket-timeout":{"value":20,"default":15},"extractor-retries":{"value":5,"default":3}}}"#,
+        )
+        .expect("settings parse");
+        assert_eq!(
+            settings.ytdlp_extra_args(),
+            vec!["-4", "--socket-timeout", "20", "--extractor-retries", "5"]
+        );
+        assert_eq!(settings.ytdlp_socket_timeout_seconds(), 20);
     }
 }

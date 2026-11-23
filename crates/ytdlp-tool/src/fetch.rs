@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -100,22 +101,16 @@ fn run_fetch(
         ))
     })?;
     pid.store(child.id(), Ordering::SeqCst);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut out) = stdout {
-            let _ = out.read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut err) = stderr {
-            let _ = err.read_to_end(&mut bytes);
-        }
-        bytes
-    });
+    // The document is the whole stdout, so it is collected in full; only
+    // stderr is tailed for diagnostics.
+    let stdout_capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stderr_capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_output_reader(child.stdout.take(), Arc::clone(&stdout_capture), None);
+    let stderr_reader = spawn_output_reader(
+        child.stderr.take(),
+        Arc::clone(&stderr_capture),
+        Some(MAX_OUTPUT_BYTES),
+    );
 
     let started = Instant::now();
     let deadline = started + RESOLUTION_TIMEOUT;
@@ -131,58 +126,54 @@ fn run_fetch(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) => {
                 let elapsed = started.elapsed();
                 if !socket_timeout_logged && elapsed >= SOCKET_TIMEOUT {
                     socket_timeout_logged = true;
                     app_logging::warning(format!(
-                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s",
+                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_tail=\"{}\" stdout_tail=\"{}\"",
                         SOCKET_TIMEOUT.as_secs(),
                         elapsed.as_secs(),
-                        RESOLUTION_TIMEOUT.as_secs()
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        output_excerpt(&stderr_capture),
+                        output_excerpt(&stdout_capture),
                     ));
                 }
+                if Instant::now() >= deadline {
+                    let stderr_text = tail_text(&stderr_capture);
+                    let stdout_text = tail_text(&stdout_capture);
+                    let stderr_excerpt = last_chars(&stderr_text, 300);
+                    let stdout_excerpt = last_chars(&stdout_text, 300);
+                    crate::locate::terminate_child_process(&mut child);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    let stage =
+                        if stderr_excerpt.to_ascii_lowercase().contains("downloading webpage") {
+                            "downloading_webpage"
+                        } else if stderr_excerpt.to_ascii_lowercase().contains("extracting url") {
+                            "extracting_url"
+                        } else {
+                            "unknown"
+                        };
+                    app_logging::warning(format!(
+                        "yt-dlp hard timeout reached; killing process: url={url} stage={stage} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
+                        SOCKET_TIMEOUT.as_secs(),
+                        elapsed.as_secs(),
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        stderr_text.len(),
+                        stdout_text.len(),
+                        stderr_excerpt,
+                        stdout_excerpt
+                    ));
+                    pid.store(0, Ordering::SeqCst);
+                    return Err(Error::YtDlp(format!(
+                        "yt-dlp did not respond within {} seconds; last output: stderr=\"{}\" stdout=\"{}\"",
+                        RESOLUTION_TIMEOUT.as_secs(),
+                        stderr_excerpt,
+                        stdout_excerpt
+                    )));
+                }
                 thread::sleep(Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let elapsed = started.elapsed();
-                crate::locate::terminate_child_process(&mut child);
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
-                let stderr_tail = String::from_utf8_lossy(&stderr);
-                let stdout_tail = String::from_utf8_lossy(&stdout);
-                let stderr_tail = stderr_tail.trim();
-                let stdout_tail = stdout_tail.trim();
-                app_logging::warning(format!(
-                    "yt-dlp hard timeout reached; killing process: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
-                    SOCKET_TIMEOUT.as_secs(),
-                    elapsed.as_secs(),
-                    RESOLUTION_TIMEOUT.as_secs(),
-                    stderr.len(),
-                    stdout.len(),
-                    stderr_tail
-                        .chars()
-                        .rev()
-                        .take(300)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>(),
-                    stdout_tail
-                        .chars()
-                        .rev()
-                        .take(300)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-                ));
-                crate::locate::kill_all(tool);
-                pid.store(0, Ordering::SeqCst);
-                return Err(Error::YtDlp(format!(
-                    "yt-dlp did not respond within {} seconds",
-                    RESOLUTION_TIMEOUT.as_secs()
-                )));
             }
             Err(error) => {
                 crate::locate::terminate_child_process(&mut child);
@@ -195,25 +186,92 @@ fn run_fetch(
         }
     };
     pid.store(0, Ordering::SeqCst);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    let stdout = tail_text(&stdout_capture);
+    let stderr = tail_text(&stderr_capture);
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
     if !status.success() {
-        let message = String::from_utf8_lossy(&stderr).trim().to_string();
-        let message = if message.is_empty() {
-            String::from_utf8_lossy(&stdout).trim().to_string()
-        } else {
-            message
-        };
+        let message = if stderr.is_empty() { output_excerpt(&stdout_capture) } else { stderr };
         let detail =
             if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
         return Err(Error::YtDlp(detail));
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&stdout)
+    let value = parse_document(&stdout)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
     deserialize_video_lenient(value)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
+}
+
+/// Parses the first JSON value in `stdout`.
+///
+/// The output is the whole `--dump-single-json` document; a value is taken
+/// where one parses and anything after it is ignored, since `yt-dlp` may
+/// print stray text around the document.
+fn parse_document(stdout: &str) -> Result<serde_json::Value, String> {
+    let mut values = serde_json::Deserializer::from_str(stdout).into_iter::<serde_json::Value>();
+    match values.next() {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(error)) => Err(error.to_string()),
+        None => Err("no JSON value in output".to_string()),
+    }
+}
+
+/// Captured output of one of `yt-dlp`'s output streams, kept while the stream
+/// is read; tail reads are capped at [`MAX_OUTPUT_BYTES`] and the stdout
+/// document is collected without a cap.
+type OutputTail = Arc<Mutex<Vec<u8>>>;
+
+/// Maximum bytes kept of each diagnostic output stream.
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// The trimmed text of the captured output.
+fn tail_text(tail: &OutputTail) -> String {
+    let guard = tail.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    String::from_utf8_lossy(guard.as_slice()).trim().to_string()
+}
+
+/// The final part of the output stream's text, limited to its last 300 characters.
+fn output_excerpt(tail: &OutputTail) -> String {
+    last_chars(&tail_text(tail), 300)
+}
+
+/// The last `count` characters of `text`, in their original order.
+fn last_chars(text: &str, count: usize) -> String {
+    text.chars().rev().take(count).collect::<String>().chars().rev().collect()
+}
+
+/// Reads `stream` until it ends into `capture`, keeping its final `max_bytes`
+/// when given or every byte when `None`.
+fn spawn_output_reader<R: Read + Send + 'static>(
+    stream: Option<R>,
+    capture: OutputTail,
+    max_bytes: Option<usize>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Some(mut stream) = stream {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut guard =
+                            capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.extend_from_slice(&buffer[..n]);
+                        if let Some(max) = max_bytes
+                            && guard.len() > max
+                        {
+                            let start = guard.len() - max;
+                            guard.copy_within(start.., 0);
+                            guard.truncate(max);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    })
 }
 
 fn common_args(extra: &[String]) -> Vec<String> {
@@ -221,13 +279,26 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "--no-warnings".to_string(),
         "--no-progress".to_string(),
         "--ignore-config".to_string(),
-        "--socket-timeout".to_string(),
-        SOCKET_TIMEOUT.as_secs().to_string(),
+        "-v".to_string(),
     ];
-    for arg in extra {
+    let mut has_socket_timeout = false;
+    let mut iter = extra.iter();
+    while let Some(arg) = iter.next() {
         if !args.iter().any(|existing| existing == arg) {
             args.push(arg.clone());
         }
+        if arg == "--socket-timeout" {
+            has_socket_timeout = true;
+            if let Some(value) = iter.next()
+                && !args.iter().any(|existing| existing == value)
+            {
+                args.push(value.clone());
+            }
+        }
+    }
+    if !has_socket_timeout {
+        args.insert(3, SOCKET_TIMEOUT.as_secs().to_string());
+        args.insert(3, "--socket-timeout".to_string());
     }
     args
 }
@@ -550,5 +621,85 @@ mod tests {
     #[test]
     fn rejects_documents_of_the_wrong_shape() {
         assert!(deserialize_video_lenient(json!({ "id": 1 })).is_err());
+    }
+
+    #[test]
+    fn output_reader_records_the_stream_output() {
+        let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_output_reader(
+            Some(std::io::Cursor::new(b"line1\nline2\n".to_vec())),
+            Arc::clone(&tail),
+            Some(MAX_OUTPUT_BYTES),
+        );
+        let _ = handle.join();
+        assert_eq!(tail_text(&tail), "line1\nline2");
+    }
+
+    #[test]
+    fn output_reader_keeps_the_whole_document() {
+        let capture: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_output_reader(
+            Some(std::io::Cursor::new(vec![b'a'; MAX_OUTPUT_BYTES + 1024])),
+            Arc::clone(&capture),
+            None,
+        );
+        let _ = handle.join();
+        assert_eq!(capture.lock().unwrap().len(), MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn output_reader_keeps_only_the_final_bytes() {
+        let tail: OutputTail = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_output_reader(
+            Some(std::io::Cursor::new(vec![b'a'; MAX_OUTPUT_BYTES + 100])),
+            Arc::clone(&tail),
+            Some(MAX_OUTPUT_BYTES),
+        );
+        let _ = handle.join();
+        assert_eq!(tail.lock().unwrap().len(), MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn tail_text_trims_the_stream_contents() {
+        let tail: OutputTail = Arc::new(Mutex::new(b"  hello\n\n".to_vec()));
+        assert_eq!(tail_text(&tail), "hello");
+    }
+
+    #[test]
+    fn output_excerpt_is_bounded_to_300_characters() {
+        let tail: OutputTail = Arc::new(Mutex::new(vec![b'x'; 1000]));
+        assert_eq!(output_excerpt(&tail).chars().count(), 300);
+    }
+
+    #[test]
+    fn parses_documents_larger_than_the_tail_buffer() {
+        let mut video = well_formed_video();
+        video["title"] = json!("t".repeat(MAX_OUTPUT_BYTES + 1024));
+        let text = serde_json::to_string(&video).expect("video serializes");
+        assert!(text.len() > MAX_OUTPUT_BYTES);
+
+        let parsed = deserialize_video_lenient(parse_document(&text).expect("document parses"));
+        assert_eq!(parsed.expect("metadata parses").title.len(), MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn parse_document_takes_the_first_value_and_ignores_trailing_text() {
+        let text = serde_json::to_string(&well_formed_video()).expect("video serializes");
+        assert!(parse_document(&format!("{text} trailing text")).is_ok());
+    }
+
+    #[test]
+    fn common_args_include_socket_timeout_once() {
+        let args =
+            common_args(&["-4".to_string(), "--socket-timeout".to_string(), "20".to_string()]);
+        assert_eq!(args.iter().filter(|a| a.as_str() == "--socket-timeout").count(), 1);
+        assert!(args.windows(2).any(|w| w[0] == "--socket-timeout" && w[1] == "20"));
+        assert!(args.iter().any(|a| a == "-4"));
+    }
+
+    #[test]
+    fn parse_document_rejects_missing_values() {
+        assert!(parse_document("").is_err());
+        assert!(parse_document("garbage in front of the document").is_err());
     }
 }

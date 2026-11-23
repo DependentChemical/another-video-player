@@ -83,12 +83,13 @@ impl std::error::Error for Error {}
 pub struct Resolver {
     tool: ytdlp_tool::YtDlp,
     cookies: BTreeMap<Service, std::path::PathBuf>,
+    args: Vec<String>,
 }
 
 impl Resolver {
     /// Creates a resolver that uses the given `yt-dlp` access point.
     pub fn new(tool: ytdlp_tool::YtDlp) -> Self {
-        Self { tool, cookies: BTreeMap::new() }
+        Self { tool, cookies: BTreeMap::new(), args: Vec::new() }
     }
 
     /// Supplies a Netscape cookie file for URLs of one service.
@@ -97,6 +98,25 @@ impl Resolver {
         self
     }
 
+    /// Adds extra yt-dlp arguments used for every resolve request.
+    /// Adds extra yt-dlp arguments used for every resolve request.
+    pub fn with_args(mut self, args: Vec<String>) -> Self {
+        self.args = args.into_iter().filter(|arg| !arg.trim().is_empty()).collect();
+        self
+    }
+
+    /// Returns whether resolves are forced to IPv4.
+    pub fn forces_ipv4(&self) -> bool {
+        self.args.iter().any(|arg| arg == "-4")
+    }
+
+    /// Returns a copy that forces IPv4 for yt-dlp network requests.
+    pub fn with_force_ipv4(mut self) -> Self {
+        if !self.forces_ipv4() {
+            self.args.push("-4".to_string());
+        }
+        self
+    }
     /// The underlying yt-dlp access point.
     pub fn tool(&self) -> &ytdlp_tool::YtDlp {
         &self.tool
@@ -128,7 +148,7 @@ impl Resolver {
             tool: Some(self.tool.clone()),
             url: url.to_string(),
             cookies,
-            args: Vec::new(),
+            args: self.args.clone(),
         };
 
         let result =
