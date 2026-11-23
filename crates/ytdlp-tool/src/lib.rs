@@ -11,6 +11,7 @@
 //! Flatline keeps control over where the managed executable lives (`tools/`)
 //! and how updates are surfaced to the user.
 
+pub mod deno;
 pub mod locate;
 pub mod platform;
 pub mod update;

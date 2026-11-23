@@ -8,6 +8,9 @@ export struct ToastItem {
 export component Toast inherits Rectangle {
     in property <ToastItem> item;
     in property <length> toast-max-width: 380px;
+    // The number of lines a notification shows. The text that does not fit
+    // is cut off and the last line ends in an ellipsis.
+    in property <int> toast-max-lines: 4;
 
     max-width: root.toast-max-width;
     min-width: 220px;
@@ -38,6 +41,8 @@ export component Toast inherits Rectangle {
             vertical-alignment: top;
             horizontal-alignment: left;
             wrap: word-wrap;
+            max-lines: root.toast-max-lines;
+            overflow: elide;
         }
     }
 }
@@ -45,6 +50,7 @@ export component Toast inherits Rectangle {
 export component ToastList inherits Rectangle {
     in property <[ToastItem]> toasts: [];
     in property <length> toast-max-width: 380px;
+    in property <int> toast-max-lines: 4;
     in property <length> spacing: 8px;
 
     VerticalLayout {
@@ -53,6 +59,7 @@ export component ToastList inherits Rectangle {
         for toast in root.toasts: Toast {
             item: toast;
             toast-max-width: root.toast-max-width;
+            toast-max-lines: root.toast-max-lines;
         }
     }
 }

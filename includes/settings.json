@@ -137,11 +137,10 @@
       "description": "The JavaScript runtime yt-dlp uses to solve YouTube EJS challenges",
       "type": "select",
       "options": [
-        "bun",
         "deno"
       ],
-      "default": "bun",
-      "value": "bun"
+      "default": "deno",
+      "value": "deno"
     }
   }
 }

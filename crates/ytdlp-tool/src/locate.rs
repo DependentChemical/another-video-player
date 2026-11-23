@@ -59,7 +59,14 @@ impl YtDlp {
             }
             None => Command::new(&self.program),
         };
-        command.env("BUN_DIR", self.tools.root().join("bun-data"));
+        // The JavaScript runtime that solves the EJS challenges keeps its
+        // files inside the tool directory, so the whole folder stays
+        // portable and nothing is written to the user's home.
+        command.env("DENO_DIR", self.tools.deno_files_dir());
+        // The runtime must not phone home for a newer version and must not
+        // wait for an answer when it asks something.
+        command.env("DENO_NO_UPDATE_CHECK", "1");
+        command.env("DENO_NO_PROMPT", "1");
         #[cfg(windows)]
         let command = {
             let mut command = command;
@@ -185,6 +192,16 @@ impl ToolPaths {
     /// Directory used by the `yt-dlp` crate for output/artifacts.
     pub fn tools_output_dir(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    /// The directory the Deno runtime keeps its files in.
+    ///
+    /// The runtime writes its cache, its configuration and the compiled
+    /// scripts it builds here. It lives inside the tool directory so the
+    /// whole folder can be moved to another machine without leaving
+    /// anything behind in the user's home.
+    pub fn deno_files_dir(&self) -> PathBuf {
+        self.root.join("deno-files")
     }
 }
 

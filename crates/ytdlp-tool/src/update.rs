@@ -18,8 +18,6 @@ use crate::version::is_newer;
 /// Where the newest release is announced.
 pub const RELEASES_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 
-pub const BUN_VERSION: &str = "bun-v1.3.14";
-
 const USER_AGENT: &str = concat!("Flatline/", env!("CARGO_PKG_VERSION"));
 
 /// A GitHub release, reduced to the fields Flatline needs.
@@ -150,58 +148,6 @@ pub fn install_latest(paths: &ToolPaths) -> Result<PathBuf, Error> {
     ));
     download(&asset.browser_download_url, &destination)?;
     Ok(destination)
-}
-
-/// Downloads the pinned Bun runtime for this platform into the tool directory.
-///
-/// The asset is a zip archive, so the `bun(.exe)` binary is extracted out of
-/// it and stored under the managed tool directory. The version is pinned so the
-/// JavaScript runtime cannot drift away from the EJS scripts bundled with the
-/// pinned `yt-dlp` release.
-pub fn install_bun(paths: &ToolPaths) -> Result<PathBuf, Error> {
-    let asset = Platform::current().bun_asset();
-    let url = format!("https://github.com/oven-sh/bun/releases/download/{BUN_VERSION}/{asset}");
-    let binary = paths.root().join(Platform::current().bun_binary_name());
-    let archive = paths.root().join(format!("{}.zip", Platform::current().bun_binary_name()));
-
-    app_logging::notice(format!("installing bun {} into {}", BUN_VERSION, paths.root().display()));
-
-    download(&url, &archive)?;
-    let archive_file = fs::File::open(&archive).map_err(Error::Io)?;
-    let mut archive_zip = zip::ZipArchive::new(&archive_file)
-        .map_err(|error| Error::Parse(format!("the bun archive could not be read: {error}")))?;
-
-    // Extract the bun executable from the archive.
-    let bin_name = Platform::current().bun_binary_name().to_string();
-    for index in 0..archive_zip.len() {
-        let mut entry = archive_zip
-            .by_index(index)
-            .map_err(|error| Error::Parse(format!("the bun archive could not be read: {error}")))?;
-        let full_name = entry.name().to_string();
-        let file_name = std::path::Path::new(&full_name)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&full_name);
-        if file_name != bin_name.as_str() {
-            continue;
-        }
-        let mut out = fs::File::create(&binary).map_err(Error::Io)?;
-        let _ = std::io::copy(&mut entry, &mut out);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = out.metadata().map_err(Error::Io)?.permissions();
-            permissions.set_mode(0o755);
-            out.set_permissions(permissions).map_err(Error::Io)?;
-        }
-        break;
-    }
-    let _ = fs::remove_file(&archive);
-    if !binary.is_file() {
-        return Err(Error::Parse("the bun archive did not contain the bun executable".to_string()));
-    }
-    app_logging::notice(format!("bun {} installed at {}", BUN_VERSION, binary.display()));
-    Ok(binary)
 }
 
 /// Downloads the newest published release for another platform.

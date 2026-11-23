@@ -52,27 +52,28 @@ impl Platform {
         }
     }
 
-    /// The name the managed Bun runtime is stored under.
+    /// The name the managed Deno runtime is stored under.
     ///
-    /// The release artifacts are named `bun-windows-x64.zip` and
-    /// `bun-linux-x64-baseline.zip`, but the player always looks for the same
-    /// name in its tool directory, so the build renames the download.
-    pub fn bun_binary_name(self) -> &'static str {
+    /// The release artifacts are named after the target triple
+    /// (`deno-x86_64-pc-windows-msvc.zip`), but the player always looks for
+    /// the same name in its tool directory, so the build renames the
+    /// download.
+    pub fn deno_binary_name(self) -> &'static str {
         match self {
-            Platform::Windows => "bun.exe",
-            _ => "bun",
+            Platform::Windows => "deno.exe",
+            _ => "deno",
         }
     }
 
-    /// The release artifact that carries the Bun runtime for this platform.
+    /// The release artifact that carries the Deno runtime for this platform.
     ///
-    /// The version is pinned in [`crate::update::BUN_VERSION`] so the player
-    /// does not drift behind the yt-dlp EJS scripts it ships with.
-    pub fn bun_asset(self) -> &'static str {
+    /// The asset holds the runtime for the exact target triple; the
+    /// version itself is not pinned, the newest release is used.
+    pub fn deno_asset(self) -> &'static str {
         match self {
-            Platform::Windows => "bun-windows-x64.zip",
-            Platform::Linux => "bun-linux-x64-baseline.zip",
-            Platform::MacOs => "bun-darwin-x64-baseline.zip",
+            Platform::Windows => "deno-x86_64-pc-windows-msvc.zip",
+            Platform::Linux => "deno-x86_64-unknown-linux-gnu.zip",
+            Platform::MacOs => "deno-x86_64-apple-darwin.zip",
         }
     }
 
@@ -129,5 +130,32 @@ mod tests {
     fn the_archive_names_are_different() {
         assert_ne!(Platform::Windows.archive_name(), Platform::Linux.archive_name());
         assert_ne!(Platform::Linux.archive_name(), Platform::MacOs.archive_name());
+    }
+
+    #[test]
+    fn every_platform_has_its_own_deno_asset() {
+        let assets = [
+            Platform::Windows.deno_asset(),
+            Platform::Linux.deno_asset(),
+            Platform::MacOs.deno_asset(),
+        ];
+        let mut unique = assets.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), assets.len());
+    }
+
+    #[test]
+    fn the_managed_deno_uses_the_name_the_player_looks_for() {
+        assert_eq!(Platform::Windows.deno_binary_name(), "deno.exe");
+        assert_eq!(Platform::Linux.deno_binary_name(), "deno");
+        assert_eq!(Platform::MacOs.deno_binary_name(), "deno");
+    }
+
+    #[test]
+    fn the_deno_asset_names_the_target_triple() {
+        assert!(Platform::Windows.deno_asset().ends_with("pc-windows-msvc.zip"));
+        assert!(Platform::Linux.deno_asset().ends_with("unknown-linux-gnu.zip"));
+        assert!(Platform::MacOs.deno_asset().ends_with("apple-darwin.zip"));
     }
 }

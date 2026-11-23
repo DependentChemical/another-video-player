@@ -3673,12 +3673,19 @@ fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
 
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
 fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings) -> Resolver {
-    let bun_path = ensure_bun(ytdlp, settings);
-    let extra_args = settings.ytdlp_extra_args(bun_path.as_deref());
+    let deno_path = ensure_deno(ytdlp, settings);
+    let extra_args = settings.ytdlp_extra_args(deno_path.as_deref());
     if !extra_args.is_empty() {
         app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
     }
     let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args);
+    // The YouTube extractor needs its own arguments; they are added to every
+    // YouTube request and never to the request of another source.
+    let youtube_args = source_youtube::ytdlp_args();
+    if !youtube_args.is_empty() {
+        app_logging::notice(format!("yt-dlp youtube args enabled: {}", youtube_args.join(" ")));
+    }
+    resolver = resolver.with_service_args(Service::YouTube, youtube_args);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
@@ -3691,25 +3698,34 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
     resolver
 }
 
-/// Ensures the Bun runtime is installed when the settings request it.
+/// Ensures the Deno runtime is installed when the settings request it.
 ///
-/// The Bun binary is downloaded next to `yt-dlp` inside the tool directory and
-/// never writes outside of it: `BUN_DIR` is set to `tools/bun-data` when the
-/// runtime is spawned, so all caches and logs stay inside the portable
-/// package.
-fn ensure_bun(ytdlp: &YtDlp, settings: &Settings) -> Option<std::path::PathBuf> {
-    if settings.js_runtime() != "bun" {
+/// The Deno binary is downloaded next to `yt-dlp` inside the tool directory
+/// and never writes outside of it: `DENO_DIR` points at `tools/deno-files`
+/// when the runtime is spawned, so all caches and configuration stay inside
+/// the portable package.
+fn ensure_deno(ytdlp: &YtDlp, settings: &Settings) -> Option<std::path::PathBuf> {
+    if settings.js_runtime() != settings::BUNDLED_JS_RUNTIME {
         return None;
     }
-    let binary =
-        ytdlp.paths().root().join(ytdlp_tool::platform::Platform::current().bun_binary_name());
+    let platform = ytdlp_tool::platform::Platform::current();
+    let binary = ytdlp.paths().root().join(platform.deno_binary_name());
     if binary.is_file() {
+        // The directory the runtime writes its files to is part of the
+        // portable folder, so it is created next to the runtime.
+        let files = ytdlp.paths().deno_files_dir();
+        if let Err(error) = std::fs::create_dir_all(&files) {
+            app_logging::warning(format!(
+                "the deno files directory could not be created: dir={} error={error}",
+                files.display()
+            ));
+        }
         return Some(binary);
     }
-    match ytdlp_tool::update::install_bun(ytdlp.paths()) {
+    match ytdlp_tool::deno::install(ytdlp.paths()) {
         Ok(path) => Some(path),
         Err(error) => {
-            app_logging::warning(format!("the bun runtime could not be installed: {error}"));
+            app_logging::warning(format!("the deno runtime could not be installed: {error}"));
             None
         }
     }

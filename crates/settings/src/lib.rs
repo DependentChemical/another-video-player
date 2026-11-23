@@ -13,6 +13,12 @@ use serde_json::Value;
 
 const BUILTIN: &str = include_str!("../../../includes/settings.json");
 
+/// The JavaScript runtime Flatline ships for `yt-dlp` to solve EJS challenges.
+///
+/// The runtime lives next to `yt-dlp` in the tool directory and is the one
+/// every resolve uses.
+pub const BUNDLED_JS_RUNTIME: &str = "deno";
+
 /// The loaded settings document.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -104,20 +110,18 @@ impl Settings {
     }
 
     /// The JavaScript runtime yt-dlp uses to solve EJS challenges.
+    ///
+    /// Flatline ships exactly one runtime, so this is always the bundled
+    /// one. The `js-runtime` entry of `settings.json` only records which
+    /// runtime is meant; a value that names a runtime Flatline does not
+    /// ship is ignored, because there would be no executable to point
+    /// `yt-dlp` at.
     pub fn js_runtime(&self) -> String {
-        self.document
-            .pointer("/YtDlp-Settings/js-runtime/value")
-            .and_then(|v| v.as_str().map(String::from))
-            .or_else(|| {
-                self.document
-                    .pointer("/YtDlp-Settings/js-runtime/default")
-                    .and_then(|v| v.as_str().map(String::from))
-            })
-            .unwrap_or_else(|| "bun".to_string())
+        BUNDLED_JS_RUNTIME.to_string()
     }
 
     /// Extra yt-dlp CLI arguments derived from settings.
-    pub fn ytdlp_extra_args(&self, bun_path: Option<&std::path::Path>) -> Vec<String> {
+    pub fn ytdlp_extra_args(&self, deno_path: Option<&std::path::Path>) -> Vec<String> {
         let mut args = Vec::new();
         if self.bool_setting("/YtDlp-Settings/force-ipv4", false) {
             args.push("-4".to_string());
@@ -133,17 +137,14 @@ impl Settings {
             args.push("--extractor-retries".to_string());
             args.push(extractor_retries.to_string());
         }
-        // If the JavaScript runtime is set to "bun" and a bun binary path is supplied,
-        // tell yt-dlp to use it for EJS challenge solving. Clear default runtimes first
-        // so deno/node do not take precedence over the managed bun runtime.
-        if let Some(path) = bun_path
-            && self.document.pointer("/YtDlp-Settings/js-runtime/value").and_then(Value::as_str)
-                == Some("bun")
-        {
+        // Point yt-dlp at the bundled runtime for EJS challenge solving. The
+        // default runtimes are cleared first, so a runtime of the system
+        // cannot take precedence over the managed one.
+        if let Some(path) = deno_path {
             let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             args.push("--no-js-runtimes".to_string());
             args.push("--js-runtimes".to_string());
-            args.push(format!("bun:{}", abs.display()));
+            args.push(format!("{BUNDLED_JS_RUNTIME}:{}", abs.display()));
         }
         args
     }
@@ -719,15 +720,32 @@ mod tests {
     }
 
     #[test]
-    fn bun_runtime_clears_default_js_runtimes() {
+    fn deno_runtime_clears_default_js_runtimes() {
         let settings = Settings::from_json(
-            r#"{"Video-Settings":{},"YtDlp-Settings":{"js-runtime":{"value":"bun","default":"bun"}}}"#,
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"js-runtime":{"value":"deno","default":"deno"}}}"#,
         )
         .expect("settings parse");
-        let args = settings.ytdlp_extra_args(Some(std::path::Path::new("tools/bun.exe")));
+        let args = settings.ytdlp_extra_args(Some(std::path::Path::new("tools/deno.exe")));
         assert_eq!(args[0], "--no-js-runtimes");
         assert_eq!(args[1], "--js-runtimes");
-        assert!(args[2].starts_with("bun:"));
-        assert!(args[2].contains("bun.exe"));
+        assert!(args[2].starts_with("deno:"));
+        assert!(args[2].contains("deno.exe"));
+    }
+
+    #[test]
+    fn a_runtime_that_is_not_bundled_falls_back_to_the_bundled_one() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"js-runtime":{"value":"node","default":"node"}}}"#,
+        )
+        .expect("settings parse");
+
+        assert_eq!(settings.js_runtime(), "deno");
+    }
+
+    #[test]
+    fn the_bundled_runtime_is_deno() {
+        let settings = Settings::from_json(r#"{"Video-Settings":{},"YtDlp-Settings":{}}"#)
+            .expect("settings parse");
+        assert_eq!(settings.js_runtime(), "deno");
     }
 }

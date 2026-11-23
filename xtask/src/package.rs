@@ -60,7 +60,7 @@ pub fn package() -> Result<PathBuf, String> {
     copy_ytdlp(&staging, platform)?;
 
     // The JavaScript runtime yt-dlp uses to solve YouTube EJS challenges.
-    copy_bun(&staging, platform)?;
+    copy_deno(&staging, platform)?;
 
     // Files bundled with the player, placed next to the executable.
     copy_includes(&root, &staging)?;
@@ -158,46 +158,23 @@ fn session_helper_name() -> &'static str {
     if cfg!(windows) { "flatline-session.exe" } else { "flatline-session" }
 }
 
-/// Puts a Bun runtime next to the player.
+/// Puts a Deno runtime next to the player.
 ///
-/// The runtime is downloaded from the pinned Bun release and placed inside
-/// `tools/`, so the folder works offline and the runtime is portable.
-fn copy_bun(staging: &Path, platform: Platform) -> Result<(), String> {
+/// The runtime is downloaded from the newest Deno release and placed inside
+/// `tools/`, so the folder works offline and the runtime is portable. The
+/// directory the runtime writes its files to at runtime is created beside
+/// it, so nothing is written to the user's home.
+fn copy_deno(staging: &Path, platform: Platform) -> Result<(), String> {
     let tools = staging.join("tools");
     std::fs::create_dir_all(&tools).map_err(|error| error.to_string())?;
-    let destination = tools.join(platform.bun_binary_name());
+    let destination = tools.join(platform.deno_binary_name());
     if destination.is_file() {
         return Ok(());
     }
-    let asset = platform.bun_asset();
-    let version = ytdlp_tool::update::BUN_VERSION;
-    let url = format!("https://github.com/oven-sh/bun/releases/download/{version}/{asset}");
-    let archive = tools.join(format!("bun-{}.zip", platform.archive_name()));
-    download(&url, &archive)?;
-    let archive_file = std::fs::File::open(&archive).map_err(|error| error.to_string())?;
-    let mut archive_zip = zip::ZipArchive::new(&archive_file)
-        .map_err(|error| format!("the bun archive could not be read: {error}"))?;
-    let bin_name = platform.bun_binary_name().to_string();
-    for index in 0..archive_zip.len() {
-        let mut entry = archive_zip
-            .by_index(index)
-            .map_err(|error| format!("the bun archive could not be read: {error}"))?;
-        let full_name = entry.name().to_string();
-        let file_name = std::path::Path::new(&full_name)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&full_name);
-        if file_name != bin_name.as_str() {
-            continue;
-        }
-        let mut out = std::fs::File::create(&destination).map_err(|error| error.to_string())?;
-        std::io::copy(&mut entry, &mut out).map_err(|error| error.to_string())?;
-        break;
-    }
-    let _ = std::fs::remove_file(&archive);
-    if !destination.is_file() {
-        return Err("the bun archive did not contain the bun executable".to_string());
-    }
+
+    ytdlp_tool::deno::download_for_platform(platform, &tools)
+        .map_err(|error| format!("deno could not be downloaded: {error}"))?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -206,19 +183,7 @@ fn copy_bun(staging: &Path, platform: Platform) -> Result<(), String> {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&destination, permissions).map_err(|error| error.to_string())?;
     }
-    Ok(())
-}
 
-/// Downloads a file into a destination.
-fn download(url: &str, destination: &Path) -> Result<(), String> {
-    let mut response = ureq::get(url)
-        .header("User-Agent", concat!("Flatline/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .map_err(|error| format!("the download failed: {error}"))?;
-    let mut file = std::fs::File::create(destination).map_err(|error| error.to_string())?;
-    let mut reader = response.body_mut().as_reader();
-    std::io::copy(&mut reader, &mut file).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())?;
     Ok(())
 }
 
