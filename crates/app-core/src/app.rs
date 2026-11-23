@@ -3601,7 +3601,7 @@ fn audio_detail(stream: &media_model::AudioStream) -> String {
         parts.push(note.clone());
     }
     parts.push(stream.format_id.clone());
-    parts.join(" ? ")
+    parts.join(" · ")
 }
 
 /// Turns a bitrate in kilobits per second into a human line.

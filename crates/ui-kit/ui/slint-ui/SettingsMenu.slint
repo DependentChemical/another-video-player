@@ -160,6 +160,44 @@ export component SettingsMenu inherits Rectangle {
                     background: Theme.border;
                 }
 
+                // The notches mark the snap points 0, 0.5, 1.0, 1.5 and 2.0.
+                // They sit on the track line and are drawn on top of it.
+                Rectangle {
+                    x: 0px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.25 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.5 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width * 0.75 - 1px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+                Rectangle {
+                    x: parent.width - 2px;
+                    y: (parent.height - 4px) / 2;
+                    width: 2px;
+                    height: 4px;
+                    background: #ffffff80;
+                }
+
                 fill := Rectangle {
                     y: (parent.height - 4px) / 2;
                     height: 4px;
@@ -193,6 +231,43 @@ export component SettingsMenu inherits Rectangle {
                         if (event.kind == PointerEventKind.up) {
                             root.speed-changed(root.snap-speed(clamp((self.mouse-x / max(1px, self.width)) * 2.0, 0.0, 2.0)));
                         }
+                    }
+                }
+
+                // The labels under the slider name the snap points, so the
+                // user knows where 0, 0.5, 1.0, 1.5 and 2.0 sit without guessing.
+                Rectangle {
+                    width: parent.width;
+                    height: 16px;
+                    Text {
+                        x: 0px;
+                        text: "0";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.25 - 10px;
+                        text: "0.5x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.5 - 10px;
+                        text: "1x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width * 0.75 - 10px;
+                        text: "1.5x";
+                        color: Theme.muted;
+                        font-size: 10px;
+                    }
+                    Text {
+                        x: parent.width - 12px;
+                        text: "2x";
+                        color: Theme.muted;
+                        font-size: 10px;
                     }
                 }
             }
