@@ -1,7 +1,7 @@
 [package]
 name = "xtask"
 description = "Build orchestration for Flatline: dependency provisioning, workspace build and packaging."
-version = "0.4.80"
+version = "0.4.81"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
