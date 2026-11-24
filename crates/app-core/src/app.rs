@@ -2057,9 +2057,6 @@ impl App {
                             ));
                             std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                         }
-                        ThumbnailRefreshOutcome::Skipped => {
-                            progressed = true;
-                        }
                     }
                 }
 
@@ -3675,9 +3672,6 @@ enum ThumbnailRefreshOutcome {
     Completed,
     Preempted,
     RetryLater(String),
-    /// The video was removed from the queue because its thumbnail kept
-    /// failing; the pass moves on to the next entry.
-    Skipped,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3799,35 +3793,22 @@ fn refresh_thumbnail_entry(
     }
 }
 
-/// Skips an error video: the thumbnail kept failing after the yt-dlp
-/// fallback, so the refresh pass would retry the same dead video forever.
+/// Marks thumbnail refresh failure as retryable without removing the queue entry.
 ///
-/// The video is removed from the queue instead, so it stops being due at the
-/// next startup. The yt-dlp run is finished first so the next entry can
-/// start one right away.
+/// The queue entry is kept; the refresh pass will try again later.
 fn skip_error_video(
-    queue: &Queue,
+    _queue: &Queue,
     ytdlp: &Arc<YtdlpControl>,
     cancel: &Arc<AtomicBool>,
-    id: i64,
+    _id: i64,
     url: &str,
     message: &str,
 ) -> ThumbnailRefreshOutcome {
     ytdlp.finish_thumbnail(cancel);
-    match queue.remove_entry(id) {
-        Ok(_) => {
-            app_logging::notice(format!(
-                "thumbnail refresh skipped the error video {url}: {message}"
-            ));
-            ThumbnailRefreshOutcome::Skipped
-        }
-        Err(error) => {
-            app_logging::warning(format!(
-                "thumbnail refresh could not remove the error video {url} from the queue: {error}"
-            ));
-            ThumbnailRefreshOutcome::RetryLater(message.to_string())
-        }
-    }
+    app_logging::warning(format!(
+        "thumbnail refresh failed (will retry later) for {url}: {message}"
+    ));
+    ThumbnailRefreshOutcome::RetryLater(message.to_string())
 }
 
 /// The streams of a source, grouped for the source picker.
@@ -4682,7 +4663,7 @@ mod tests {
     }
 
     #[test]
-    fn skipping_an_error_video_removes_the_entry_from_the_queue() {
+    fn skipping_an_error_video_keeps_the_entry_for_retry() {
         let queue = Queue::in_memory().expect("an in-memory queue opens");
         let entry = queue
             .push(
@@ -4701,9 +4682,9 @@ mod tests {
         let outcome =
             skip_error_video(&queue, &ytdlp, &cancel, entry.id, &entry.url, "404 not found");
 
-        assert!(matches!(outcome, ThumbnailRefreshOutcome::Skipped));
+        assert!(matches!(outcome, ThumbnailRefreshOutcome::RetryLater(_)));
         let remaining = queue.entries().expect("the entries are read");
-        assert!(!remaining.iter().any(|other| other.id == entry.id));
+        assert!(remaining.iter().any(|other| other.id == entry.id));
         // The yt-dlp run is cleared so the next entry can start one.
         assert!(ytdlp.try_begin_thumbnail().is_some());
     }

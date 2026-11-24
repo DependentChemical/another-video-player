@@ -211,32 +211,47 @@ impl ThumbnailCache {
         // because the normalizer guesses the real format from the bytes.
         let temp_name = format!("{:016x}.part", fnv1a(thumbnail_url.as_bytes()));
         let temporary = self.directory.join(temp_name);
-        let _scratch = ScratchFile(&temporary);
 
-        {
-            app_logging::debug(format!("thumbnail download started: {thumbnail_url}"));
-            let mut response = ureq::get(thumbnail_url)
-                .header("User-Agent", USER_AGENT)
-                .config()
-                .timeout_global(Some(DOWNLOAD_TIMEOUT))
-                .build()
-                .call()
-                .map_err(|error| {
+        let mut last_error: Option<String> = None;
+        for attempt in 1..=5u32 {
+            let _scratch = ScratchFile(&temporary);
+            app_logging::debug(format!(
+                "thumbnail download started (attempt {attempt}/5): {thumbnail_url}"
+            ));
+            let result = (|| -> Result<(), Error> {
+                let mut response = ureq::get(thumbnail_url)
+                    .header("User-Agent", USER_AGENT)
+                    .config()
+                    .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                    .build()
+                    .call()
+                    .map_err(|error| Error::Http(error.to_string()))?;
+                let mut file = fs::File::create(&temporary)?;
+                let mut reader = response.body_mut().as_reader();
+                io::copy(&mut reader, &mut file)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => {
                     let message = error.to_string();
                     app_logging::warning(format!(
-                        "thumbnail download request failed for {thumbnail_url}: {message}"
+                        "thumbnail download attempt {attempt}/5 failed for {thumbnail_url}: {message}"
                     ));
-                    Error::Http(message)
-                })?;
-            let mut file = fs::File::create(&temporary)?;
-            let mut reader = response.body_mut().as_reader();
-            io::copy(&mut reader, &mut file).map_err(|error| {
-                app_logging::warning(format!(
-                    "thumbnail download write failed for {thumbnail_url}: {error}"
-                ));
-                error
-            })?;
-            file.sync_all()?;
+                    last_error = Some(message);
+                    let _ = fs::remove_file(&temporary);
+                    if attempt < 5 {
+                        std::thread::sleep(Duration::from_millis(500 * u64::from(attempt)));
+                    }
+                }
+            }
+        }
+        if let Some(message) = last_error {
+            return Err(Error::Http(message));
         }
 
         // Normalize to full-size JPEG, then derive the mid and small copies
