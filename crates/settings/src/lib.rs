@@ -121,6 +121,10 @@ impl Settings {
     }
 
     /// Extra yt-dlp CLI arguments derived from settings.
+    ///
+    /// The global settings come first, followed by the free-form
+    /// `YtDlp-Settings/Extra-Args/value` arguments that the user configured
+    /// for every resolve.
     pub fn ytdlp_extra_args(&self, deno_path: Option<&std::path::Path>) -> Vec<String> {
         let mut args = Vec::new();
         if self.bool_setting("/YtDlp-Settings/force-ipv4", false) {
@@ -146,7 +150,38 @@ impl Settings {
             args.push("--js-runtimes".to_string());
             args.push(format!("{BUNDLED_JS_RUNTIME}:{}", abs.display()));
         }
+        args.extend(configured_arguments(self.document.pointer("/YtDlp-Settings/Extra-Args")));
         args
+    }
+
+    /// The per-site yt-dlp argument rules from `Video-Settings`.
+    ///
+    /// Every entry of `per-site/main-list` whose regex is valid and whose
+    /// `yt-dlp-args/value` is not empty becomes a rule. Entries without the
+    /// `yt-dlp-args` key simply contribute nothing, so a site may still
+    /// carry only its source defaults.
+    pub fn ytdlp_site_arg_rules(&self) -> Vec<(String, Vec<String>)> {
+        let Some(items) =
+            self.document.pointer("/Video-Settings/per-site/main-list").and_then(Value::as_object)
+        else {
+            return Vec::new();
+        };
+        let mut rules = Vec::new();
+        for item in items.values() {
+            let Some(pattern) = item
+                .get("regex")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+            else {
+                continue;
+            };
+            let args = configured_arguments(item.get("yt-dlp-args"));
+            if !args.is_empty() {
+                rules.push((pattern.to_string(), args));
+            }
+        }
+        rules
     }
 
     /// Configured yt-dlp socket timeout in seconds.
@@ -215,6 +250,73 @@ impl Settings {
         }
         choose(source, global).ok_or(Error::NoStream)
     }
+}
+
+/// The arguments stored under an argument setting's `value` key.
+///
+/// The value is either a command-line string that is split on whitespace
+/// while honouring quotes, or an array of ready-made arguments. A missing,
+/// null or blank value means "no arguments".
+fn configured_arguments(setting: Option<&Value>) -> Vec<String> {
+    match setting.and_then(|setting| setting.get("value")) {
+        Some(Value::String(text)) => split_arguments(text),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Splits a command-line string into arguments, honouring quotes.
+///
+/// Double-quoted text may contain backslash escapes; single-quoted text is
+/// literal. This mirrors how a shell hands the argument list to a program,
+/// so `--extractor-args "youtube:player_js_variant=tv"` becomes two
+/// arguments instead of one.
+fn split_arguments(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut started = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if started || !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+    if started || !current.is_empty() {
+        args.push(current);
+    }
+    args.iter().map(|arg| arg.trim().to_string()).filter(|arg| !arg.is_empty()).collect()
 }
 
 fn preferences(value: &Value, key: &str) -> Vec<String> {
@@ -717,6 +819,65 @@ mod tests {
             vec!["-4", "--socket-timeout", "20", "--extractor-retries", "5"]
         );
         assert_eq!(settings.ytdlp_socket_timeout_seconds(), 20);
+    }
+
+    #[test]
+    fn global_extra_args_are_appended_to_the_derived_arguments() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"force-ipv4":{"value":true,"default":false},"Extra-Args":{"value":"--extractor-args \"youtube:player_js_variant=tv\"","default":null}}}"#,
+        )
+        .expect("settings parse");
+        assert_eq!(
+            settings.ytdlp_extra_args(None),
+            vec!["-4", "--extractor-args", "youtube:player_js_variant=tv"]
+        );
+    }
+
+    #[test]
+    fn global_extra_args_accept_an_array_and_treat_null_as_empty() {
+        let array = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"Extra-Args":{"value":["--no-warnings","--flat-playlist"]}}}"#,
+        )
+        .expect("settings parse");
+        assert_eq!(array.ytdlp_extra_args(None), vec!["--no-warnings", "--flat-playlist"]);
+
+        let unset = Settings::from_json(
+            r#"{"Video-Settings":{},"YtDlp-Settings":{"Extra-Args":{"value":null,"default":null}}}"#,
+        )
+        .expect("settings parse");
+        assert!(unset.ytdlp_extra_args(None).is_empty());
+    }
+
+    #[test]
+    fn site_rules_only_include_entries_with_an_argument_value() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{"per-site":{"main-list":{
+                "Youtube":{"regex":"youtube\\.com","yt-dlp-args":{"extra":"--extractor-args \"youtube:player_js_variant=tv\""}},
+                "Twitch":{"regex":"twitch\\.tv","yt-dlp-args":{"value":"--no-warnings"}},
+                "Plain":{"regex":"example\\.com"}
+            }}}}"#,
+        )
+        .expect("settings parse");
+
+        let rules = settings.ytdlp_site_arg_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, "twitch\\.tv");
+        assert_eq!(rules[0].1, vec!["--no-warnings"]);
+    }
+
+    #[test]
+    fn site_rules_split_quoted_arguments() {
+        let settings = Settings::from_json(
+            r#"{"Video-Settings":{"per-site":{"main-list":{"Youtube":{"regex":"youtube\\.com","yt-dlp-args":{"value":"--extractor-args \"youtube:player_js_variant=tv\" --no-warnings"}}}}}}"#,
+        )
+        .expect("settings parse");
+
+        let rules = settings.ytdlp_site_arg_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].1,
+            vec!["--extractor-args", "youtube:player_js_variant=tv", "--no-warnings"]
+        );
     }
 
     #[test]

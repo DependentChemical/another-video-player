@@ -103,12 +103,19 @@ pub struct Resolver {
     cookies: BTreeMap<Service, std::path::PathBuf>,
     args: Vec<String>,
     service_args: BTreeMap<Service, Vec<String>>,
+    site_args: Vec<(regex::Regex, Vec<String>)>,
 }
 
 impl Resolver {
     /// Creates a resolver that uses the given `yt-dlp` access point.
     pub fn new(tool: ytdlp_tool::YtDlp) -> Self {
-        Self { tool, cookies: BTreeMap::new(), args: Vec::new(), service_args: BTreeMap::new() }
+        Self {
+            tool,
+            cookies: BTreeMap::new(),
+            args: Vec::new(),
+            service_args: BTreeMap::new(),
+            site_args: Vec::new(),
+        }
     }
 
     /// Supplies a Netscape cookie file for URLs of one service.
@@ -135,12 +142,38 @@ impl Resolver {
         self
     }
 
+    /// Adds yt-dlp arguments that apply only to URLs matching a regex.
+    ///
+    /// The rules are evaluated when a request is made, so one resolver can
+    /// serve URLs from several sites and each one gets only its own extra
+    /// arguments. A pattern that does not compile is skipped instead of
+    /// failing every resolve.
+    pub fn with_site_args(mut self, rules: Vec<(String, Vec<String>)>) -> Self {
+        self.site_args = rules
+            .into_iter()
+            .filter_map(|(pattern, args)| {
+                let args: Vec<String> =
+                    args.into_iter().filter(|arg| !arg.trim().is_empty()).collect();
+                if args.is_empty() {
+                    return None;
+                }
+                regex::Regex::new(&pattern).ok().map(|regex| (regex, args))
+            })
+            .collect();
+        self
+    }
+
     /// The arguments a request for `url` is made with.
     ///
-    /// The general arguments come first, the ones of the service the URL
-    /// belongs to last.
+    /// The general arguments come first, then the site arguments whose
+    /// pattern matches, then the ones of the service the URL belongs to.
     fn args_for(&self, url: &str) -> Vec<String> {
         let mut args = self.args.clone();
+        for (pattern, extra) in &self.site_args {
+            if pattern.is_match(url) {
+                args.extend(extra.iter().cloned());
+            }
+        }
         if let Some(service) = Service::from_url(url)
             && let Some(extra) = self.service_args.get(&service)
         {
@@ -245,23 +278,45 @@ mod tests {
     fn the_arguments_of_a_service_only_reach_that_service() {
         let resolver = resolver().with_args(vec!["--no-warnings".to_string()]).with_service_args(
             Service::YouTube,
-            vec!["--extractor-args".to_string(), "youtube:player_js_variant=tv".to_string()],
+            vec!["--add-header".to_string(), "X-Service: youtube".to_string()],
         );
 
         let youtube = resolver.args_for("https://www.youtube.com/watch?v=1");
         assert_eq!(youtube[0], "--no-warnings");
-        assert_eq!(youtube[1], "--extractor-args");
-        assert_eq!(youtube[2], "youtube:player_js_variant=tv");
+        assert_eq!(youtube[1], "--add-header");
+        assert_eq!(youtube[2], "X-Service: youtube");
 
         let twitch = resolver.args_for("https://www.twitch.tv/videos/1");
         assert_eq!(twitch, vec!["--no-warnings".to_string()]);
     }
 
     #[test]
+    fn matching_site_arguments_follow_the_general_arguments() {
+        let resolver =
+            resolver().with_args(vec!["--no-warnings".to_string()]).with_site_args(vec![
+                (
+                    "youtube\\.com".to_string(),
+                    vec!["--extractor-args".to_string(), "a=b".to_string()],
+                ),
+                ("twitch\\.tv".to_string(), vec!["--add-header".to_string(), "X=1".to_string()]),
+            ]);
+
+        assert_eq!(
+            resolver.args_for("https://www.youtube.com/watch?v=1"),
+            vec!["--no-warnings", "--extractor-args", "a=b"]
+        );
+        assert_eq!(
+            resolver.args_for("https://www.twitch.tv/videos/1"),
+            vec!["--no-warnings", "--add-header", "X=1"]
+        );
+        assert_eq!(resolver.args_for("https://example.org/video.mp4"), vec!["--no-warnings"]);
+    }
+
+    #[test]
     fn a_url_without_a_service_keeps_the_general_arguments_only() {
         let resolver = resolver().with_service_args(
             Service::YouTube,
-            vec!["--extractor-args".to_string(), "youtube:player_js_variant=tv".to_string()],
+            vec!["--add-header".to_string(), "X-Service: youtube".to_string()],
         );
 
         assert!(resolver.args_for("https://example.org/video.mp4").is_empty());

@@ -200,9 +200,11 @@ export component MainWindow inherits Window {
     }
 
     function toggle-settings() {
-        if (root.settings-open) {
+        // The gear always shows the base popup: when the speed slider is
+        // open it returns to the sources/speed rows, and only an already
+        // open base menu toggles closed.
+        if (root.settings-open && !root.settings-speed-mode) {
             root.settings-open = false;
-            root.settings-speed-mode = false;
         } else {
             root.sources-open = false;
             root.settings-speed-mode = false;
@@ -211,15 +213,10 @@ export component MainWindow inherits Window {
     }
 
     function close-settings() {
-        // Clicking outside a popup always returns to the parent level. When
-        // the user left through the playback-speed slider that parent is the
-        // selection menu, so the menu stays open with the source row and the
-        // playback-speed row instead of closing itself.
-        if (root.settings-speed-mode) {
-            root.settings-speed-mode = false;
-        } else {
-            root.settings-open = false;
-        }
+        // A click outside the popup always closes it, including when the
+        // playback-speed slider is the visible level.
+        root.settings-open = false;
+        root.settings-speed-mode = false;
     }
 
     function toggle-video(id: string) {

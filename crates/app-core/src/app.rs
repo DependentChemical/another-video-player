@@ -3678,14 +3678,16 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
     if !extra_args.is_empty() {
         app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
     }
-    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args);
-    // The YouTube extractor needs its own arguments; they are added to every
-    // YouTube request and never to the request of another source.
-    let youtube_args = source_youtube::ytdlp_args();
-    if !youtube_args.is_empty() {
-        app_logging::notice(format!("yt-dlp youtube args enabled: {}", youtube_args.join(" ")));
+    // Site arguments are regex matched when a URL is resolved, so they are
+    // applied only to the sites whose entry actually names them.
+    let site_args = settings.ytdlp_site_arg_rules();
+    if !site_args.is_empty() {
+        app_logging::notice(format!(
+            "yt-dlp site args enabled: {} rule(s) from settings",
+            site_args.len()
+        ));
     }
-    resolver = resolver.with_service_args(Service::YouTube, youtube_args);
+    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args).with_site_args(site_args);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);

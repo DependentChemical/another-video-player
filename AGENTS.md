@@ -6,37 +6,31 @@ written in Rust, it draws its interface with Slint and it plays with libmpv.
 This file is the contract for every agent and every contributor working in
 this repository. Read it before changing anything.
 
-## ⚠️ IMPORTANT and URGENT: check `yt-dlp` for a new stable release
+## Mandatory workflow for code changes
 
-> **Reminder: check in the background for a newer stable `yt-dlp` release
-> before and after touching the resolver, the extractor arguments or the
-> JavaScript runtime.** This is an important reminder, not a hard block, but
-> most YouTube failures are not Flatline bugs: they are a `yt-dlp` that has
-> fallen behind YouTube.
+Unless the request explicitly says otherwise, **every** request that edits
+code must end with the same sequence, in this order. This is the default and
+it applies automatically; do not ask whether to run it.
 
-The YouTube extractor arguments in `crates/sources/source-youtube` are a
-**quick fix**, not a solution. `--extractor-args
-"youtube:player_js_variant=tv"` keeps the `tv` player variant alive while
-YouTube breaks the default web player. It does not repair the underlying
-n-challenge handling, and it will stop working the day YouTube changes the
-variant too.
+1. **Address everything.** Re-read the request and confirm that **all** the
+   requested tweaks, issues and features are implemented. Do not stop after
+   the first item and do not leave an item for later.
+2. **Run the full checks.** Run the verification checklist below after the
+   edits, fix every failure, and run it again until all four checks pass.
+3. **Bump the patch version.** Only after the checks pass, increase
+   `[workspace.package].version` in the root `Cargo.toml` by one patch
+   release.
+4. **Commit.** Commit the change with a message that says what was done.
+5. **Push to `dev`.** Push the commit to the `dev` branch.
+6. **Write the final technical report.** The report is the final output. For
+   each requested fix, tweak or feature, address it one by one and then
+   provide the diagnosis, the fix or implementation, the rationale,
+   justification and reasoning for the change, and finally a simplified
+   explanation of what was done and why.
 
-What every agent and contributor owes the project:
-
-1. **Check in the background, always.** Query
-   `https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest` and compare
-   it with the version Flatline manages. The player already does this
-   (`ytdlp_tool::update::check`), but the check has to happen even when the
-   work at hand looks unrelated to YouTube.
-2. **Prefer the real fix.** When a new stable `yt-dlp` is out, the answer to
-   a broken resolve is the updated extractor, not another workaround in
-   Flatline. Remove the quick fix once the new release carries the fix.
-3. **Record what was found.** Write the version that was checked for and the
-   version that is current into the commit that touches the resolver, so the
-   next agent does not have to guess whether the check happened.
-4. **Do not pin the JavaScript runtime to hide the symptom.** The bundled
-   Deno is always the newest release, and a `yt-dlp` that is too old fails
-   with the EJS challenge, not with the runtime.
+This workflow applies **only** to requests that edit the code. Requests that
+do not change code — preparing a release, running GitHub Actions, answering
+code questions, or reading code — must **not** run it.
 
 ## Release from `dev` to `main`
 

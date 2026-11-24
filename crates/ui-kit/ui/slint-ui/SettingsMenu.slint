@@ -148,7 +148,7 @@ export component SettingsMenu inherits Rectangle {
             }
 
             Rectangle {
-                height: 44px;
+                height: 56px;
                 border-radius: 8px;
                 background: #ffffff08;
 
@@ -236,7 +236,10 @@ export component SettingsMenu inherits Rectangle {
 
                 // The labels under the slider name the snap points, so the
                 // user knows where 0, 0.5, 1.0, 1.5 and 2.0 sit without guessing.
+                // They sit below the track and the knob so dragging the slider
+                // never hides them.
                 Rectangle {
+                    y: parent.height - 16px;
                     width: parent.width;
                     height: 16px;
                     Text {

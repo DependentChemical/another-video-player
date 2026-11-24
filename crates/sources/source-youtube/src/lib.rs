@@ -16,22 +16,6 @@ pub struct YouTube;
 /// The singleton YouTube source used by the internal plugin registry.
 pub static SOURCE: YouTube = YouTube;
 
-/// The `yt-dlp` arguments that every YouTube resolve needs.
-///
-/// YouTube's default web player breaks the signature and the challenge
-/// extraction often enough to make plain resolves fail. The `tv` player
-/// variant is the one that keeps working, so it is used for every
-/// YouTube video Flatline processes.
-pub const YTDLP_ARGS: &[&str] = &["--extractor-args", "youtube:player_js_variant=tv"];
-
-/// The `yt-dlp` arguments of a YouTube resolve, as command line values.
-///
-/// The composition root hands these to the resolver, which adds them to
-/// every request for a YouTube URL.
-pub fn ytdlp_args() -> Vec<String> {
-    YTDLP_ARGS.iter().map(|arg| arg.to_string()).collect()
-}
-
 impl Source for YouTube {
     fn service(&self) -> Service {
         Service::YouTube
@@ -136,7 +120,7 @@ pub fn matches_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TimeoutRecovery, YouTube, matches_url, timeout_recovery, ytdlp_args};
+    use super::{TimeoutRecovery, YouTube, matches_url, timeout_recovery};
     use media_model::Service;
     use web_session::Source;
 
@@ -178,12 +162,5 @@ mod tests {
     #[test]
     fn an_unsigned_profile_offers_the_sign_in_then_the_cookies() {
         assert_eq!(timeout_recovery(false), TimeoutRecovery::SignInThenRegenerate);
-    }
-
-    #[test]
-    fn every_youtube_resolve_uses_the_tv_player_variant() {
-        let args = ytdlp_args();
-
-        assert_eq!(args, vec!["--extractor-args", "youtube:player_js_variant=tv"]);
     }
 }
