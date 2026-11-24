@@ -113,6 +113,60 @@ fn host_is(host: &str, base: &str) -> bool {
     host == base || host.ends_with(&format!(".{base}"))
 }
 
+/// Parameters that Flatline always keeps when preparing a YouTube URL for
+/// processing. Keeping the playlist reference (`list`, `index`) lets yt-dlp
+/// treat the URL as a playlist instead of dropping it to a single video.
+const YOUTUBE_PROCESSING_PARAMS: &[&str] = &["v", "list", "index", "start"];
+
+/// Parameters that are tracking noise and may be dropped before processing.
+const YOUTUBE_TRACKING_PARAMS: &[&str] =
+    &["si", "feature", "ab_channel", "pp", "utm_source", "utm_medium", "utm_campaign"];
+
+/// Prepares a YouTube URL for processing without stripping playlist
+/// information.
+///
+/// Unlike the identity-based cleaner used for thumbnails and history, this
+/// keeps the playlist reference so yt-dlp can still see the whole playlist.
+/// When the URL is not YouTube, it is returned trimmed and unchanged.
+pub fn processing_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let Ok(mut parsed) = Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return trimmed.to_string();
+    };
+    let host = host.to_ascii_lowercase();
+    let is_youtube = host_is(&host, "youtube.com")
+        || host_is(&host, "youtu.be")
+        || host_is(&host, "youtube-nocookie.com");
+    if !is_youtube {
+        return trimmed.to_string();
+    }
+
+    let mut pairs: Vec<(String, String)> =
+        parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        pairs.retain(|(key, _value)| {
+        let key = key.to_ascii_lowercase();
+        if YOUTUBE_TRACKING_PARAMS.iter().any(|p| key == p.to_ascii_lowercase()) {
+            return false;
+        }
+        YOUTUBE_PROCESSING_PARAMS.iter().any(|p| key == p.to_ascii_lowercase())
+    });
+
+    let query = if pairs.is_empty() {
+        String::new()
+    } else {
+        pairs.into_iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&")
+    };
+    parsed.set_query(if query.is_empty() { None } else { Some(&query) });
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
 /// Whether a URL belongs to YouTube.
 pub fn matches_url(url: &str) -> bool {
     SOURCE.matches_url(url)
@@ -120,7 +174,7 @@ pub fn matches_url(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TimeoutRecovery, YouTube, matches_url, timeout_recovery};
+    use super::{TimeoutRecovery, YouTube, matches_url, processing_url, timeout_recovery};
     use media_model::Service;
     use web_session::Source;
 
@@ -162,5 +216,40 @@ mod tests {
     #[test]
     fn an_unsigned_profile_offers_the_sign_in_then_the_cookies() {
         assert_eq!(timeout_recovery(false), TimeoutRecovery::SignInThenRegenerate);
+    }
+
+    #[test]
+    fn processing_url_keeps_list_param() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc123&t=30s";
+        let cleaned = processing_url(url);
+        assert_eq!(cleaned, "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc123");
+    }
+
+    #[test]
+    fn processing_url_strips_tracking_params() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share&ab_channel=Test&list=PLabc&t=30s";
+        let cleaned = processing_url(url);
+        assert_eq!(cleaned, "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc");
+    }
+
+    #[test]
+    fn processing_url_preserves_index() {
+        let url = "https://youtu.be/dQw4w9WgXcQ?list=PLabc&index=5";
+        let cleaned = processing_url(url);
+        assert_eq!(cleaned, "https://youtu.be/dQw4w9WgXcQ?list=PLabc&index=5");
+    }
+
+    #[test]
+    fn processing_url_strips_other_params() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc&start_radio=1&si=abc";
+        let cleaned = processing_url(url);
+        assert_eq!(cleaned, "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLabc");
+    }
+
+    #[test]
+    fn processing_url_non_youtube_unchanged() {
+        let url = "https://example.com/video?id=abc&other=param";
+        let cleaned = processing_url(url);
+        assert_eq!(cleaned, "https://example.com/video?id=abc&other=param");
     }
 }
