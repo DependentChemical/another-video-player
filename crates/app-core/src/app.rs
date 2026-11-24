@@ -3500,7 +3500,6 @@ fn entries_needing_thumbnails(
 }
 
 /// Scans all playlists and repairs missing/broken thumbnail references.
-/// Returns the number of entries queued for repair by setting thumbnail to NULL.
 fn scan_playlist_thumbnails(queue: &Queue, cache: &ThumbnailCache) -> usize {
     let playlists = match queue.playlists() {
         Ok(playlists) => playlists,
@@ -3515,19 +3514,19 @@ fn scan_playlist_thumbnails(queue: &Queue, cache: &ThumbnailCache) -> usize {
         for entry in entries {
             let Some(thumbnail_url) = entry.thumbnail_url.as_deref() else { continue };
             let broken = match entry.thumbnail.as_deref() {
-                None => false,
+                None => true,
                 Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
                 Some(_) => true,
             };
             if !broken {
                 continue;
             }
-            if queue.set_thumbnail_for_playlist(&playlist.id, entry.position, None).is_ok() {
-                app_logging::debug(format!(
-                    "thumbnail scan queued repair: playlist={} url={} thumbnail_url={thumbnail_url}",
-                    playlist.id, entry.url
-                ));
+            if let Ok(id) = cache.fetch(&entry.url, Some(thumbnail_url)) {
+                let _ = queue.set_thumbnail_for_playlist(&playlist.id, entry.position, Some(&id));
                 repaired += 1;
+                if repaired >= 8 {
+                    return repaired;
+                }
             }
         }
     }

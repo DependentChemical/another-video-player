@@ -609,6 +609,31 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Updates displayed details for an entry in a specific playlist.
+    pub fn update_details_for_playlist(
+        &self,
+        playlist_id: &str,
+        position: i64,
+        title: &str,
+        thumbnail: Option<&str>,
+        thumbnail_url: Option<&str>,
+        uploader: Option<&str>,
+    ) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                let table = table_for_playlist(connection, playlist_id)?;
+                connection.execute(
+                    &format!(
+                        "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, uploader = ?5 WHERE position = ?1"
+                    ),
+                    params![position, title, thumbnail, thumbnail_url, uploader],
+                )?;
+                touch_current(connection, &table)?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
     /// Saves or clears the resolver result associated with an entry.
     pub fn set_resolved_source(
         &self,
