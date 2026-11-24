@@ -54,17 +54,17 @@ jobs:
             const fs = require('fs');
             const path = require('path');
 
-            // Reads the version out of the `[workspace.package]` table of a
-            // manifest. The table ends at the next table header, so the lines
-            // in between are the only candidates. A regular expression over
-            // the whole file stops at the end of the header line and finds
-            // nothing, because the header is followed by a line break.
-            function workspaceVersion(manifest) {
+            // Reads the version out of a `[package]` or `[workspace.package]`
+            // table. The table ends at the next table header, so the lines in
+            // between are the only candidates. A regular expression over the
+            // whole file stops at the end of the header line and finds nothing,
+            // because the header is followed by a line break.
+            function tableVersion(manifest, table) {
               let inside = false;
               for (const line of manifest.split(/\r?\n/)) {
                 const trimmed = line.trim();
                 if (trimmed.startsWith('[')) {
-                  inside = trimmed === '[workspace.package]';
+                  inside = trimmed === `[${table}]`;
                   continue;
                 }
                 if (!inside) {
@@ -78,26 +78,31 @@ jobs:
               return null;
             }
 
+            async function readManifest(filePath) {
+              const file = (await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: filePath,
+                ref: headSha,
+              })).data;
+              if (!file.content || !file.encoding) {
+                throw new Error(`Unable to read ${filePath} from the release commit.`);
+              }
+              return Buffer.from(file.content, file.encoding).toString('utf8');
+            }
+
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const headSha = context.payload.workflow_run.head_sha;
 
-            // The workspace version in Cargo.toml is the single source of
-            // truth for the version of the project.
-            const manifestFile = (await github.rest.repos.getContent({
-              owner,
-              repo,
-              path: 'Cargo.toml',
-              ref: headSha,
-            })).data;
-            if (!manifestFile.content || !manifestFile.encoding) {
-              throw new Error('Unable to read Cargo.toml from the release commit.');
-            }
-            const manifest = Buffer.from(manifestFile.content, manifestFile.encoding)
-              .toString('utf8');
-            const version = workspaceVersion(manifest);
+            // app-core is the main application version; older releases keep it
+            // in [workspace.package] in the root manifest.
+            const appCoreManifest = await readManifest('crates/app-core/Cargo.toml');
+            const rootManifest = await readManifest('Cargo.toml');
+            const version = tableVersion(appCoreManifest, 'package')
+              || tableVersion(rootManifest, 'workspace.package');
             if (!version) {
-              throw new Error('Unable to read [workspace.package].version from Cargo.toml.');
+              throw new Error('Unable to read the app-core version from the release commit.');
             }
             if (!/^\d+\.\d+\.\d+$/.test(version)) {
               throw new Error(`"${version}" is not a version number.`);
