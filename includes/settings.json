@@ -29,6 +29,11 @@
             "video": "720,default,best",
             "audio": "default,best",
             "combined": "720,default,best"
+          },
+          "yt-dlp-args": {
+            "display-name": "yt-dlp Arguments",
+            "description": "Arguments appended to yt-dlp for URLs matching this site",
+            "extra": "--extractor-args \"youtube:player_js_variant=tv\""
           }
         }
       }
@@ -141,6 +146,13 @@
       ],
       "default": "deno",
       "value": "deno"
+    },
+    "Extra-Args": {
+      "display-name": "Extra Arguments",
+      "description": "Custom command-line arguments passed to yt-dlp for every resolve",
+      "type": "string",
+      "default": null,
+      "value": null
     }
   }
 }

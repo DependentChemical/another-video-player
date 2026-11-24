@@ -89,6 +89,9 @@ export component MainWindow inherits Window {
     in-out property <bool> pending-open: false;
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
+    in property <bool> pending-is-playlist: false;
+    in property <bool> pending-has-selected-video: false;
+    in property <int> pending-playlist-count: 0;
     in-out property <bool> update-open: false;
     in property <string> update-title: "Update available";
     in property <string> update-version: "";
@@ -145,6 +148,7 @@ export component MainWindow inherits Window {
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-queue-next-requested();
+    callback pending-play-selected-requested();
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
@@ -168,6 +172,10 @@ export component MainWindow inherits Window {
     callback queue-move-to-new-playlist(int);
     callback pending-add-to-playlist(string);
     callback pending-add-to-new-playlist();
+    callback pending-play-playlist-requested();
+    callback pending-play-playlist-new-requested();
+    callback pending-append-playlist(string);
+    callback pending-append-playlist-new();
     callback history-item-selected(string);
     callback outside-clicked();
 
@@ -200,9 +208,11 @@ export component MainWindow inherits Window {
     }
 
     function toggle-settings() {
-        if (root.settings-open) {
+        // The gear always shows the base popup: when the speed slider is
+        // open it returns to the sources/speed rows, and only an already
+        // open base menu toggles closed.
+        if (root.settings-open && !root.settings-speed-mode) {
             root.settings-open = false;
-            root.settings-speed-mode = false;
         } else {
             root.sources-open = false;
             root.settings-speed-mode = false;
@@ -211,15 +221,10 @@ export component MainWindow inherits Window {
     }
 
     function close-settings() {
-        // Clicking outside a popup always returns to the parent level. When
-        // the user left through the playback-speed slider that parent is the
-        // selection menu, so the menu stays open with the source row and the
-        // playback-speed row instead of closing itself.
-        if (root.settings-speed-mode) {
-            root.settings-speed-mode = false;
-        } else {
-            root.settings-open = false;
-        }
+        // A click outside the popup always closes it, including when the
+        // playback-speed slider is the visible level.
+        root.settings-open = false;
+        root.settings-speed-mode = false;
     }
 
     function toggle-video(id: string) {
@@ -394,13 +399,21 @@ export component MainWindow inherits Window {
         pending-title: root.pending-title;
         pending-thumbnail: root.pending-thumbnail;
         in-playlist: root.pending-in-playlist;
+        pending-is-playlist: root.pending-is-playlist;
+        pending-has-selected-video: root.pending-has-selected-video;
+        pending-playlist-count: root.pending-playlist-count;
         playlists: root.playlist-items;
         pending-open <=> root.pending-open;
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
         pending-queue-next-requested => { root.pending-queue-next-requested(); }
+        pending-play-selected-requested => { root.pending-play-selected-requested(); }
         pending-add-to-playlist(id) => { root.pending-add-to-playlist(id); }
         pending-add-to-new-playlist => { root.pending-add-to-new-playlist(); }
+        pending-play-playlist-requested => { root.pending-play-playlist-requested(); }
+        pending-play-playlist-new-requested => { root.pending-play-playlist-new-requested(); }
+        pending-append-playlist(id) => { root.pending-append-playlist(id); }
+        pending-append-playlist-new => { root.pending-append-playlist-new(); }
         pending-dismissed => { root.pending-dismissed(); }
     }
 

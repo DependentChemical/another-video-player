@@ -283,14 +283,14 @@ export component PlayerControls inherits Rectangle {
     // options menu of a YouTube video: the rect's bottom edge is the top
     // edge of the bar and the panel stretches up by the menu's own height,
     // so the menu grows with its rows and stays pinned to the bar.
-    // The overlay covers the whole video area so a click anywhere outside
-    // the menu dismisses it, and the menu's right edge aligns with the
+    // The overlay covers everything above the control bar so a click anywhere
+    // outside the menu dismisses it, and the menu's right edge aligns with the
     // right edge of the gear button.
     if root.settings-open: Rectangle {
         x: 0;
-        y: -(root.container-height - Theme.controls-height);
+        y: -(root.container-height + Theme.bar-height - Theme.controls-height);
         width: root.width;
-        height: root.container-height - Theme.controls-height;
+        height: root.container-height + Theme.bar-height - Theme.controls-height;
         background: transparent;
 
         TouchArea {
@@ -308,7 +308,7 @@ export component PlayerControls inherits Rectangle {
             playback-speed: root.playback-speed;
             close-requested => { root.settings-closed(); }
             sources-requested => { root.sources-requested(); }
-            speed-mode-requested => { root.settings-speed-mode = true; }
+            speed-mode-requested => { root.speed-mode-requested(); }
             speed-changed(value) => { root.speed-changed(value); }
         }
     }

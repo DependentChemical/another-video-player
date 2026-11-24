@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use media_model::{AudioStream, MediaSource, VideoStream};
 
-use crate::Error;
+use crate::{Error, ResolvedPlaylist, ResolvedPlaylistEntry};
 
 /// Converts a `yt-dlp` crate video into Flatline's media model.
 pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
@@ -125,6 +125,62 @@ pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
         video_streams,
         audio_streams,
     })
+}
+
+/// Converts a `yt-dlp` playlist into a resolved playlist document.
+pub fn parse_playlist(
+    playlist: yt_dlp::model::playlist::Playlist,
+    source_url: &str,
+) -> ResolvedPlaylist {
+    let entries = playlist
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            let url = normalize_playlist_entry_url(source_url, &entry.url, &entry.id)?;
+            let title = if entry.title.trim().is_empty() { entry.id.clone() } else { entry.title };
+            Some(ResolvedPlaylistEntry {
+                id: entry.id,
+                title,
+                url,
+                thumbnail: entry.thumbnail,
+                uploader: entry.uploader,
+            })
+        })
+        .collect();
+    ResolvedPlaylist { id: playlist.id, title: playlist.title, url: playlist.url, entries }
+}
+
+fn normalize_playlist_entry_url(source_url: &str, raw: &str, id: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return fallback_playlist_entry_url(source_url, id);
+    }
+    if let Ok(url) = url::Url::parse(raw) {
+        return Some(url.to_string());
+    }
+    if let Ok(base) = url::Url::parse(source_url)
+        && let Ok(joined) = base.join(raw)
+    {
+        return Some(joined.to_string());
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    fallback_playlist_entry_url(source_url, id)
+}
+
+fn fallback_playlist_entry_url(source_url: &str, id: &str) -> Option<String> {
+    let source = url::Url::parse(source_url).ok()?;
+    let host = source.host_str()?.to_ascii_lowercase();
+    let is_youtube = host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+        || host == "youtube-nocookie.com";
+    if is_youtube && !id.trim().is_empty() {
+        return Some(format!("https://www.youtube.com/watch?v={id}"));
+    }
+    None
 }
 
 fn pick_bitrate(primary: Option<f64>, fallback: Option<f64>) -> Option<u64> {

@@ -32,6 +32,8 @@ pub enum Message {
     Resolved(Result<ResolvedMedia, ResolveFailure>),
     /// A URL the user submitted was resolved and waits for the user's choice.
     Pending(PendingMedia),
+    /// A playlist URL was resolved and waits for the user's choice.
+    PendingPlaylist(PendingPlaylist),
     /// A URL the user submitted could not be processed.
     UrlEntryFailed {
         /// The URL that failed.
@@ -199,9 +201,6 @@ pub struct ResolveFailure {
     pub hard_timeout: bool,
 }
 /// A URL that was resolved while another media plays.
-///
-/// The user chooses what happens next: the media is either appended to the
-/// active queue or it replaces the queue and plays right away.
 #[derive(Debug, Clone)]
 pub struct PendingMedia {
     /// The URL the media was asked for.
@@ -220,6 +219,38 @@ pub struct PendingMedia {
     pub epoch: u64,
     /// SponsorBlock segments fetched for the media, kept only in memory.
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
+}
+
+/// A playlist that was resolved while another media plays.
+#[derive(Debug, Clone)]
+pub struct PendingPlaylist {
+    /// The URL the playlist was asked for.
+    pub url: String,
+    /// Playlist title.
+    pub title: String,
+    /// Thumbnail for the dialog.
+    pub thumbnail: Option<PathBuf>,
+    /// URL of the video that should be selected after creating/playing playlist.
+    pub selected_url: String,
+    /// Whether the submitted URL explicitly selected a video inside the playlist.
+    pub has_selected_video: bool,
+    /// Resolved playlist entries.
+    pub entries: Vec<PendingPlaylistEntry>,
+    /// URL entry generation.
+    pub epoch: u64,
+}
+
+/// One entry in a pending playlist.
+#[derive(Debug, Clone)]
+pub struct PendingPlaylistEntry {
+    /// Queue URL.
+    pub url: String,
+    /// Display title.
+    pub title: String,
+    /// Remote thumbnail URL.
+    pub thumbnail_url: Option<String>,
+    /// Uploader/channel name.
+    pub uploader: Option<String>,
 }
 
 /// What the user interface has to show after a media was accepted.
@@ -273,6 +304,8 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(16);
 
 /// How long the background thumbnail pass waits between downloads or retries.
 const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
+/// How long the background thumbnail pass waits when there is no due work.
+const THUMBNAIL_REFRESH_IDLE_DELAY: Duration = Duration::from_secs(15);
 
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
@@ -654,6 +687,7 @@ pub struct App {
     stream_buffer: PathBuf,
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
+    pending_playlist: Mutex<Option<PendingPlaylist>>,
     /// The last application release version shown to the user.
     /// Whether -4 was auto-enabled for the current playback retry sequence.
     auto_force_ipv4: AtomicBool,
@@ -717,6 +751,7 @@ impl App {
             paths: paths.clone(),
             stream_buffer,
             pending: Mutex::new(None),
+            pending_playlist: Mutex::new(None),
             url_entry: Mutex::new(UrlEntryState::default()),
             auto_force_ipv4: AtomicBool::new(false),
             notified_app_update: Mutex::new(None),
@@ -748,9 +783,12 @@ impl App {
     /// The work happens in the background; the result arrives through
     /// [`App::poll`].
     pub fn submit_url(&self, url: String) {
-        let url = url.trim().to_string();
+        let mut url = url.trim().to_string();
         if url.is_empty() {
             return;
+        }
+        if source_youtube::matches_url(&url) {
+            url = source_youtube::processing_url(&url);
         }
         app_logging::notice(format!(
             "url entry submitted: url={url} current_media={} playing={}",
@@ -836,7 +874,7 @@ impl App {
                 return;
             }
             let sender = outbox.lock().expect("the outbox is not poisoned").clone();
-            let result = resolve_with_session(
+            let result = resolve_document_with_session(
                 &resolver,
                 &session,
                 &epoch_state,
@@ -858,7 +896,7 @@ impl App {
                 return;
             }
             let message = match result {
-                Ok(source) => {
+                Ok(stream_resolver::ResolvedDocument::Video(source)) => {
                     let sponsorblock_segments = if source_youtube::matches_url(&url) {
                         source_youtube::sponsorblock::fetch_for_url(&url)
                     } else {
@@ -882,10 +920,46 @@ impl App {
                         sponsorblock_segments,
                     })
                 }
+                Ok(stream_resolver::ResolvedDocument::Playlist(playlist)) => {
+                    let (selected_url, has_selected_video) =
+                        Self::selected_playlist_url(&url, &playlist);
+                    let entries: Vec<PendingPlaylistEntry> = playlist
+                        .entries
+                        .iter()
+                        .map(|entry| PendingPlaylistEntry {
+                            url: entry.url.clone(),
+                            title: entry.title.clone(),
+                            thumbnail_url: entry.thumbnail.clone(),
+                            uploader: entry.uploader.clone(),
+                        })
+                        .collect();
+                    let thumb_url = entries
+                        .iter()
+                        .find(|entry| entry.url == selected_url)
+                        .and_then(|entry| entry.thumbnail_url.as_deref())
+                        .or_else(|| entries.first().and_then(|entry| entry.thumbnail_url.as_deref()));
+                    let thumb_id = cache.fetch(&selected_url, thumb_url).ok();
+                    let thumbnail = thumb_id.as_deref().and_then(|id| cache.mid_path(id));
+                    app_logging::notice(format!(
+                        "playlist url entry resolved: url={url} epoch={epoch} title=\"{}\" entries={} has_selected_video={has_selected_video}",
+                        playlist.title,
+                        entries.len()
+                    ));
+                    Message::PendingPlaylist(PendingPlaylist {
+                        url,
+                        title: if playlist.title.trim().is_empty() {
+                            "Playlist".to_string()
+                        } else {
+                            playlist.title
+                        },
+                        thumbnail,
+                        selected_url,
+                        has_selected_video,
+                        entries,
+                        epoch,
+                    })
+                }
                 Err(error) => {
-                    // The hard deadline is the only failure a different
-                    // network stack can still fix, so it is the only one
-                    // that is reported as a timeout.
                     let timeout_seconds = match &error {
                         stream_resolver::Error::HardTimeout { seconds, .. } => Some(*seconds),
                         _ => None,
@@ -904,6 +978,39 @@ impl App {
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
         });
+    }
+}
+
+impl App {
+    /// Picks the URL to play from a resolved playlist and reports whether the
+    /// submitted URL explicitly selected a video inside that playlist.
+    fn selected_playlist_url(
+        source_url: &str,
+        playlist: &stream_resolver::ResolvedPlaylist,
+    ) -> (String, bool) {
+        if let Ok(parsed) = url::Url::parse(source_url) {
+            let video = parsed
+                .query_pairs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("v"))
+                .map(|(_, value)| value.to_string());
+            if let Some(video) = video
+                && let Some(entry) = playlist.entries.iter().find(|entry| {
+                    url::Url::parse(&entry.url).ok().is_some_and(|u| {
+                        u.query_pairs().any(|(k, v)| k.eq_ignore_ascii_case("v") && v == video)
+                    }) || entry.id == video
+                })
+            {
+                return (entry.url.clone(), true);
+            }
+        }
+        (
+            playlist
+                .entries
+                .first()
+                .map(|entry| entry.url.clone())
+                .unwrap_or_else(|| source_url.to_string()),
+            false,
+        )
     }
 
     /// Whether a resolved result for `url` still belongs to the active playback.
@@ -1025,6 +1132,27 @@ impl App {
             pending.url, pending.title
         ));
         *self.pending.lock().expect("the pending media is not poisoned") = Some(pending);
+    }
+
+    /// Stores a pending playlist so the user can decide what to do with it.
+    pub fn set_pending_playlist(&self, pending: PendingPlaylist) {
+        app_logging::debug(format!(
+            "pending playlist is waiting for the user: url={} title=\"{}\" entries={}",
+            pending.url,
+            pending.title,
+            pending.entries.len()
+        ));
+        *self.pending_playlist.lock().expect("the pending playlist is not poisoned") =
+            Some(pending);
+    }
+
+    /// Forgets the pending playlist without doing anything with it.
+    pub fn dismiss_pending_playlist(&self) {
+        if let Some(pending) =
+            self.pending_playlist.lock().expect("the pending playlist is not poisoned").take()
+        {
+            app_logging::debug(format!("the pending playlist was dismissed: url={}", pending.url));
+        }
     }
 
     /// Plays the pending media right away.
@@ -1161,6 +1289,110 @@ impl App {
             self.pending.lock().expect("the pending media is not poisoned").take()
         {
             app_logging::debug(format!("the pending video was dismissed: url={}", pending.url));
+        }
+    }
+
+    /// Returns the selected video from the pending playlist, if it has one.
+    pub fn pending_playlist_selected(&self) -> Option<PendingPlaylistEntry> {
+        let slot = self.pending_playlist.lock().expect("the pending playlist is not poisoned");
+        let pending = slot.as_ref()?;
+        if !pending.has_selected_video {
+            return None;
+        }
+        pending
+            .entries
+            .iter()
+            .find(|entry| entry.url == pending.selected_url)
+            .cloned()
+            .or_else(|| pending.entries.first().cloned())
+    }
+
+    /// Plays the selected video from a pending playlist as a standalone media.
+    pub fn play_pending_playlist_selected(&self) -> Option<String> {
+        let selected = self.pending_playlist_selected()?;
+        self.dismiss_pending_playlist();
+        Some(selected.url)
+    }
+
+    /// Appends the selected video from a pending playlist to the active queue.
+    pub fn queue_pending_playlist_selected(&self) -> bool {
+        self.queue_pending_playlist_selected_with(false)
+    }
+
+    /// Appends the selected video from a pending playlist next in the active queue.
+    pub fn queue_pending_playlist_selected_next(&self) -> bool {
+        self.queue_pending_playlist_selected_with(true)
+    }
+
+    fn queue_pending_playlist_selected_with(&self, next: bool) -> bool {
+        let Some(selected) = self.pending_playlist_selected() else {
+            return false;
+        };
+        let result = if next {
+            self.queue.push_next(
+                &selected.url,
+                &selected.title,
+                None,
+                selected.thumbnail_url.as_deref(),
+                selected.uploader.as_deref(),
+            )
+        } else {
+            self.queue.push(
+                &selected.url,
+                &selected.title,
+                None,
+                selected.thumbnail_url.as_deref(),
+                selected.uploader.as_deref(),
+            )
+        };
+        match result {
+            Ok(_) => {
+                self.dismiss_pending_playlist();
+                true
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "the active queue could not be written for {}: {error}",
+                    selected.url
+                ));
+                false
+            }
+        }
+    }
+
+    /// Adds the selected video from a pending playlist to `playlist_id`.
+    pub fn add_pending_playlist_selected_to_playlist(&self, playlist_id: &str) -> bool {
+        let Some(selected) = self.pending_playlist_selected() else {
+            return false;
+        };
+        let entry = library::QueueEntry {
+            id: 0,
+            position: 0,
+            url: selected.url.clone(),
+            title: selected.title.clone(),
+            thumbnail: None,
+            thumbnail_url: selected.thumbnail_url.clone(),
+            uploader: selected.uploader.clone(),
+            id_hash: String::new(),
+            current: false,
+            resolved_source: None,
+            resolved_at: None,
+            selected_video: None,
+            selected_audio: None,
+            selected_muxed: None,
+        };
+        match self.queue.push_entry_to_playlist(playlist_id, &entry) {
+            Ok(_) => {
+                self.dismiss_pending_playlist();
+                true
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "the pending playlist video could not be added to the playlist: url={} playlist_id={playlist_id} error={error}",
+                    selected.url
+                ));
+                false
+            }
         }
     }
 
@@ -1463,9 +1695,6 @@ impl App {
     }
 
     /// Adds the pending media to `playlist_id` and forgets it.
-    ///
-    /// The pending media is only dropped after the write succeeded, so a
-    /// failure leaves the dialog usable.
     pub fn add_pending_to_playlist(&self, playlist_id: &str) -> bool {
         let mut slot = self.pending.lock().expect("the pending media is not poisoned");
         let Some(pending) = slot.as_ref() else {
@@ -1479,7 +1708,7 @@ impl App {
             thumbnail: pending.thumbnail_id.clone(),
             thumbnail_url: pending.source.thumbnail.clone(),
             uploader: pending.source.uploader.clone(),
-            id_hash: media_model::video_id_hash(&pending.url),
+            id_hash: String::new(),
             current: false,
             resolved_source: serde_json::to_string(&pending.source).ok(),
             resolved_at: Some(pending.resolved_at),
@@ -1504,6 +1733,123 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Plays a pending playlist by creating a new playlist and making it active.
+    pub fn play_pending_playlist_as_new(&self, name: Option<&str>) -> Result<(), String> {
+        let mut slot = self.pending_playlist.lock().expect("the pending playlist is not poisoned");
+        let Some(pending) = slot.as_ref() else {
+            return Err("no pending playlist".to_string());
+        };
+        let playlist_name = name
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| pending.title.clone());
+        let info = self.create_playlist(&playlist_name)?;
+        let selected = pending.selected_url.clone();
+        let entries = pending.entries.clone();
+        slot.take();
+        drop(slot);
+        self.populate_playlist_entries(&info.id, &entries, &selected)?;
+        let _ = self.select_playlist(&info.id);
+        self.play_url_in_active_playlist(&selected);
+        Ok(())
+    }
+
+    /// Plays a pending playlist into an already created playlist.
+    pub fn play_pending_playlist_into(&self, playlist_id: &str) -> Result<(), String> {
+        let mut slot = self.pending_playlist.lock().expect("the pending playlist is not poisoned");
+        let Some(pending) = slot.as_ref() else {
+            return Err("no pending playlist".to_string());
+        };
+        let selected = pending.selected_url.clone();
+        let entries = pending.entries.clone();
+        slot.take();
+        drop(slot);
+        self.populate_playlist_entries(playlist_id, &entries, &selected)?;
+        let _ = self.select_playlist(playlist_id);
+        self.play_url_in_active_playlist(&selected);
+        Ok(())
+    }
+
+    fn populate_playlist_entries(
+        &self,
+        playlist_id: &str,
+        entries: &[PendingPlaylistEntry],
+        selected_url: &str,
+    ) -> Result<(), String> {
+        let has_selected = entries.iter().any(|entry| entry.url == selected_url);
+        for (index, entry) in entries.iter().enumerate() {
+            let current = if has_selected { entry.url == selected_url } else { index == 0 };
+            let row = library::QueueEntry {
+                id: 0,
+                position: 0,
+                url: entry.url.clone(),
+                title: entry.title.clone(),
+                thumbnail: None,
+                thumbnail_url: entry.thumbnail_url.clone(),
+                uploader: entry.uploader.clone(),
+                id_hash: String::new(),
+                current,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            };
+            self.queue
+                .push_entry_to_playlist(playlist_id, &row)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Appends a pending playlist to an existing playlist. Does not change active playlist.
+    pub fn append_pending_playlist_to(&self, playlist_id: &str) -> Result<usize, String> {
+        let slot = self.pending_playlist.lock().expect("the pending playlist is not poisoned");
+        let Some(pending) = slot.as_ref() else {
+            return Err("no pending playlist".to_string());
+        };
+        let mut count = 0usize;
+        for entry in &pending.entries {
+            let row = library::QueueEntry {
+                id: 0,
+                position: 0,
+                url: entry.url.clone(),
+                title: entry.title.clone(),
+                thumbnail: None,
+                thumbnail_url: entry.thumbnail_url.clone(),
+                uploader: entry.uploader.clone(),
+                id_hash: String::new(),
+                current: false,
+                resolved_source: None,
+                resolved_at: None,
+                selected_video: None,
+                selected_audio: None,
+                selected_muxed: None,
+            };
+            self.queue
+                .push_entry_to_playlist(playlist_id, &row)
+                .map_err(|error| error.to_string())?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Clears pending playlist after successful append.
+    pub fn take_pending_playlist(&self) -> Option<PendingPlaylist> {
+        self.pending_playlist.lock().expect("the pending playlist is not poisoned").take()
+    }
+
+    /// Plays a URL from the active playlist if present, else submits it.
+    fn play_url_in_active_playlist(&self, url: &str) {
+        if let Ok(entries) = self.queue.entries()
+            && let Some(entry) = entries.into_iter().find(|entry| entry.url == url)
+        {
+            let _ = self.play_queue_entry(entry.id);
+            return;
+        }
+        self.submit_url(url.to_string());
     }
 
     /// Returns the small thumbnail of a cached thumbnail for the queue list.
@@ -1613,16 +1959,12 @@ impl App {
         });
     }
 
-    /// Kicks off a background pass that (re)builds the thumbnail cache for the
-    /// active queue.
+    /// Kicks off a background pass that (re)builds the thumbnail cache.
     ///
-    /// Entries that already hold a valid cached thumbnail are skipped; the rest
-    /// are downloaded one at a time, slowly, so the cache is rebuilt without
-    /// blocking playback or the interface. Failures and preemption do not stop
-    /// the pass: it waits and retries until the queue is satisfied or work is
-    /// no longer possible. A video whose thumbnail keeps failing after the
-    /// yt-dlp fallback is removed from the queue and the pass moves on. The
-    /// start is reported to the user through [`Message::ThumbnailRefreshStarted`].
+    /// While queue work exists, thumbnails are processed every 5 seconds.
+    /// When the queue is exhausted, the worker stays alive and scans playlists
+    /// every 15 seconds for missing/broken thumbnails, enqueuing repairs and
+    /// then returning to normal processing.
     pub fn refresh_queue_thumbnails(&self) {
         let cache = self.cache.clone();
         let queue = self.queue.clone();
@@ -1636,7 +1978,13 @@ impl App {
 
         handle.spawn_blocking(move || {
             let mut announced = false;
+            let mut active_playlist_id = queue.active_playlist_id().ok().flatten();
             loop {
+                let current_playlist = queue.active_playlist_id().ok().flatten();
+                if current_playlist != active_playlist_id {
+                    active_playlist_id = current_playlist;
+                    announced = false;
+                }
                 let entries = match queue.entries() {
                     Ok(entries) => entries,
                     Err(error) => {
@@ -1649,10 +1997,17 @@ impl App {
                 };
                 let due = entries_needing_thumbnails(&entries, &cache);
                 if due.is_empty() {
-                    if announced {
-                        app_logging::notice("thumbnail refresh finished: queue thumbnails are cached");
+                    let repaired = scan_playlist_thumbnails(&queue, &cache);
+                    if repaired > 0 {
+                        announced = false;
+                        continue;
                     }
-                    return;
+                    if announced {
+                        app_logging::notice("thumbnail refresh idle: no queue thumbnails pending");
+                        announced = false;
+                    }
+                    std::thread::sleep(THUMBNAIL_REFRESH_IDLE_DELAY);
+                    continue;
                 }
 
                 if !announced {
@@ -1703,7 +2058,6 @@ impl App {
                             std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                         }
                         ThumbnailRefreshOutcome::Skipped => {
-                            // The error video is out of the queue; move on.
                             progressed = true;
                         }
                     }
@@ -3260,6 +3614,40 @@ fn entries_needing_thumbnails(
         .collect()
 }
 
+/// Scans all playlists and repairs missing/broken thumbnail references.
+fn scan_playlist_thumbnails(queue: &Queue, cache: &ThumbnailCache) -> usize {
+    let playlists = match queue.playlists() {
+        Ok(playlists) => playlists,
+        Err(_) => return 0,
+    };
+    let mut repaired = 0usize;
+    for playlist in playlists {
+        let entries = match queue.entries_for_playlist(&playlist.id) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let Some(thumbnail_url) = entry.thumbnail_url.as_deref() else { continue };
+            let broken = match entry.thumbnail.as_deref() {
+                None => true,
+                Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
+                Some(_) => true,
+            };
+            if !broken {
+                continue;
+            }
+            if let Ok(id) = cache.fetch(&entry.url, Some(thumbnail_url)) {
+                let _ = queue.set_thumbnail_for_playlist(&playlist.id, entry.position, Some(&id));
+                repaired += 1;
+                if repaired >= 8 {
+                    return repaired;
+                }
+            }
+        }
+    }
+    repaired
+}
+
 /// Removes the media a previous source buffered.
 ///
 /// The player may still have a cache file open while it replaces the old
@@ -3678,14 +4066,16 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
     if !extra_args.is_empty() {
         app_logging::notice(format!("yt-dlp extra args enabled: {}", extra_args.join(" ")));
     }
-    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args);
-    // The YouTube extractor needs its own arguments; they are added to every
-    // YouTube request and never to the request of another source.
-    let youtube_args = source_youtube::ytdlp_args();
-    if !youtube_args.is_empty() {
-        app_logging::notice(format!("yt-dlp youtube args enabled: {}", youtube_args.join(" ")));
+    // Site arguments are regex matched when a URL is resolved, so they are
+    // applied only to the sites whose entry actually names them.
+    let site_args = settings.ytdlp_site_arg_rules();
+    if !site_args.is_empty() {
+        app_logging::notice(format!(
+            "yt-dlp site args enabled: {} rule(s) from settings",
+            site_args.len()
+        ));
     }
-    resolver = resolver.with_service_args(Service::YouTube, youtube_args);
+    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args).with_site_args(site_args);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);
@@ -3732,7 +4122,7 @@ fn ensure_deno(ytdlp: &YtDlp, settings: &Settings) -> Option<std::path::PathBuf>
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn sign_in_and_resolve(
+async fn sign_in_and_resolve_document(
     resolver: &Resolver,
     session: &Session,
     epoch_state: &AtomicU64,
@@ -3743,14 +4133,14 @@ async fn sign_in_and_resolve(
     notice: &Sender<Box<Message>>,
     service: media_model::Service,
     original_error: stream_resolver::Error,
-) -> Result<MediaSource, stream_resolver::Error> {
+) -> Result<stream_resolver::ResolvedDocument, stream_resolver::Error> {
     use stream_resolver::Error as ResolveError;
     match session.sign_in(service, url, notice) {
         Ok(()) => {
             if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
                 return Err(ResolveError::Cancelled);
             }
-            resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await
+            resolver.resolve_document_with_cancel(url, cancel.clone(), pid.clone()).await
         }
         Err(crate::session::Error::Declined) => {
             if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
@@ -3781,14 +4171,65 @@ async fn resolve_with_session(
     url: &str,
     notice: &Sender<Box<Message>>,
 ) -> Result<MediaSource, stream_resolver::Error> {
+    match resolve_document_with_session(
+        resolver,
+        session,
+        epoch_state,
+        epoch,
+        cancel,
+        pid,
+        url,
+        notice,
+    )
+    .await?
+    {
+        stream_resolver::ResolvedDocument::Video(source) => Ok(source),
+        stream_resolver::ResolvedDocument::Playlist(playlist) => {
+            for entry in playlist.entries {
+                if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
+                    return Err(stream_resolver::Error::Cancelled);
+                }
+                match resolve_document_with_session(
+                    resolver,
+                    session,
+                    epoch_state,
+                    epoch,
+                    cancel,
+                    pid,
+                    &entry.url,
+                    notice,
+                )
+                .await?
+                {
+                    stream_resolver::ResolvedDocument::Video(source) => return Ok(source),
+                    stream_resolver::ResolvedDocument::Playlist(_) => continue,
+                }
+            }
+            Err(stream_resolver::Error::Empty)
+        }
+    }
+}
+
+/// Resolves a URL into a document, offering sign-in when the service requires it.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_document_with_session(
+    resolver: &Resolver,
+    session: &Session,
+    epoch_state: &AtomicU64,
+    epoch: u64,
+    cancel: &Arc<AtomicBool>,
+    pid: &Arc<AtomicU32>,
+    url: &str,
+    notice: &Sender<Box<Message>>,
+) -> Result<stream_resolver::ResolvedDocument, stream_resolver::Error> {
     use stream_resolver::Error as ResolveError;
 
     if cancel.load(Ordering::SeqCst) || epoch_state.load(Ordering::SeqCst) != epoch {
         return Err(ResolveError::Cancelled);
     }
-    let first = resolver.resolve_with_cancel(url, cancel.clone(), pid.clone()).await;
+    let first = resolver.resolve_document_with_cancel(url, cancel.clone(), pid.clone()).await;
     let error = match first {
-        Ok(source) => return Ok(source),
+        Ok(document) => return Ok(document),
         Err(error) => error,
     };
     if matches!(error, ResolveError::Cancelled)
@@ -3802,7 +4243,7 @@ async fn resolve_with_session(
     let Some(service) = web_session::challenge_service(url, &message) else {
         return Err(error);
     };
-    sign_in_and_resolve(
+    sign_in_and_resolve_document(
         resolver,
         session,
         epoch_state,
