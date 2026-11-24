@@ -184,13 +184,14 @@ export component FlatButton inherits Rectangle {
     callback clicked();
     callback pointer-activity();
 
+    min-width: label-text.preferred-width + 24px;
     border-radius: 6px;
     border-width: 1px;
     border-color: root.primary ? Theme.accent : (touch.has-hover && root.enabled ? Theme.accent : Theme.border);
     background: root.primary ? (touch.has-hover ? #5a9bf5 : Theme.accent) : (touch.pressed ? Theme.elevated : (touch.has-hover ? Theme.elevated : Theme.panel));
     opacity: root.enabled ? 1 : 0.45;
 
-    Text {
+    label-text := Text {
         text: root.label;
         color: root.primary ? Theme.on-accent : Theme.fg;
         font-size: 13px;

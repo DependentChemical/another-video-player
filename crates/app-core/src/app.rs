@@ -1750,7 +1750,7 @@ impl App {
         let entries = pending.entries.clone();
         slot.take();
         drop(slot);
-        self.populate_playlist_entries(&info.id, &entries)?;
+        self.populate_playlist_entries(&info.id, &entries, &selected)?;
         let _ = self.select_playlist(&info.id);
         self.play_url_in_active_playlist(&selected);
         Ok(())
@@ -1766,7 +1766,7 @@ impl App {
         let entries = pending.entries.clone();
         slot.take();
         drop(slot);
-        self.populate_playlist_entries(playlist_id, &entries)?;
+        self.populate_playlist_entries(playlist_id, &entries, &selected)?;
         let _ = self.select_playlist(playlist_id);
         self.play_url_in_active_playlist(&selected);
         Ok(())
@@ -1776,8 +1776,11 @@ impl App {
         &self,
         playlist_id: &str,
         entries: &[PendingPlaylistEntry],
+        selected_url: &str,
     ) -> Result<(), String> {
+        let has_selected = entries.iter().any(|entry| entry.url == selected_url);
         for (index, entry) in entries.iter().enumerate() {
+            let current = if has_selected { entry.url == selected_url } else { index == 0 };
             let row = library::QueueEntry {
                 id: 0,
                 position: 0,
@@ -1787,7 +1790,7 @@ impl App {
                 thumbnail_url: entry.thumbnail_url.clone(),
                 uploader: entry.uploader.clone(),
                 id_hash: String::new(),
-                current: index == 0,
+                current,
                 resolved_source: None,
                 resolved_at: None,
                 selected_video: None,
