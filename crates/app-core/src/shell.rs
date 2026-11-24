@@ -35,6 +35,8 @@ enum PlaylistIntent {
     AddEntry(i64),
     MoveEntry(i64),
     AddPending,
+    PlayPendingPlaylist,
+    AppendPendingPlaylist,
 }
 
 /// How often the interface is refreshed.
@@ -246,7 +248,10 @@ impl Shell {
         }
         {
             let app = Arc::clone(&app);
-            ui.on_pending_dismissed(move || app.dismiss_pending());
+            ui.on_pending_dismissed(move || {
+                app.dismiss_pending();
+                app.dismiss_pending_playlist();
+            });
         }
         {
             let app = Arc::clone(&app);
@@ -380,6 +385,51 @@ impl Shell {
             let intent = Rc::clone(&playlist_intent);
             ui.on_pending_add_to_new_playlist(move || {
                 *intent.borrow_mut() = Some(PlaylistIntent::AddPending);
+                ui_for_pending.show_create_playlist();
+            });
+        }
+        {
+            let ui_for_pending = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_pending_play_playlist(move || {
+                *intent.borrow_mut() = Some(PlaylistIntent::PlayPendingPlaylist);
+                ui_for_pending.show_create_playlist();
+            });
+        }
+        {
+            let ui_for_pending = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_pending_play_playlist_new(move || {
+                *intent.borrow_mut() = Some(PlaylistIntent::PlayPendingPlaylist);
+                ui_for_pending.show_create_playlist();
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
+            ui.on_pending_append_playlist(move |playlist_id| {
+                let target = playlist_name(&app, playlist_id.as_str())
+                    .unwrap_or_else(|| "the playlist".to_string());
+                match app.append_pending_playlist_to(playlist_id.as_str()) {
+                    Ok(count) => {
+                        let _ = app.take_pending_playlist();
+                        ui_for_pending.hide_pending();
+                        ui_for_pending.show_toast(&format!("Appended {count} items to {target}"));
+                        ui_for_pending.show_queue(
+                            &queue_list(&app),
+                            &queue_title(&app),
+                            &playlist_list(&app),
+                        );
+                    }
+                    Err(_) => ui_for_pending.show_toast("The playlist could not be appended"),
+                }
+            });
+        }
+        {
+            let ui_for_pending = Rc::clone(&ui);
+            let intent = Rc::clone(&playlist_intent);
+            ui.on_pending_append_playlist_new(move || {
+                *intent.borrow_mut() = Some(PlaylistIntent::AppendPendingPlaylist);
                 ui_for_pending.show_create_playlist();
             });
         }
@@ -685,9 +735,9 @@ fn start_load(app: &App, ui: &PlayerUi, loading: &RefCell<Loading>, url: &str) {
     if !app.is_playing() {
         loading.borrow_mut().entry_started();
     }
-    // The new URL replaces the video that waits for the user's choice, so
-    // the old dialog is taken down with it.
+    // The new URL replaces the video/playlist that waits for the user's choice.
     app.dismiss_pending();
+    app.dismiss_pending_playlist();
     ui.hide_pending();
     app.submit_url(url.to_string());
 }
@@ -880,6 +930,26 @@ fn playlist_action(
                 ui.show_toast("The video could not be added to the playlist");
             }
         }
+        PlaylistIntent::PlayPendingPlaylist => {
+            if app.play_pending_playlist_into(playlist_id).is_ok() {
+                ui.hide_pending();
+                loading.borrow_mut().resolve_started();
+                ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+            } else {
+                ui.show_toast("The playlist could not be played");
+            }
+        }
+        PlaylistIntent::AppendPendingPlaylist => {
+            match app.append_pending_playlist_to(playlist_id) {
+                Ok(count) => {
+                    let _ = app.take_pending_playlist();
+                    ui.hide_pending();
+                    ui.show_toast(&format!("Appended {count} items to {target_name}"));
+                    ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
+                }
+                Err(_) => ui.show_toast("The playlist could not be appended"),
+            }
+        }
     }
 }
 
@@ -1006,6 +1076,25 @@ fn tick(
                     &playlist_list(app),
                 );
                 app.set_pending(pending);
+                loading.entry_finished();
+            }
+            Message::PendingPlaylist(pending) => {
+                if !app.is_current_url_entry(pending.epoch) {
+                    app_logging::debug(format!(
+                        "discarded a playlist url entry that was replaced before it was shown: url={}",
+                        pending.url
+                    ));
+                    continue;
+                }
+                let in_playlist = app.active_playlist_name().is_some();
+                ui.show_pending_playlist(
+                    &pending.title,
+                    pending.thumbnail.as_deref(),
+                    in_playlist,
+                    pending.entries.len(),
+                    &playlist_list(app),
+                );
+                app.set_pending_playlist(pending);
                 loading.entry_finished();
             }
             Message::UrlEntryFailed { url, error, timeout_seconds, epoch } => {

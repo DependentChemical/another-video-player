@@ -89,6 +89,8 @@ export component MainWindow inherits Window {
     in-out property <bool> pending-open: false;
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
+    in property <bool> pending-is-playlist: false;
+    in property <int> pending-playlist-count: 0;
     in-out property <bool> update-open: false;
     in property <string> update-title: "Update available";
     in property <string> update-version: "";
@@ -168,6 +170,10 @@ export component MainWindow inherits Window {
     callback queue-move-to-new-playlist(int);
     callback pending-add-to-playlist(string);
     callback pending-add-to-new-playlist();
+    callback pending-play-playlist-requested();
+    callback pending-play-playlist-new-requested();
+    callback pending-append-playlist(string);
+    callback pending-append-playlist-new();
     callback history-item-selected(string);
     callback outside-clicked();
 
@@ -391,6 +397,8 @@ export component MainWindow inherits Window {
         pending-title: root.pending-title;
         pending-thumbnail: root.pending-thumbnail;
         in-playlist: root.pending-in-playlist;
+        pending-is-playlist: root.pending-is-playlist;
+        pending-playlist-count: root.pending-playlist-count;
         playlists: root.playlist-items;
         pending-open <=> root.pending-open;
         pending-play-requested => { root.pending-play-requested(); }
@@ -398,6 +406,10 @@ export component MainWindow inherits Window {
         pending-queue-next-requested => { root.pending-queue-next-requested(); }
         pending-add-to-playlist(id) => { root.pending-add-to-playlist(id); }
         pending-add-to-new-playlist => { root.pending-add-to-new-playlist(); }
+        pending-play-playlist-requested => { root.pending-play-playlist-requested(); }
+        pending-play-playlist-new-requested => { root.pending-play-playlist-new-requested(); }
+        pending-append-playlist(id) => { root.pending-append-playlist(id); }
+        pending-append-playlist-new => { root.pending-append-playlist-new(); }
         pending-dismissed => { root.pending-dismissed(); }
     }
 

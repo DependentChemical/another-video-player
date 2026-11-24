@@ -13,5 +13,6 @@ app-logging = { workspace = true }
 media-model = { workspace = true }
 regex = "1"
 serde_json = { workspace = true }
+url = { workspace = true }
 ytdlp-tool = { workspace = true }
 yt-dlp = { workspace = true }

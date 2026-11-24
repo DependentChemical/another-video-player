@@ -149,7 +149,7 @@ pub fn processing_url(url: &str) -> String {
 
     let mut pairs: Vec<(String, String)> =
         parsed.query_pairs().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        pairs.retain(|(key, _value)| {
+    pairs.retain(|(key, _value)| {
         let key = key.to_ascii_lowercase();
         if YOUTUBE_TRACKING_PARAMS.iter().any(|p| key == p.to_ascii_lowercase()) {
             return false;

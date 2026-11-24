@@ -686,11 +686,6 @@ impl PlayerUi {
     }
 
     /// Opens the dialog that asks what to do with a resolved media.
-    ///
-    /// The thumbnail is read from disk; when it is missing or cannot be
-    /// decoded the dialog simply shows no picture. `in_playlist` tells the
-    /// dialog whether the active queue or a user playlist is on screen, so its
-    /// labels say "queue" or "playlist" accordingly.
     pub fn show_pending(
         &self,
         title: &str,
@@ -701,6 +696,28 @@ impl PlayerUi {
         self.set_playlists(playlists);
         self.window.set_pending_title(display_title(title).as_ref().into());
         self.window.set_pending_in_playlist(in_playlist);
+        self.window.set_pending_is_playlist(false);
+        self.window.set_pending_playlist_count(0);
+        let image =
+            thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
+        self.window.set_pending_thumbnail(image);
+        self.window.set_pending_open(true);
+    }
+
+    /// Opens the dialog that asks what to do with a resolved playlist.
+    pub fn show_pending_playlist(
+        &self,
+        title: &str,
+        thumbnail: Option<&Path>,
+        in_playlist: bool,
+        count: usize,
+        playlists: &[PlaylistListEntry],
+    ) {
+        self.set_playlists(playlists);
+        self.window.set_pending_title(display_title(title).as_ref().into());
+        self.window.set_pending_in_playlist(in_playlist);
+        self.window.set_pending_is_playlist(true);
+        self.window.set_pending_playlist_count(count as i32);
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
         self.window.set_pending_thumbnail(image);
@@ -1013,6 +1030,26 @@ impl PlayerUi {
     /// Called when the user adds the pending media to a playlist they create.
     pub fn on_pending_add_to_new_playlist(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_add_to_new_playlist(handler);
+    }
+
+    /// Called when the user asks to play a pending playlist.
+    pub fn on_pending_play_playlist(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_play_playlist_requested(handler);
+    }
+
+    /// Called when the user asks to create a new playlist and play it.
+    pub fn on_pending_play_playlist_new(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_play_playlist_new_requested(handler);
+    }
+
+    /// Called when the user appends a pending playlist to an existing playlist.
+    pub fn on_pending_append_playlist(&self, handler: impl Fn(String) + 'static) {
+        self.window.on_pending_append_playlist(move |playlist| handler(playlist.to_string()));
+    }
+
+    /// Called when the user appends a pending playlist to a new playlist.
+    pub fn on_pending_append_playlist_new(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_append_playlist_new(handler);
     }
 
     /// Called when the user accepts the update.

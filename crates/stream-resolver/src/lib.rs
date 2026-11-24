@@ -15,8 +15,45 @@ use ytdlp_tool::FetchRequest;
 pub mod parse;
 pub mod plan;
 
-pub use parse::parse_video;
+pub use parse::{parse_playlist, parse_video};
 pub use plan::plan;
+
+/// The resolved document for a URL.
+#[derive(Debug, Clone)]
+pub enum ResolvedDocument {
+    /// A single playable media source.
+    Video(MediaSource),
+    /// A playlist with entries to be expanded into queue items.
+    Playlist(ResolvedPlaylist),
+}
+
+/// A playlist resolved from a URL.
+#[derive(Debug, Clone)]
+pub struct ResolvedPlaylist {
+    /// Playlist id.
+    pub id: String,
+    /// Playlist title.
+    pub title: String,
+    /// Playlist webpage URL.
+    pub url: Option<String>,
+    /// Entries in playlist order.
+    pub entries: Vec<ResolvedPlaylistEntry>,
+}
+
+/// One entry in a resolved playlist.
+#[derive(Debug, Clone)]
+pub struct ResolvedPlaylistEntry {
+    /// Video id.
+    pub id: String,
+    /// Human readable title.
+    pub title: String,
+    /// URL that can be resolved/queued.
+    pub url: String,
+    /// Thumbnail URL.
+    pub thumbnail: Option<String>,
+    /// Uploader/channel name.
+    pub uploader: Option<String>,
+}
 
 /// Everything that can go wrong while resolving a URL.
 #[derive(Debug)]
@@ -207,12 +244,42 @@ impl Resolver {
     }
 
     /// Resolves a URL into a [`MediaSource`], stopping when `cancel` is set.
+    ///
+    /// When the URL resolves to a playlist, the first playable entry is resolved.
     pub async fn resolve_with_cancel(
         &self,
         url: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<MediaSource, Error> {
+        match self.resolve_document_with_cancel(url, cancel.clone(), pid.clone()).await? {
+            ResolvedDocument::Video(source) => Ok(source),
+            ResolvedDocument::Playlist(playlist) => {
+                for entry in playlist.entries {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(Error::Cancelled);
+                    }
+                    match self
+                        .resolve_document_with_cancel(&entry.url, cancel.clone(), pid.clone())
+                        .await
+                    {
+                        Ok(ResolvedDocument::Video(source)) => return Ok(source),
+                        Ok(ResolvedDocument::Playlist(_)) | Err(Error::Empty) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(Error::Empty)
+            }
+        }
+    }
+
+    /// Resolves a URL into a document, stopping when `cancel` is set.
+    pub async fn resolve_document_with_cancel(
+        &self,
+        url: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) -> Result<ResolvedDocument, Error> {
         let mut cookies = Vec::new();
         if let Some(service) = Service::from_url(url)
             && let Some(path) = self.cookies.get(&service)
@@ -230,7 +297,14 @@ impl Resolver {
 
         let result =
             ytdlp_tool::fetch_with_cancel(request, cancel, pid).await.map_err(map_tool_error)?;
-        parse::parse_video(result.video)
+        match result.document {
+            ytdlp_tool::FetchDocument::Video(video) => {
+                parse::parse_video(*video).map(ResolvedDocument::Video)
+            }
+            ytdlp_tool::FetchDocument::Playlist(playlist) => {
+                Ok(ResolvedDocument::Playlist(parse::parse_playlist(*playlist, url)))
+            }
+        }
     }
 }
 

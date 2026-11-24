@@ -8,6 +8,8 @@ export component PendingDialog inherits Rectangle {
     in property <image> pending-thumbnail;
     // Whether a user playlist is the active playlist rather than the queue.
     in property <bool> in-playlist: false;
+    in property <bool> pending-is-playlist: false;
+    in property <int> pending-playlist-count: 0;
     in property <[PlaylistItem]> playlists: [];
     in-out property <bool> pending-open: false;
     callback pending-play-requested();
@@ -15,6 +17,10 @@ export component PendingDialog inherits Rectangle {
     callback pending-queue-next-requested();
     callback pending-add-to-playlist(string);
     callback pending-add-to-new-playlist();
+    callback pending-play-playlist-requested();
+    callback pending-play-playlist-new-requested();
+    callback pending-append-playlist(string);
+    callback pending-append-playlist-new();
     callback pending-dismissed();
 
     private property <bool> options-open: false;
@@ -101,7 +107,7 @@ export component PendingDialog inherits Rectangle {
             }
 
             Text {
-                text: "What do you want to do with this video?";
+                text: root.pending-is-playlist ? "What do you want to do with this playlist?" : "What do you want to do with this video?";
                 color: Theme.muted;
                 font-size: 12px;
                 vertical-alignment: center;
@@ -110,6 +116,65 @@ export component PendingDialog inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 alignment: end;
+
+                if root.pending-is-playlist: split-button-playlist := Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.accent;
+                    clip: true;
+                    background: Theme.accent;
+
+                    HorizontalLayout {
+                        spacing: 0px;
+
+                        Rectangle {
+                            width: 130px;
+                            background: left-playlist-touch.pressed ? #5a9bf5 : (left-playlist-touch.has-hover ? #5a9bf5 : Theme.accent);
+
+                            Text {
+                                text: "Play Playlist";
+                                color: Theme.on-accent;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+
+                            left-playlist-touch := TouchArea {
+                                clicked => {
+                                    root.options-open = false;
+                                    root.pending-open = false;
+                                    root.pending-play-playlist-requested();
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            width: 1px;
+                            background: #ffffff33;
+                        }
+
+                        Rectangle {
+                            width: 34px;
+                            background: right-playlist-touch.pressed ? #5a9bf5 : (right-playlist-touch.has-hover ? #5a9bf5 : Theme.accent);
+
+                            MoreIcon {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                size: 18px;
+                                ink: Theme.on-accent;
+                            }
+
+                            right-playlist-touch := TouchArea {
+                                clicked => {
+                                    root.menu-anchor-x = split-button-playlist.absolute-position.x - pending-panel.absolute-position.x;
+                                    root.menu-anchor-y = split-button-playlist.absolute-position.y - pending-panel.absolute-position.y + split-button-playlist.height + 2px;
+                                    root.options-open = !root.options-open;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 split-button := Rectangle {
                     height: 34px;
@@ -138,8 +203,6 @@ export component PendingDialog inherits Rectangle {
                                 clicked => {
                                     root.options-open = false;
                                     if root.in-playlist {
-                                        // On a user playlist the button asks
-                                        // where the item should go.
                                         root.picker-open = true;
                                     } else {
                                         root.pending-open = false;
@@ -176,7 +239,7 @@ export component PendingDialog inherits Rectangle {
                     }
                 }
 
-                FlatButton {
+                if !root.pending-is-playlist: FlatButton {
                     width: 110px;
                     height: 34px;
                     label: "Play now";
@@ -219,7 +282,7 @@ export component PendingDialog inherits Rectangle {
                     padding: 4px;
                     spacing: 2px;
 
-                    Rectangle {
+                    if !root.pending-is-playlist: Rectangle {
                         height: 32px;
                         border-radius: 4px;
                         background: play-next-touch.has-hover ? Theme.elevated : transparent;
@@ -246,7 +309,7 @@ export component PendingDialog inherits Rectangle {
                         }
                     }
 
-                    Rectangle {
+                    if !root.pending-is-playlist: Rectangle {
                         height: 32px;
                         border-radius: 4px;
                         background: add-playlist-touch.has-hover ? Theme.elevated : transparent;
@@ -265,6 +328,32 @@ export component PendingDialog inherits Rectangle {
                         }
 
                         add-playlist-touch := TouchArea {
+                            clicked => {
+                                root.options-open = false;
+                                root.picker-open = true;
+                            }
+                        }
+                    }
+
+                    if root.pending-is-playlist: Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: append-playlist-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: start;
+
+                            Text {
+                                text: "Append to Playlist";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        append-playlist-touch := TouchArea {
                             clicked => {
                                 root.options-open = false;
                                 root.picker-open = true;
@@ -346,7 +435,11 @@ export component PendingDialog inherits Rectangle {
                                 picker-touch := TouchArea {
                                     clicked => {
                                         root.picker-open = false;
-                                        root.pending-add-to-playlist(playlist.id);
+                                        if root.pending-is-playlist {
+                                            root.pending-append-playlist(playlist.id);
+                                        } else {
+                                            root.pending-add-to-playlist(playlist.id);
+                                        }
                                     }
                                 }
                             }
@@ -355,11 +448,15 @@ export component PendingDialog inherits Rectangle {
 
                     FlatButton {
                         height: 32px;
-                        label: "Add to New Playlist";
+                        label: root.pending-is-playlist ? "Append to New Playlist" : "Add to New Playlist";
                         primary: true;
                         clicked => {
                             root.picker-open = false;
-                            root.pending-add-to-new-playlist();
+                            if root.pending-is-playlist {
+                                root.pending-append-playlist-new();
+                            } else {
+                                root.pending-add-to-new-playlist();
+                            }
                         }
                     }
 

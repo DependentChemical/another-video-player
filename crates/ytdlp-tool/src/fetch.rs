@@ -25,8 +25,17 @@ pub struct FetchRequest {
 /// Metadata returned from `yt-dlp`.
 #[derive(Debug, Clone)]
 pub struct FetchResult {
-    /// The parsed `yt-dlp` video metadata.
-    pub video: yt_dlp::model::Video,
+    /// The parsed `yt-dlp` document.
+    pub document: FetchDocument,
+}
+
+/// The document `yt-dlp` returned for one URL.
+#[derive(Debug, Clone)]
+pub enum FetchDocument {
+    /// A single video or streamable media.
+    Video(Box<yt_dlp::model::Video>),
+    /// A playlist containing entries.
+    Playlist(Box<yt_dlp::model::playlist::Playlist>),
 }
 
 /// Resolves a URL through the managed `yt-dlp` process.
@@ -60,13 +69,20 @@ pub async fn fetch_with_cancel(
     .map_err(|error| Error::YtDlp(format!("yt-dlp task failed: {error}")))?;
 
     match result {
-        Ok(video) => {
-            app_logging::notice(format!(
-                "resolved url with yt-dlp: url={url} title=\"{}\" formats={}",
-                video.title,
-                video.formats.len()
-            ));
-            Ok(FetchResult { video })
+        Ok(document) => {
+            match &document {
+                FetchDocument::Video(video) => app_logging::notice(format!(
+                    "resolved url with yt-dlp: url={url} title=\"{}\" formats={}",
+                    video.title,
+                    video.formats.len()
+                )),
+                FetchDocument::Playlist(playlist) => app_logging::notice(format!(
+                    "resolved playlist with yt-dlp: url={url} title=\"{}\" entries={}",
+                    playlist.title,
+                    playlist.entries.len()
+                )),
+            }
+            Ok(FetchResult { document })
         }
         Err(error) => {
             app_logging::error(format!("yt-dlp failed to resolve url: url={url} error={error}"));
@@ -123,7 +139,7 @@ fn run_fetch(
     cancel: &AtomicBool,
     pid: &AtomicU32,
     budget: Budget,
-) -> Result<yt_dlp::model::Video, Error> {
+) -> Result<FetchDocument, Error> {
     // A request that is cancelled before it starts never spawns a process,
     // and a request whose budget is already gone is refused instead of
     // starting a process that would be killed right away.
@@ -246,7 +262,7 @@ fn run_fetch(
 
     let value = parse_document(&stdout)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
-    deserialize_video_lenient(value)
+    deserialize_document_lenient(value)
         .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
 }
 
@@ -369,30 +385,52 @@ fn dummy_ffmpeg_path(output_dir: &Path) -> PathBuf {
 /// Maximum number of repair passes before giving up.
 const MAX_MISSING_FIELD_REPAIRS: usize = 32;
 
-/// Parses `yt-dlp` video metadata, tolerating extractors that omit fields the
-/// `yt-dlp` model marks as required.
-///
-/// Extractors from any source occasionally return metadata without fields the
-/// model needs, so a missing-field error triggers a retry with the field
-/// filled in; the next error's missing-field name is extracted and repaired
-/// in turn, until the document parses or a real type error surfaces.
-fn deserialize_video_lenient(
+/// Parses `yt-dlp` metadata, tolerating missing fields in both video and
+/// playlist documents.
+fn deserialize_document_lenient(
     value: serde_json::Value,
-) -> Result<yt_dlp::model::Video, serde_json::Error> {
-    let mut value = value;
+) -> Result<FetchDocument, serde_json::Error> {
+    if is_playlist_document(&value) {
+        let playlist = deserialize_lenient::<yt_dlp::model::playlist::Playlist>(value)?;
+        Ok(FetchDocument::Playlist(Box::new(playlist)))
+    } else {
+        let video = deserialize_lenient::<yt_dlp::model::Video>(value)?;
+        Ok(FetchDocument::Video(Box::new(video)))
+    }
+}
+
+/// Whether the JSON document describes a playlist.
+fn is_playlist_document(value: &serde_json::Value) -> bool {
+    value
+        .get("_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("playlist"))
+        || value.get("entries").is_some_and(serde_json::Value::is_array)
+}
+
+/// Parses metadata, tolerating extractors that omit fields the model marks as
+/// required.
+///
+/// A missing-field error triggers a retry with the field filled in; the next
+/// error's missing-field name is extracted and repaired in turn, until the
+/// document parses or a real type error surfaces.
+fn deserialize_lenient<T>(mut value: serde_json::Value) -> Result<T, serde_json::Error>
+where
+    T: serde::de::DeserializeOwned,
+{
     for _ in 0..MAX_MISSING_FIELD_REPAIRS {
-        let error = match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
-            Ok(video) => return Ok(video),
+        let error = match serde_json::from_value::<T>(value.clone()) {
+            Ok(parsed) => return Ok(parsed),
             Err(error) => error,
         };
         let Some(field) = missing_field_name(&error) else {
             return Err(error);
         };
-        if !try_fills(&mut value, &field) {
+        if !try_fills::<T>(&mut value, &field) {
             return Err(error);
         }
     }
-    serde_json::from_value::<yt_dlp::model::Video>(value)
+    serde_json::from_value::<T>(value)
 }
 
 /// Extracts the field name from a serde missing-field error message.
@@ -412,12 +450,15 @@ fn missing_field_name(error: &serde_json::Error) -> Option<String> {
 /// fills that break the tree (structs that absorb unknown keys with other
 /// types, the flattened `HttpHeaders.extra` map, for example) are undone and
 /// the next lacking object is tried. Returns whether any fill was kept.
-fn try_fills(value: &mut serde_json::Value, field: &str) -> bool {
+fn try_fills<T>(value: &mut serde_json::Value, field: &str) -> bool
+where
+    T: serde::de::DeserializeOwned,
+{
     let mut kept = false;
     for path in lacking_paths(value, field) {
         let default = missing_field_default(field);
         set_lacking(value, &path, field, default);
-        match serde_json::from_value::<yt_dlp::model::Video>(value.clone()) {
+        match serde_json::from_value::<T>(value.clone()) {
             Ok(_) => return true,
             Err(error) if missing_field_name(&error).is_some() => kept = true,
             Err(_) => remove_at(value, &path, field),
@@ -626,19 +667,24 @@ mod tests {
 
     #[test]
     fn parses_well_formed_metadata() {
-        let video = deserialize_video_lenient(well_formed_video()).expect("metadata parses");
-        assert_eq!(video.id, "abc123");
-        assert_eq!(video.title, "Some video");
-        assert_eq!(video.formats.len(), 1);
+        let document = deserialize_document_lenient(well_formed_video()).expect("metadata parses");
+        match document {
+            FetchDocument::Video(video) => {
+                assert_eq!(video.id, "abc123");
+                assert_eq!(video.title, "Some video");
+                assert_eq!(video.formats.len(), 1);
+            }
+            FetchDocument::Playlist(_) => panic!("expected video document"),
+        }
     }
 
     #[test]
     fn fills_missing_thumbnail_preference() {
-        // Extractors of other sources omit `preference` on thumbnail entries.
         let mut video = well_formed_video();
         video["thumbnails"] = json!([{ "id": "t1", "url": "https://example.invalid/t1.jpg" }]);
 
-        let parsed = deserialize_video_lenient(video).expect("metadata parses");
+        let document = deserialize_document_lenient(video).expect("metadata parses");
+        let FetchDocument::Video(parsed) = document else { panic!("expected video") };
         assert_eq!(parsed.thumbnails[0].preference, 0);
     }
 
@@ -658,7 +704,8 @@ mod tests {
             object.remove(key);
         }
 
-        let parsed = deserialize_video_lenient(video).expect("metadata parses");
+        let document = deserialize_document_lenient(video).expect("metadata parses");
+        let FetchDocument::Video(parsed) = document else { panic!("expected video") };
         assert_eq!(parsed.id, "");
         assert_eq!(parsed.age_limit, 0);
         assert!(parsed.live_status.is_empty());
@@ -666,7 +713,24 @@ mod tests {
 
     #[test]
     fn rejects_documents_of_the_wrong_shape() {
-        assert!(deserialize_video_lenient(json!({ "id": 1 })).is_err());
+        assert!(deserialize_document_lenient(json!({ "id": 1 })).is_err());
+    }
+
+    #[test]
+    fn parses_playlist_documents() {
+        let playlist = json!({
+            "_type": "playlist",
+            "id": "PL1",
+            "title": "Playlist",
+            "entries": [
+                { "id": "a", "title": "A", "url": "https://example.com/a" },
+                { "id": "b", "title": "B", "url": "https://example.com/b" }
+            ]
+        });
+        let document = deserialize_document_lenient(playlist).expect("playlist parses");
+        let FetchDocument::Playlist(parsed) = document else { panic!("expected playlist") };
+        assert_eq!(parsed.id, "PL1");
+        assert_eq!(parsed.entries.len(), 2);
     }
 
     #[test]
@@ -724,8 +788,10 @@ mod tests {
         let text = serde_json::to_string(&video).expect("video serializes");
         assert!(text.len() > MAX_OUTPUT_BYTES);
 
-        let parsed = deserialize_video_lenient(parse_document(&text).expect("document parses"));
-        assert_eq!(parsed.expect("metadata parses").title.len(), MAX_OUTPUT_BYTES + 1024);
+        let parsed = deserialize_document_lenient(parse_document(&text).expect("document parses"))
+            .expect("metadata parses");
+        let FetchDocument::Video(video) = parsed else { panic!("expected video") };
+        assert_eq!(video.title.len(), MAX_OUTPUT_BYTES + 1024);
     }
 
     #[test]

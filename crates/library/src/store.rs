@@ -260,6 +260,19 @@ impl Queue {
             .map_err(Error::from)
     }
 
+    /// Every entry of a playlist, in play order.
+    pub fn entries_for_playlist(&self, playlist_id: &str) -> Result<Vec<QueueEntry>, Error> {
+        self.db
+            .with_connection(|connection| {
+                let table = table_for_playlist(connection, playlist_id)?;
+                let mut statement = connection
+                    .prepare(&format!("SELECT {COLUMNS} FROM {table} ORDER BY position"))?;
+                let rows = statement.query_map([], entry_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(Error::from)
+    }
+
     /// The entry that is playing now, if the active playlist names one.
     pub fn current(&self) -> Result<Option<QueueEntry>, Error> {
         self.db
@@ -542,6 +555,26 @@ impl Queue {
         self.db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
+                connection.execute(
+                    &format!("UPDATE {table} SET thumbnail = ?2 WHERE position = ?1"),
+                    params![position, thumbnail],
+                )?;
+                touch_current(connection, &table)?;
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
+
+    /// Replaces the thumbnail of an entry in a specific playlist.
+    pub fn set_thumbnail_for_playlist(
+        &self,
+        playlist_id: &str,
+        position: i64,
+        thumbnail: Option<&str>,
+    ) -> Result<(), Error> {
+        self.db
+            .with_connection(|connection| {
+                let table = table_for_playlist(connection, playlist_id)?;
                 connection.execute(
                     &format!("UPDATE {table} SET thumbnail = ?2 WHERE position = ?1"),
                     params![position, thumbnail],
@@ -1115,6 +1148,15 @@ fn active_table(connection: &Connection) -> rusqlite::Result<String> {
     Ok(table
         .filter(|table| is_safe_table_name(table))
         .unwrap_or_else(|| ACTIVE_QUEUE_TABLE.to_string()))
+}
+
+/// The table for any playlist id, including the built-in active queue.
+fn table_for_playlist(connection: &Connection, playlist_id: &str) -> rusqlite::Result<String> {
+    let table = playlist_table_in(connection, playlist_id)?;
+    if playlist_id != ACTIVE_QUEUE_ID {
+        create_queue_table(connection, &table)?;
+    }
+    Ok(table)
 }
 
 /// The database id of the entry that is current in `table`.
