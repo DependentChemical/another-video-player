@@ -288,12 +288,12 @@ impl Resolver {
             cookies.push((service.name().to_string(), path.clone()));
         }
 
-        let request = FetchRequest {
-            tool: Some(self.tool.clone()),
-            url: url.to_string(),
-            cookies,
-            args: self.args_for(url),
-        };
+        let mut args = self.args_for(url);
+        if is_playlist_url(url) && !args.iter().any(|arg| arg == "--flat-playlist") {
+            args.push("--flat-playlist".to_string());
+        }
+        let request =
+            FetchRequest { tool: Some(self.tool.clone()), url: url.to_string(), cookies, args };
 
         let result =
             ytdlp_tool::fetch_with_cancel(request, cancel, pid).await.map_err(map_tool_error)?;
@@ -306,6 +306,24 @@ impl Resolver {
             }
         }
     }
+}
+
+fn is_playlist_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let is_youtube = host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com");
+    if !is_youtube {
+        return parsed.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("list"));
+    }
+    parsed.path().eq_ignore_ascii_case("/playlist")
+        || parsed.query_pairs().any(|(k, _)| k.eq_ignore_ascii_case("list"))
 }
 
 fn map_tool_error(error: ytdlp_tool::Error) -> Error {
@@ -431,5 +449,12 @@ mod tests {
             }
             other => panic!("expected a tool error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn playlist_urls_are_detected() {
+        assert!(super::is_playlist_url("https://www.youtube.com/playlist?list=PL123"));
+        assert!(super::is_playlist_url("https://www.youtube.com/watch?v=abc&list=PL123"));
+        assert!(!super::is_playlist_url("https://www.youtube.com/watch?v=abc"));
     }
 }

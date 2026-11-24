@@ -388,14 +388,43 @@ const MAX_MISSING_FIELD_REPAIRS: usize = 32;
 /// Parses `yt-dlp` metadata, tolerating missing fields in both video and
 /// playlist documents.
 fn deserialize_document_lenient(
-    value: serde_json::Value,
+    mut value: serde_json::Value,
 ) -> Result<FetchDocument, serde_json::Error> {
     if is_playlist_document(&value) {
+        normalize_playlist_thumbnails(&mut value);
         let playlist = deserialize_lenient::<yt_dlp::model::playlist::Playlist>(value)?;
         Ok(FetchDocument::Playlist(Box::new(playlist)))
     } else {
         let video = deserialize_lenient::<yt_dlp::model::Video>(value)?;
         Ok(FetchDocument::Video(Box::new(video)))
+    }
+}
+
+fn normalize_playlist_thumbnails(value: &mut serde_json::Value) {
+    let Some(entries) = value.get_mut("entries").and_then(serde_json::Value::as_array_mut) else {
+        return;
+    };
+    for entry in entries {
+        let Some(obj) = entry.as_object_mut() else { continue };
+        let has_thumbnail = obj
+            .get("thumbnail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if has_thumbnail {
+            continue;
+        }
+        let thumb = obj.get("thumbnails").and_then(serde_json::Value::as_array).and_then(|arr| {
+            arr.iter().rev().find_map(|t| {
+                t.get("url")
+                    .or_else(|| t.get("src"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            })
+        });
+        if let Some(thumb) = thumb {
+            obj.insert("thumbnail".to_string(), serde_json::Value::String(thumb));
+        }
     }
 }
 
@@ -731,6 +760,29 @@ mod tests {
         let FetchDocument::Playlist(parsed) = document else { panic!("expected playlist") };
         assert_eq!(parsed.id, "PL1");
         assert_eq!(parsed.entries.len(), 2);
+    }
+
+    #[test]
+    fn flat_playlist_entry_thumbnail_is_normalized() {
+        let playlist = json!({
+            "_type": "playlist",
+            "id": "PL1",
+            "title": "Playlist",
+            "entries": [
+                {
+                    "id": "a",
+                    "title": "A",
+                    "url": "https://example.com/a",
+                    "thumbnails": [
+                        { "url": "https://img/small.jpg", "width": 120 },
+                        { "url": "https://img/large.jpg", "width": 480 }
+                    ]
+                }
+            ]
+        });
+        let document = deserialize_document_lenient(playlist).expect("playlist parses");
+        let FetchDocument::Playlist(parsed) = document else { panic!("expected playlist") };
+        assert_eq!(parsed.entries[0].thumbnail.as_deref(), Some("https://img/large.jpg"));
     }
 
     #[test]
