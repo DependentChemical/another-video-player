@@ -17,9 +17,11 @@ it applies automatically; do not ask whether to run it.
    the first item and do not leave an item for later.
 2. **Run the full checks.** Run the verification checklist below after the
    edits, fix every failure, and run it again until all four checks pass.
-3. **Bump the patch version.** Only after the checks pass, increase
-   `[workspace.package].version` in the root `Cargo.toml` by one patch
-   release.
+3. **Bump versions.** Only after the checks pass, increment the patch version:
+   - **Always** bump `app-core` (the main application version, rendered by the executable).
+   - **Only** bump other crates that were actually edited/touched in this change.
+   - Each crate has its own `version` in its `Cargo.toml` (no `version.workspace`).
+   - All crates start at `0.4.80`.
 4. **Commit.** Commit the change with a message that says what was done.
 5. **Push to `dev`.** Push the commit to the `dev` branch.
 6. **Write the final technical report.** The report is the final output. For
@@ -41,7 +43,7 @@ To release, first confirm the working tree is clean and `dev` is the current
 branch. Compare `dev` with `main` from their merge base and collect the commit
 subjects since the previous merge. Use those subjects to prepare a concise,
 grouped changelog; do not infer additional changes from diffs or other notes.
-Check that `[workspace.package].version` in the root `Cargo.toml` on `dev` is
+Check that `app-core`'s `version` in `crates/app-core/Cargo.toml` on `dev` is
 higher than the version on `main`, and that the corresponding `v<version>` tag
 has not already been released.
 
