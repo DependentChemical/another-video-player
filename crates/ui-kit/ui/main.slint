@@ -90,6 +90,7 @@ export component MainWindow inherits Window {
     in property <string> pending-title: "";
     in property <image> pending-thumbnail;
     in property <bool> pending-is-playlist: false;
+    in property <bool> pending-has-selected-video: false;
     in property <int> pending-playlist-count: 0;
     in-out property <bool> update-open: false;
     in property <string> update-title: "Update available";
@@ -147,6 +148,7 @@ export component MainWindow inherits Window {
     callback pending-play-requested();
     callback pending-queue-requested();
     callback pending-queue-next-requested();
+    callback pending-play-selected-requested();
     callback pending-dismissed();
     callback update-accepted();
     callback update-dismissed();
@@ -398,12 +400,14 @@ export component MainWindow inherits Window {
         pending-thumbnail: root.pending-thumbnail;
         in-playlist: root.pending-in-playlist;
         pending-is-playlist: root.pending-is-playlist;
+        pending-has-selected-video: root.pending-has-selected-video;
         pending-playlist-count: root.pending-playlist-count;
         playlists: root.playlist-items;
         pending-open <=> root.pending-open;
         pending-play-requested => { root.pending-play-requested(); }
         pending-queue-requested => { root.pending-queue-requested(); }
         pending-queue-next-requested => { root.pending-queue-next-requested(); }
+        pending-play-selected-requested => { root.pending-play-selected-requested(); }
         pending-add-to-playlist(id) => { root.pending-add-to-playlist(id); }
         pending-add-to-new-playlist => { root.pending-add-to-new-playlist(); }
         pending-play-playlist-requested => { root.pending-play-playlist-requested(); }

@@ -232,6 +232,8 @@ pub struct PendingPlaylist {
     pub thumbnail: Option<PathBuf>,
     /// URL of the video that should be selected after creating/playing playlist.
     pub selected_url: String,
+    /// Whether the submitted URL explicitly selected a video inside the playlist.
+    pub has_selected_video: bool,
     /// Resolved playlist entries.
     pub entries: Vec<PendingPlaylistEntry>,
     /// URL entry generation.
@@ -919,7 +921,8 @@ impl App {
                     })
                 }
                 Ok(stream_resolver::ResolvedDocument::Playlist(playlist)) => {
-                    let selected_url = Self::selected_playlist_url(&url, &playlist);
+                    let (selected_url, has_selected_video) =
+                        Self::selected_playlist_url(&url, &playlist);
                     let entries: Vec<PendingPlaylistEntry> = playlist
                         .entries
                         .iter()
@@ -938,7 +941,7 @@ impl App {
                     let thumb_id = cache.fetch(&selected_url, thumb_url).ok();
                     let thumbnail = thumb_id.as_deref().and_then(|id| cache.mid_path(id));
                     app_logging::notice(format!(
-                        "playlist url entry resolved: url={url} epoch={epoch} title=\"{}\" entries={}",
+                        "playlist url entry resolved: url={url} epoch={epoch} title=\"{}\" entries={} has_selected_video={has_selected_video}",
                         playlist.title,
                         entries.len()
                     ));
@@ -951,6 +954,7 @@ impl App {
                         },
                         thumbnail,
                         selected_url,
+                        has_selected_video,
                         entries,
                         epoch,
                     })
@@ -978,11 +982,12 @@ impl App {
 }
 
 impl App {
-    /// Picks the URL to play from a resolved playlist.
+    /// Picks the URL to play from a resolved playlist and reports whether the
+    /// submitted URL explicitly selected a video inside that playlist.
     fn selected_playlist_url(
         source_url: &str,
         playlist: &stream_resolver::ResolvedPlaylist,
-    ) -> String {
+    ) -> (String, bool) {
         if let Ok(parsed) = url::Url::parse(source_url) {
             let video = parsed
                 .query_pairs()
@@ -995,14 +1000,17 @@ impl App {
                     }) || entry.id == video
                 })
             {
-                return entry.url.clone();
+                return (entry.url.clone(), true);
             }
         }
-        playlist
-            .entries
-            .first()
-            .map(|entry| entry.url.clone())
-            .unwrap_or_else(|| source_url.to_string())
+        (
+            playlist
+                .entries
+                .first()
+                .map(|entry| entry.url.clone())
+                .unwrap_or_else(|| source_url.to_string()),
+            false,
+        )
     }
 
     /// Whether a resolved result for `url` still belongs to the active playback.
@@ -1281,6 +1289,110 @@ impl App {
             self.pending.lock().expect("the pending media is not poisoned").take()
         {
             app_logging::debug(format!("the pending video was dismissed: url={}", pending.url));
+        }
+    }
+
+    /// Returns the selected video from the pending playlist, if it has one.
+    pub fn pending_playlist_selected(&self) -> Option<PendingPlaylistEntry> {
+        let slot = self.pending_playlist.lock().expect("the pending playlist is not poisoned");
+        let pending = slot.as_ref()?;
+        if !pending.has_selected_video {
+            return None;
+        }
+        pending
+            .entries
+            .iter()
+            .find(|entry| entry.url == pending.selected_url)
+            .cloned()
+            .or_else(|| pending.entries.first().cloned())
+    }
+
+    /// Plays the selected video from a pending playlist as a standalone media.
+    pub fn play_pending_playlist_selected(&self) -> Option<String> {
+        let selected = self.pending_playlist_selected()?;
+        self.dismiss_pending_playlist();
+        Some(selected.url)
+    }
+
+    /// Appends the selected video from a pending playlist to the active queue.
+    pub fn queue_pending_playlist_selected(&self) -> bool {
+        self.queue_pending_playlist_selected_with(false)
+    }
+
+    /// Appends the selected video from a pending playlist next in the active queue.
+    pub fn queue_pending_playlist_selected_next(&self) -> bool {
+        self.queue_pending_playlist_selected_with(true)
+    }
+
+    fn queue_pending_playlist_selected_with(&self, next: bool) -> bool {
+        let Some(selected) = self.pending_playlist_selected() else {
+            return false;
+        };
+        let result = if next {
+            self.queue.push_next(
+                &selected.url,
+                &selected.title,
+                None,
+                selected.thumbnail_url.as_deref(),
+                selected.uploader.as_deref(),
+            )
+        } else {
+            self.queue.push(
+                &selected.url,
+                &selected.title,
+                None,
+                selected.thumbnail_url.as_deref(),
+                selected.uploader.as_deref(),
+            )
+        };
+        match result {
+            Ok(_) => {
+                self.dismiss_pending_playlist();
+                true
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "the active queue could not be written for {}: {error}",
+                    selected.url
+                ));
+                false
+            }
+        }
+    }
+
+    /// Adds the selected video from a pending playlist to `playlist_id`.
+    pub fn add_pending_playlist_selected_to_playlist(&self, playlist_id: &str) -> bool {
+        let Some(selected) = self.pending_playlist_selected() else {
+            return false;
+        };
+        let entry = library::QueueEntry {
+            id: 0,
+            position: 0,
+            url: selected.url.clone(),
+            title: selected.title.clone(),
+            thumbnail: None,
+            thumbnail_url: selected.thumbnail_url.clone(),
+            uploader: selected.uploader.clone(),
+            id_hash: String::new(),
+            current: false,
+            resolved_source: None,
+            resolved_at: None,
+            selected_video: None,
+            selected_audio: None,
+            selected_muxed: None,
+        };
+        match self.queue.push_entry_to_playlist(playlist_id, &entry) {
+            Ok(_) => {
+                self.dismiss_pending_playlist();
+                true
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "the pending playlist video could not be added to the playlist: url={} playlist_id={playlist_id} error={error}",
+                    selected.url
+                ));
+                false
+            }
         }
     }
 

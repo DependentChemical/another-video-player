@@ -697,6 +697,7 @@ impl PlayerUi {
         self.window.set_pending_title(display_title(title).as_ref().into());
         self.window.set_pending_in_playlist(in_playlist);
         self.window.set_pending_is_playlist(false);
+        self.window.set_pending_has_selected_video(false);
         self.window.set_pending_playlist_count(0);
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
@@ -710,6 +711,7 @@ impl PlayerUi {
         title: &str,
         thumbnail: Option<&Path>,
         in_playlist: bool,
+        has_selected_video: bool,
         count: usize,
         playlists: &[PlaylistListEntry],
     ) {
@@ -717,6 +719,7 @@ impl PlayerUi {
         self.window.set_pending_title(display_title(title).as_ref().into());
         self.window.set_pending_in_playlist(in_playlist);
         self.window.set_pending_is_playlist(true);
+        self.window.set_pending_has_selected_video(has_selected_video);
         self.window.set_pending_playlist_count(count as i32);
         let image =
             thumbnail.and_then(|path| slint::Image::load_from_path(path).ok()).unwrap_or_default();
@@ -1015,6 +1018,11 @@ impl PlayerUi {
     /// Called when the user asks to play the pending media next in the queue.
     pub fn on_pending_queue_next(&self, handler: impl Fn() + 'static) {
         self.window.on_pending_queue_next_requested(handler);
+    }
+
+    /// Called when the user asks to play the selected video from a playlist.
+    pub fn on_pending_play_selected(&self, handler: impl Fn() + 'static) {
+        self.window.on_pending_play_selected_requested(handler);
     }
 
     /// Called when the user dismisses the pending dialog.

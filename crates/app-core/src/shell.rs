@@ -231,19 +231,43 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let ui_for_pending = Rc::clone(&ui);
+            let loading = Rc::clone(&loading);
+            ui.on_pending_play_selected(move || {
+                if let Some(url) = app.play_pending_playlist_selected() {
+                    ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
+                    start_load(&app, &ui_for_pending, &loading, &url);
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let ui_for_pending = Rc::clone(&ui);
             ui.on_pending_queue(move || {
-                let _ = app.queue_pending();
-                ui_for_pending.set_url("");
-                ui_for_pending.blur_url();
+                let queued = if app.pending_playlist_selected().is_some() {
+                    app.queue_pending_playlist_selected()
+                } else {
+                    app.queue_pending()
+                };
+                if queued {
+                    ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
+                }
             });
         }
         {
             let app = Arc::clone(&app);
             let ui_for_pending = Rc::clone(&ui);
             ui.on_pending_queue_next(move || {
-                let _ = app.queue_pending_next();
-                ui_for_pending.set_url("");
-                ui_for_pending.blur_url();
+                let queued = if app.pending_playlist_selected().is_some() {
+                    app.queue_pending_playlist_selected_next()
+                } else {
+                    app.queue_pending_next()
+                };
+                if queued {
+                    ui_for_pending.set_url("");
+                    ui_for_pending.blur_url();
+                }
             });
         }
         {
@@ -370,14 +394,25 @@ impl Shell {
             ui.on_pending_add_to_playlist(move |playlist_id| {
                 let target = playlist_name(&app, playlist_id.as_str())
                     .unwrap_or_else(|| "the playlist".to_string());
-                playlist_action(
-                    &app,
-                    &ui_for_pending,
-                    &loading,
-                    PlaylistIntent::AddPending,
-                    playlist_id.as_str(),
-                    &target,
-                );
+                if app.pending_playlist_selected().is_some() {
+                    if app.add_pending_playlist_selected_to_playlist(playlist_id.as_str()) {
+                        ui_for_pending.hide_pending();
+                        ui_for_pending.set_url("");
+                        ui_for_pending.blur_url();
+                        ui_for_pending.show_toast(&format!("Added to {target}"));
+                    } else {
+                        ui_for_pending.show_toast("The video could not be added to the playlist");
+                    }
+                } else {
+                    playlist_action(
+                        &app,
+                        &ui_for_pending,
+                        &loading,
+                        PlaylistIntent::AddPending,
+                        playlist_id.as_str(),
+                        &target,
+                    );
+                }
             });
         }
         {
@@ -921,7 +956,12 @@ fn playlist_action(
             ui.show_queue(&queue_list(app), &queue_title(app), &playlist_list(app));
         }
         PlaylistIntent::AddPending => {
-            if app.add_pending_to_playlist(playlist_id) {
+            let added = if app.pending_playlist_selected().is_some() {
+                app.add_pending_playlist_selected_to_playlist(playlist_id)
+            } else {
+                app.add_pending_to_playlist(playlist_id)
+            };
+            if added {
                 ui.hide_pending();
                 ui.set_url("");
                 ui.blur_url();
@@ -1091,6 +1131,7 @@ fn tick(
                     &pending.title,
                     pending.thumbnail.as_deref(),
                     in_playlist,
+                    pending.has_selected_video,
                     pending.entries.len(),
                     &playlist_list(app),
                 );
