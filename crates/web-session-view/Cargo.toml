@@ -1,7 +1,7 @@
 [package]
 name = "web-session-view"
 description = "Runs the Flatline sign-in in a webview and exports the cookies yt-dlp needs."
-version.workspace = true
+version = "0.4.80"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

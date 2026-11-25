@@ -100,6 +100,7 @@ mod tests {
             uploader: None,
             duration: Some(10.0),
             thumbnail: None,
+            thumbnails: Vec::new(),
             webpage_url: None,
             extractor: None,
             is_live: false,

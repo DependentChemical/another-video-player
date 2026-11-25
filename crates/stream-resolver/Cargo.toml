@@ -1,7 +1,7 @@
 [package]
 name = "stream-resolver"
 description = "Resolves a media URL into a catalog of playable streams via yt-dlp."
-version.workspace = true
+version = "0.4.81"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

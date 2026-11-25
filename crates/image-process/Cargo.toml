@@ -1,6 +1,6 @@
 [package]
 name = "image-process"
-version.workspace = true
+version = "0.4.80"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -113,15 +113,19 @@ pub fn parse_video(video: yt_dlp::model::Video) -> Result<MediaSource, Error> {
         .filter(|v| !v.is_empty())
         .or_else(|| Some(video.extractor_info.extractor).filter(|v| !v.is_empty()));
 
+    let thumbnails = collect_video_thumbnails(video.thumbnail.as_deref(), &video.thumbnails);
+    let thumbnail = thumbnails.first().cloned().or(video.thumbnail);
+
     Ok(MediaSource {
         id: video.id,
         title: without_live_timestamp(&title).to_string(),
         uploader: video.uploader.or(video.channel),
         duration: video.duration.map(|d| d as f64),
-        thumbnail: video.thumbnail,
+        thumbnail,
         webpage_url: video.webpage_url,
         extractor,
         is_live,
+        thumbnails,
         video_streams,
         audio_streams,
     })
@@ -138,11 +142,14 @@ pub fn parse_playlist(
         .filter_map(|entry| {
             let url = normalize_playlist_entry_url(source_url, &entry.url, &entry.id)?;
             let title = if entry.title.trim().is_empty() { entry.id.clone() } else { entry.title };
+            let thumbnails = collect_thumbnail_urls(entry.thumbnail.as_deref(), std::iter::empty());
+            let thumbnail = thumbnails.first().cloned().or(entry.thumbnail);
             Some(ResolvedPlaylistEntry {
                 id: entry.id,
                 title,
                 url,
-                thumbnail: entry.thumbnail,
+                thumbnail,
+                thumbnails,
                 uploader: entry.uploader,
             })
         })
@@ -233,6 +240,35 @@ fn manifest_note(
     } else {
         note
     }
+}
+
+fn collect_video_thumbnails(
+    primary: Option<&str>,
+    thumbnails: &[yt_dlp::model::thumbnail::Thumbnail],
+) -> Vec<String> {
+    let mut sorted = thumbnails.iter().collect::<Vec<_>>();
+    sorted.sort_by_key(|thumbnail| {
+        (thumbnail.preference, thumbnail.width.unwrap_or(0) * thumbnail.height.unwrap_or(0))
+    });
+    collect_thumbnail_urls(
+        primary,
+        sorted.into_iter().rev().map(|thumbnail| thumbnail.url.as_str()),
+    )
+}
+
+fn collect_thumbnail_urls<'a>(
+    primary: Option<&'a str>,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut urls = Vec::new();
+    for url in primary.into_iter().chain(candidates) {
+        let trimmed = url.trim();
+        if trimmed.is_empty() || urls.iter().any(|existing: &String| existing == trimmed) {
+            continue;
+        }
+        urls.push(trimmed.to_string());
+    }
+    urls
 }
 
 fn without_live_timestamp(title: &str) -> &str {
@@ -432,5 +468,36 @@ mod tests {
         }))])))
         .unwrap_err();
         assert!(matches!(err, Error::Empty));
+    }
+
+    #[test]
+    fn video_thumbnail_candidates_are_collected() {
+        let mut video = base_video(serde_json::json!([format_json(serde_json::json!({
+            "format": "95 - 1280x720",
+            "format_id": "95",
+            "url": "https://example.com/manifest.m3u8",
+            "ext": "mp4",
+            "width": 1280,
+            "height": 720,
+            "vcodec": "avc1",
+            "acodec": "mp4a.40.2",
+            "protocol": "m3u8_native"
+        }))]));
+        video["thumbnail"] = serde_json::json!("https://img/maxresdefault.jpg");
+        video["thumbnails"] = serde_json::json!([
+            { "id": "small", "url": "https://img/hqdefault.jpg", "preference": 0, "width": 480, "height": 360 },
+            { "id": "large", "url": "https://img/maxresdefault.jpg", "preference": 1, "width": 1280, "height": 720 },
+            { "id": "medium", "url": "https://img/sddefault.jpg", "preference": 0, "width": 640, "height": 480 }
+        ]);
+        let source = parse(video).expect("video parses");
+        assert_eq!(source.thumbnail.as_deref(), Some("https://img/maxresdefault.jpg"));
+        assert_eq!(
+            source.thumbnails,
+            vec![
+                "https://img/maxresdefault.jpg".to_string(),
+                "https://img/sddefault.jpg".to_string(),
+                "https://img/hqdefault.jpg".to_string()
+            ]
+        );
     }
 }

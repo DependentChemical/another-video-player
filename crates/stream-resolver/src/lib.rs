@@ -51,6 +51,8 @@ pub struct ResolvedPlaylistEntry {
     pub url: String,
     /// Thumbnail URL.
     pub thumbnail: Option<String>,
+    /// Preview thumbnail URLs reported by the extractor, best first when possible.
+    pub thumbnails: Vec<String>,
     /// Uploader/channel name.
     pub uploader: Option<String>,
 }
