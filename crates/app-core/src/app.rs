@@ -1875,116 +1875,103 @@ impl App {
     /// Returns the small thumbnail of a cached thumbnail for the queue list.
     ///
     /// Only a thumbnail that is already on disk is returned; the image work
-    /// happens when the thumbnail is fetched, never on the event loop.
-    pub fn queue_thumbnail(&self, thumbnail: &str) -> Option<PathBuf> {
-        self.cache.small_path(thumbnail)
+    /// happens when the thumbnail is fetched, never on the event loop. When a
+    /// queue row has no thumbnail ref yet, the deterministic cache id derived
+    /// from the entry URL is used as a read-only fallback.
+    pub fn queue_thumbnail(&self, thumbnail: Option<&str>, url: &str) -> Option<PathBuf> {
+        let id = thumbnail
+            .filter(|value| library::ThumbnailCache::is_thumbnail_id(value))
+            .map(str::to_string)
+            .or_else(|| {
+                (!url.trim().is_empty()).then(|| library::ThumbnailCache::thumbnail_id_for(url))
+            });
+        id.as_deref().and_then(|id| self.cache.small_path(id))
     }
 
-    /// Removes orphaned thumbnail files and migrates any thumbnails that still
-    /// point at a direct file path into the new cache.
+    /// Maintains thumbnail cache files without mutating queue rows.
     ///
-    /// The work runs in the background. The start and end of the migration are
-    /// reported to the user through [`Message::ThumbnailMigrationStarted`] and
-    /// [`Message::ThumbnailMigrationFinished`].
+    /// The background worker may read queue entries to discover referenced
+    /// thumbnail IDs and candidate URLs, but it must never edit queue content.
+    /// Queue rows hold deterministic thumbnail references derived from the
+    /// video URL; thumbnail files and thumbnail URL metadata live in the cache.
     pub fn maintain_thumbnails(&self) {
-        let legacy = match self.queue.entries() {
-            Ok(entries) => entries
-                .into_iter()
-                .filter_map(|entry| {
-                    let thumbnail = entry.thumbnail.as_deref()?;
-                    if ThumbnailCache::is_thumbnail_id(thumbnail) {
-                        return None;
-                    }
-                    Some((entry.position, entry.url, thumbnail.to_string()))
-                })
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                app_logging::error(format!("the active queue could not be read: {error}"));
-                return;
-            }
-        };
-
         let cache = self.cache.clone();
         let queue = self.queue.clone();
-        let outbox = Arc::clone(&self.outbox);
         let runtime = self.runtime.handle().clone();
 
         runtime.spawn_blocking(move || {
-            // Files left behind that no cache row references are deleted first.
-            let _ = cache.prune_orphans();
+            app_logging::notice(
+                "thumbnail maintenance started: action=cache-only mode=background queue_write=false",
+            );
+            if let Err(error) = cache.prune_orphans() {
+                app_logging::warning(format!("thumbnail cache orphan prune failed: {error}"));
+            }
 
-            // A crash can leave the image files on disk without their cache row.
-            // Recreate any missing row the active queue still points at so the
-            // thumbnails are not downloaded again on the next start.
-            if let Ok(entries) = queue.entries() {
-                for entry in &entries {
-                    if let Some(id) = entry.thumbnail_id() {
-                        let _ = cache.repair_row(id);
-                    }
+            let entries = match queue.entries() {
+                Ok(entries) => entries,
+                Err(error) => {
+                    app_logging::error(format!(
+                        "thumbnail maintenance could not read the active queue: {error}"
+                    ));
+                    return;
                 }
-            }
+            };
 
-            if legacy.is_empty() {
-                let _ = cache.release_unreferenced_thumbnails();
-                return;
-            }
-
-            let count = legacy.len();
-            app_logging::notice(format!("migrating {count} legacy thumbnails into the cache"));
-            let _ = outbox
-                .lock()
-                .map(|sender| sender.send(Box::new(Message::ThumbnailMigrationStarted { count })));
-
-            let mut processed = 0;
-            for (position, url, path) in legacy {
-                let legacy_path = PathBuf::from(&path);
-                let id = ThumbnailCache::thumbnail_id_for(&url);
-                let result = if legacy_path.is_file() {
-                    cache.register_legacy(&url, &legacy_path)
-                } else {
-                    let _ = cache.repair_row(&id);
-                    Ok(id.clone())
-                };
-
-                match result {
-                    Ok(new_id) => {
-                        let has_files = cache.full_path(&new_id).is_some();
-                        let value = has_files.then_some(new_id.as_str());
-                        if let Err(error) = queue.set_thumbnail(position, value) {
-                            app_logging::warning(format!(
-                                "the active queue entry could not be updated: {error}"
-                            ));
-                        } else if !has_files {
+            let mut repaired = 0usize;
+            let mut remembered = 0usize;
+            for entry in &entries {
+                let id = entry
+                    .thumbnail_id()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| ThumbnailCache::thumbnail_id_for(&entry.url));
+                match cache.repair_row(&id) {
+                    Ok(true) => repaired += 1,
+                    Ok(false) => {}
+                    Err(error) => app_logging::warning(format!(
+                        "thumbnail maintenance could not repair cache row: id={id} url={} error={error}",
+                        entry.url
+                    )),
+                }
+                let candidates = entry_thumbnail_candidates(entry);
+                if !candidates.is_empty() {
+                    match cache.remember_thumbnail_urls(&entry.url, &candidates) {
+                        Ok(cache_id) => {
+                            remembered += 1;
                             app_logging::debug(format!(
-                                "legacy thumbnail missing after move; cleared local path for {url}"
+                                "thumbnail maintenance remembered candidates: queue_write=false id={cache_id} url={} candidates={} entry_id={} position={}",
+                                entry.url,
+                                candidates.len(),
+                                entry.id,
+                                entry.position
                             ));
                         }
-                    }
-                    Err(error) => {
-                        app_logging::warning(format!(
-                            "a legacy thumbnail could not be migrated: {error}"
-                        ));
+                        Err(error) => app_logging::warning(format!(
+                            "thumbnail maintenance could not store thumbnail candidates: url={} error={error}",
+                            entry.url
+                        )),
                     }
                 }
-                processed += 1;
             }
 
-            // Anything still not referenced by the queue is dropped.
-            let _ = cache.release_unreferenced_thumbnails();
-            app_logging::notice(format!("thumbnail migration finished: processed={processed}"));
-
-            let _ = outbox.lock().map(|sender| {
-                sender.send(Box::new(Message::ThumbnailMigrationFinished { processed }))
-            });
+            if let Err(error) = cache.release_unreferenced_thumbnails() {
+                app_logging::warning(format!(
+                    "thumbnail maintenance could not release unreferenced thumbnails: {error}"
+                ));
+            }
+            app_logging::notice(format!(
+                "thumbnail maintenance finished: queue_write=false entries={} repaired_rows={} remembered_candidate_sets={}",
+                entries.len(),
+                repaired,
+                remembered
+            ));
         });
     }
 
-    /// Kicks off a background pass that (re)builds the thumbnail cache.
+    /// Refreshes thumbnail cache files in the background without mutating queue rows.
     ///
-    /// While queue work exists, thumbnails are processed every 5 seconds.
-    /// When the queue is exhausted, the worker stays alive and scans playlists
-    /// every 15 seconds for missing/broken thumbnails, enqueuing repairs and
-    /// then returning to normal processing.
+    /// The worker reads queue/playlist entries and writes only thumbnail cache
+    /// files/metadata. Queue entries are never removed, reordered, or edited by
+    /// this process.
     pub fn refresh_queue_thumbnails(&self) {
         let cache = self.cache.clone();
         let queue = self.queue.clone();
@@ -2015,10 +2002,21 @@ impl App {
                         continue;
                     }
                 };
+
+                for entry in &entries {
+                    let candidates = entry_thumbnail_candidates(entry);
+                    if !candidates.is_empty() {
+                        let _ = cache.remember_thumbnail_urls(&entry.url, &candidates);
+                    }
+                }
+
                 let due = entries_needing_thumbnails(&entries, &cache);
                 if due.is_empty() {
                     let repaired = scan_playlist_thumbnails(&queue, &cache);
                     if repaired > 0 {
+                        app_logging::debug(format!(
+                            "thumbnail refresh repaired playlist cache files: count={repaired} queue_write=false"
+                        ));
                         announced = false;
                         continue;
                     }
@@ -2033,7 +2031,7 @@ impl App {
                 if !announced {
                     let count = due.len();
                     app_logging::notice(format!(
-                        "refreshing {count} queue thumbnails in the background"
+                        "refreshing {count} queue thumbnails in the background: queue_write=false"
                     ));
                     let _ = outbox.lock().map(|sender| {
                         sender.send(Box::new(Message::ThumbnailRefreshStarted { count }))
@@ -2042,7 +2040,7 @@ impl App {
                 }
 
                 let mut progressed = false;
-                for (id, position, url, thumbnail_url) in due {
+                for item in due {
                     let pass_epoch = ytdlp_epoch.load(Ordering::SeqCst);
                     let outcome = refresh_thumbnail_entry(
                         &cache,
@@ -2054,10 +2052,7 @@ impl App {
                         &ytdlp,
                         &task_handle,
                         &outbox,
-                        id,
-                        position,
-                        &url,
-                        &thumbnail_url,
+                        &item,
                     );
                     match outcome {
                         ThumbnailRefreshOutcome::Completed => {
@@ -2073,7 +2068,8 @@ impl App {
                         }
                         ThumbnailRefreshOutcome::RetryLater(error) => {
                             app_logging::warning(format!(
-                                "thumbnail refresh failed for {url}; retrying in 5s: {error}"
+                                "thumbnail refresh failed; retrying in 5s: queue_write=false id={} url={} position={} error={error}",
+                                item.id, item.url, item.position
                             ));
                             std::thread::sleep(THUMBNAIL_REFRESH_DELAY);
                         }
@@ -3605,25 +3601,50 @@ impl App {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Toast(text))));
     }
 }
+#[derive(Debug, Clone)]
+struct ThumbnailRefreshItem {
+    id: i64,
+    position: i64,
+    url: String,
+    candidates: Vec<String>,
+}
+
 /// The queue entries that lack a valid cached thumbnail but can still be
-/// downloaded, because the extractor reported a remote thumbnail URL.
-///
-/// Returns `(id, position, url, thumbnail_url)` tuples, in queue order.
+/// downloaded. Queue rows are read only; candidates come from queue metadata
+/// and/or thumbnail cache metadata.
 fn entries_needing_thumbnails(
     entries: &[library::QueueEntry],
     cache: &ThumbnailCache,
-) -> Vec<(i64, i64, String, String)> {
+) -> Vec<ThumbnailRefreshItem> {
     entries
         .iter()
         .filter_map(|entry| {
-            let candidates = entry_thumbnail_candidates(entry);
-            let thumbnail_url = candidates.first()?.clone();
-            let needed = match entry.thumbnail.as_deref() {
-                None => true,
-                Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
-                Some(_) => true,
-            };
-            needed.then_some((entry.id, entry.position, entry.url.clone(), thumbnail_url))
+            let id = entry
+                .thumbnail_id()
+                .map(str::to_string)
+                .unwrap_or_else(|| ThumbnailCache::thumbnail_id_for(&entry.url));
+            if cache.full_path(&id).is_some() {
+                return None;
+            }
+            let mut candidates = entry_thumbnail_candidates(entry);
+            if candidates.is_empty()
+                && let Ok(cached) = cache.thumbnail_urls(&id)
+            {
+                candidates = cached;
+            }
+            if candidates.is_empty() {
+                app_logging::debug(format!(
+                    "thumbnail refresh skipping entry with no candidates: queue_write=false entry_id={} position={} url={}",
+                    entry.id, entry.position, entry.url
+                ));
+                return None;
+            }
+            Some(ThumbnailRefreshItem {
+                id: entry.id,
+                position: entry.position,
+                url: entry.url.clone(),
+                candidates,
+            })
         })
         .collect()
 }
@@ -3648,50 +3669,62 @@ fn thumbnail_candidates(primary: Option<&str>, urls: &[String]) -> Vec<String> {
     out
 }
 
-fn url_title_hint(url: &str) -> String {
-    url.to_string()
-}
-
-/// Scans all playlists and repairs missing/broken thumbnail references.
+/// Scans playlists and repairs missing/broken thumbnail cache files.
+/// This reads queue rows and writes only thumbnail cache data.
 fn scan_playlist_thumbnails(queue: &Queue, cache: &ThumbnailCache) -> usize {
     let playlists = match queue.playlists() {
         Ok(playlists) => playlists,
-        Err(_) => return 0,
+        Err(error) => {
+            app_logging::warning(format!(
+                "thumbnail refresh could not read playlists for cache scan: {error}"
+            ));
+            return 0;
+        }
     };
     let mut repaired = 0usize;
     for playlist in playlists {
         let entries = match queue.entries_for_playlist(&playlist.id) {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(error) => {
+                app_logging::warning(format!(
+                    "thumbnail refresh could not read playlist for cache scan: playlist_id={} error={error}",
+                    playlist.id
+                ));
+                continue;
+            }
         };
         for entry in entries {
-            let candidates = entry_thumbnail_candidates(&entry);
+            let id = entry
+                .thumbnail_id()
+                .map(str::to_string)
+                .unwrap_or_else(|| ThumbnailCache::thumbnail_id_for(&entry.url));
+            if cache.full_path(&id).is_some() {
+                continue;
+            }
+            let mut candidates = entry_thumbnail_candidates(&entry);
+            if candidates.is_empty() {
+                candidates = cache.thumbnail_urls(&id).unwrap_or_default();
+            }
             if candidates.is_empty() {
                 continue;
             }
-            let broken = match entry.thumbnail.as_deref() {
-                None => true,
-                Some(id) if ThumbnailCache::is_thumbnail_id(id) => cache.full_path(id).is_none(),
-                Some(_) => true,
-            };
-            if !broken {
-                continue;
-            }
-            if let Ok((thumb_id, used_url)) = cache.fetch(&entry.url, &candidates) {
-                let _ =
-                    queue.set_thumbnail_for_playlist(&playlist.id, entry.position, Some(&thumb_id));
-                let _ = queue.update_details_for_playlist(
-                    &playlist.id,
-                    entry.position,
-                    &entry.title,
-                    Some(&thumb_id),
-                    Some(&used_url),
-                    &candidates,
-                    entry.uploader.as_deref(),
-                );
-                repaired += 1;
-                if repaired >= 8 {
-                    return repaired;
+            let _ = cache.remember_thumbnail_urls(&entry.url, &candidates);
+            match cache.fetch(&entry.url, &candidates) {
+                Ok((thumb_id, used_url)) => {
+                    app_logging::notice(format!(
+                        "thumbnail cache repaired: queue_write=false playlist_id={} entry_id={} position={} url={} thumb_id={} source_url={}",
+                        playlist.id, entry.id, entry.position, entry.url, thumb_id, used_url
+                    ));
+                    repaired += 1;
+                    if repaired >= 8 {
+                        return repaired;
+                    }
+                }
+                Err(error) => {
+                    app_logging::warning(format!(
+                        "thumbnail cache repair failed: queue_write=false playlist_id={} entry_id={} position={} url={} error={error}",
+                        playlist.id, entry.id, entry.position, entry.url
+                    ));
                 }
             }
         }
@@ -3700,10 +3733,6 @@ fn scan_playlist_thumbnails(queue: &Queue, cache: &ThumbnailCache) -> usize {
 }
 
 /// Removes the media a previous source buffered.
-///
-/// The player may still have a cache file open while it replaces the old
-/// media, and such a file cannot be removed on every platform. Those leftovers
-/// are picked up by the next load and by the cleanup at start-up.
 fn clear_stream_buffer(directory: &Path) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -3731,7 +3760,7 @@ enum ThumbnailRefreshOutcome {
 #[allow(clippy::too_many_arguments)]
 fn refresh_thumbnail_entry(
     cache: &ThumbnailCache,
-    queue: &Queue,
+    _queue: &Queue,
     resolver: &Arc<Mutex<Resolver>>,
     session: &Session,
     ytdlp_epoch: &Arc<AtomicU64>,
@@ -3739,10 +3768,7 @@ fn refresh_thumbnail_entry(
     ytdlp: &Arc<YtdlpControl>,
     task_handle: &tokio::runtime::Handle,
     outbox: &Arc<Mutex<Sender<Box<Message>>>>,
-    id: i64,
-    position: i64,
-    url: &str,
-    thumbnail_url: &str,
+    item: &ThumbnailRefreshItem,
 ) -> ThumbnailRefreshOutcome {
     loop {
         if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
@@ -3753,106 +3779,37 @@ fn refresh_thumbnail_entry(
             continue;
         };
 
-        app_logging::debug(format!("thumbnail refresh: downloading {url}"));
-        let mut direct_candidates = thumbnail_candidates(Some(thumbnail_url), &[]);
-        if direct_candidates.len() <= 1 {
-            ytdlp.finish_thumbnail(&cancel);
-            match refresh_thumbnail_entry_via_ytdlp(
-                cache,
-                queue,
-                resolver,
-                session,
-                ytdlp_epoch,
-                pass_epoch,
-                ytdlp,
-                task_handle,
-                outbox,
-                id,
-                position,
-                url,
-                "thumbnail refresh: expanding single legacy thumbnail source via yt-dlp",
-            ) {
-                ThumbnailRefreshViaYtdlp::Completed => return ThumbnailRefreshOutcome::Completed,
-                ThumbnailRefreshViaYtdlp::Preempted => return ThumbnailRefreshOutcome::Preempted,
-                ThumbnailRefreshViaYtdlp::RetryLater(message) => {
-                    direct_candidates = queue
-                        .entries()
-                        .ok()
-                        .and_then(|entries| entries.into_iter().find(|entry| entry.id == id))
-                        .map(|entry| entry_thumbnail_candidates(&entry))
-                        .unwrap_or_else(|| thumbnail_candidates(Some(thumbnail_url), &[]));
-                    if direct_candidates.len() <= 1 {
-                        return ThumbnailRefreshOutcome::RetryLater(message);
-                    }
-                }
+        app_logging::debug(format!(
+            "thumbnail refresh: downloading cache only: queue_write=false entry_id={} position={} url={} candidates={}",
+            item.id,
+            item.position,
+            item.url,
+            item.candidates.len()
+        ));
+        let mut candidates = item.candidates.clone();
+        let _ = cache.remember_thumbnail_urls(&item.url, &candidates);
+
+        let direct_result = cache.fetch(&item.url, &candidates);
+        match direct_result {
+            Ok((thumb_id, used_url)) => {
+                ytdlp.finish_thumbnail(&cancel);
+                app_logging::notice(format!(
+                    "thumbnail refresh cached: queue_write=false entry_id={} position={} url={} thumb_id={} source_url={}",
+                    item.id, item.position, item.url, thumb_id, used_url
+                ));
+                return ThumbnailRefreshOutcome::Completed;
             }
-            let Some((retry_cancel, _)) = ytdlp.try_begin_thumbnail() else {
-                return ThumbnailRefreshOutcome::Preempted;
-            };
-            if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
-                ytdlp.finish_thumbnail(&retry_cancel);
-                return ThumbnailRefreshOutcome::Preempted;
+            Err(error) => {
+                app_logging::warning(format!(
+                    "thumbnail refresh direct download failed: queue_write=false entry_id={} url={} error={error}",
+                    item.id, item.url
+                ));
             }
-            match cache.fetch(url, &direct_candidates) {
-                Ok((thumb_id, used_url)) => {
-                    if let Err(error) = queue.set_thumbnail(position, Some(&thumb_id)) {
-                        let message =
-                            format!("thumbnail refresh could not update queue entry: {error}");
-                        app_logging::warning(message.clone());
-                        ytdlp.finish_thumbnail(&retry_cancel);
-                        return ThumbnailRefreshOutcome::RetryLater(message);
-                    }
-                    let _ = queue.update_details(
-                        position,
-                        &url_title_hint(url),
-                        Some(&thumb_id),
-                        Some(&used_url),
-                        &direct_candidates,
-                        None,
-                    );
-                    ytdlp.finish_thumbnail(&retry_cancel);
-                    return ThumbnailRefreshOutcome::Completed;
-                }
-                Err(error) => {
-                    app_logging::warning(format!(
-                        "thumbnail refresh direct download failed for {url}: {error}; trying yt-dlp refresh"
-                    ));
-                    ytdlp.finish_thumbnail(&retry_cancel);
-                }
-            }
-        } else {
-            match cache.fetch(url, &direct_candidates) {
-                Ok((thumb_id, used_url)) => {
-                    if let Err(error) = queue.set_thumbnail(position, Some(&thumb_id)) {
-                        let message =
-                            format!("thumbnail refresh could not update queue entry: {error}");
-                        app_logging::warning(message.clone());
-                        ytdlp.finish_thumbnail(&cancel);
-                        return ThumbnailRefreshOutcome::RetryLater(message);
-                    }
-                    let _ = queue.update_details(
-                        position,
-                        &url_title_hint(url),
-                        Some(&thumb_id),
-                        Some(&used_url),
-                        &direct_candidates,
-                        None,
-                    );
-                    ytdlp.finish_thumbnail(&cancel);
-                    return ThumbnailRefreshOutcome::Completed;
-                }
-                Err(error) => {
-                    app_logging::warning(format!(
-                        "thumbnail refresh direct download failed for {url}: {error}; trying yt-dlp refresh"
-                    ));
-                }
-            }
-            ytdlp.finish_thumbnail(&cancel);
         }
+        ytdlp.finish_thumbnail(&cancel);
 
         match refresh_thumbnail_entry_via_ytdlp(
             cache,
-            queue,
             resolver,
             session,
             ytdlp_epoch,
@@ -3860,9 +3817,8 @@ fn refresh_thumbnail_entry(
             ytdlp,
             task_handle,
             outbox,
-            id,
-            position,
-            url,
+            item,
+            &mut candidates,
             "thumbnail refresh: resolving candidates via yt-dlp",
         ) {
             ThumbnailRefreshViaYtdlp::Completed => return ThumbnailRefreshOutcome::Completed,
@@ -3883,7 +3839,6 @@ enum ThumbnailRefreshViaYtdlp {
 #[allow(clippy::too_many_arguments)]
 fn refresh_thumbnail_entry_via_ytdlp(
     cache: &ThumbnailCache,
-    queue: &Queue,
     resolver: &Arc<Mutex<Resolver>>,
     session: &Session,
     ytdlp_epoch: &Arc<AtomicU64>,
@@ -3891,9 +3846,8 @@ fn refresh_thumbnail_entry_via_ytdlp(
     ytdlp: &Arc<YtdlpControl>,
     task_handle: &tokio::runtime::Handle,
     outbox: &Arc<Mutex<Sender<Box<Message>>>>,
-    id: i64,
-    position: i64,
-    url: &str,
+    item: &ThumbnailRefreshItem,
+    candidates: &mut Vec<String>,
     reason: &str,
 ) -> ThumbnailRefreshViaYtdlp {
     if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch {
@@ -3902,7 +3856,10 @@ fn refresh_thumbnail_entry_via_ytdlp(
     let Some((cancel, pid)) = ytdlp.try_begin_thumbnail() else {
         return ThumbnailRefreshViaYtdlp::Preempted;
     };
-    app_logging::debug(format!("{reason}: {url}"));
+    app_logging::debug(format!(
+        "{reason}: queue_write=false entry_id={} position={} url={}",
+        item.id, item.position, item.url
+    ));
 
     let sender = outbox.lock().expect("outbox poisoned").clone();
     let resolver = resolver.lock().expect("the resolver is not poisoned").clone();
@@ -3913,7 +3870,7 @@ fn refresh_thumbnail_entry_via_ytdlp(
         pass_epoch,
         &cancel,
         &pid,
-        url,
+        &item.url,
         &sender,
     ));
     ytdlp.finish_thumbnail(&cancel);
@@ -3923,84 +3880,46 @@ fn refresh_thumbnail_entry_via_ytdlp(
             if ytdlp_epoch.load(Ordering::SeqCst) != pass_epoch || cancel.load(Ordering::SeqCst) {
                 return ThumbnailRefreshViaYtdlp::Preempted;
             }
-            let candidates = thumbnail_candidates_for_source(&source);
-            if candidates.is_empty() {
+            let resolved_candidates = thumbnail_candidates_for_source(&source);
+            if resolved_candidates.is_empty() {
                 let message = "yt-dlp refresh returned no thumbnail URL".to_string();
-                app_logging::warning(format!("thumbnail refresh: {message} for {url}"));
+                app_logging::warning(format!(
+                    "thumbnail refresh: queue_write=false entry_id={} url={} {message}",
+                    item.id, item.url
+                ));
                 return ThumbnailRefreshViaYtdlp::RetryLater(message);
             }
-            let _ = queue.update_details(
-                position,
-                &source.title,
-                None,
-                candidates.first().map(String::as_str),
-                &candidates,
-                source.uploader.as_deref(),
-            );
-            match cache.fetch(url, &candidates) {
+            *candidates = resolved_candidates;
+            let _ = cache.remember_thumbnail_urls(&item.url, candidates);
+            match cache.fetch(&item.url, candidates) {
                 Ok((thumb_id, used_url)) => {
-                    if let Err(error) = queue.set_thumbnail(position, Some(&thumb_id)) {
-                        let message =
-                            format!("thumbnail refresh could not update queue entry: {error}");
-                        app_logging::warning(message.clone());
-                        return ThumbnailRefreshViaYtdlp::RetryLater(message);
-                    }
-                    let _ = queue.update_details(
-                        position,
-                        &source.title,
-                        Some(&thumb_id),
-                        Some(&used_url),
-                        &candidates,
-                        source.uploader.as_deref(),
-                    );
-                    app_logging::notice(format!("thumbnail refresh: recovered {url} via yt-dlp"));
+                    app_logging::notice(format!(
+                        "thumbnail refresh recovered via yt-dlp: queue_write=false entry_id={} position={} url={} thumb_id={} source_url={}",
+                        item.id, item.position, item.url, thumb_id, used_url
+                    ));
                     ThumbnailRefreshViaYtdlp::Completed
                 }
                 Err(error) => {
                     let message =
                         format!("thumbnail download after yt-dlp refresh failed: {error}");
-                    app_logging::warning(format!("thumbnail refresh failed for {url}: {message}"));
-                    skip_error_video(queue, ytdlp, &cancel, id, url, &message);
-                    ThumbnailRefreshViaYtdlp::Completed
+                    app_logging::warning(format!(
+                        "thumbnail refresh failed: queue_write=false entry_id={} url={} {message}",
+                        item.id, item.url
+                    ));
+                    ThumbnailRefreshViaYtdlp::RetryLater(message)
                 }
             }
         }
         Err(stream_resolver::Error::Cancelled) => ThumbnailRefreshViaYtdlp::Preempted,
         Err(error) => {
             let message = format!("yt-dlp re-resolve failed: {error}");
-            app_logging::warning(format!("thumbnail refresh failed for {url}: {message}"));
-            skip_error_video(queue, ytdlp, &cancel, id, url, &message);
-            ThumbnailRefreshViaYtdlp::Completed
+            app_logging::warning(format!(
+                "thumbnail refresh failed: queue_write=false entry_id={} url={} {message}",
+                item.id, item.url
+            ));
+            ThumbnailRefreshViaYtdlp::RetryLater(message)
         }
     }
-}
-
-/// Marks thumbnail refresh failure as terminal for the current queue.
-///
-/// After all thumbnail sources and network modes are exhausted the entry is
-/// removed; the queue will requeue or re-discover it on a later pass when
-/// appropriate.
-fn skip_error_video(
-    queue: &Queue,
-    ytdlp: &Arc<YtdlpControl>,
-    cancel: &Arc<AtomicBool>,
-    id: i64,
-    url: &str,
-    message: &str,
-) -> ThumbnailRefreshOutcome {
-    ytdlp.finish_thumbnail(cancel);
-    match queue.remove_entry(id) {
-        Ok(Some(_)) => app_logging::warning(format!(
-            "thumbnail refresh removed queue entry after exhausting sources for {url}: {message}"
-        )),
-        Ok(None) => app_logging::warning(format!(
-            "thumbnail refresh exhausted sources for missing queue entry {url}: {message}"
-        )),
-        Err(error) => app_logging::warning(format!(
-            "thumbnail refresh could not remove exhausted queue entry {url}: {message}; remove error: {error}"
-        )),
-    }
-    ThumbnailRefreshOutcome::Completed
 }
 
 /// The streams of a source, grouped for the source picker.
@@ -4855,12 +4774,12 @@ mod tests {
         ];
 
         let due = entries_needing_thumbnails(&entries, &cache);
-        let due_urls: Vec<_> = due.iter().map(|(_, _, url, _)| url.as_str()).collect();
+        let due_urls: Vec<_> = due.iter().map(|item| item.url.as_str()).collect();
         assert_eq!(due_urls, vec!["https://example.com/missing", "https://example.com/stale"]);
     }
 
     #[test]
-    fn skipping_an_error_video_removes_the_entry_after_exhaustion() {
+    fn thumbnail_refresh_failure_does_not_remove_queue_entry() {
         let queue = Queue::in_memory().expect("an in-memory queue opens");
         let entry = queue
             .push(
@@ -4873,17 +4792,12 @@ mod tests {
             )
             .expect("an entry is added");
 
-        let ytdlp =
-            Arc::new(YtdlpControl::new(YtDlp::new("yt-dlp", ytdlp_tool::ToolPaths::new("tools"))));
-        let (cancel, _pid) = ytdlp.try_begin_thumbnail().expect("the slot is free");
-
-        let outcome =
-            skip_error_video(&queue, &ytdlp, &cancel, entry.id, &entry.url, "404 not found");
-
-        assert!(matches!(outcome, ThumbnailRefreshOutcome::Completed));
-        let remaining = queue.entries().expect("the entries are read");
-        assert!(!remaining.iter().any(|other| other.id == entry.id));
-        assert!(ytdlp.try_begin_thumbnail().is_some());
+        let before = queue.entries().expect("the entries are read");
+        let outcome = ThumbnailRefreshOutcome::RetryLater("404 not found".to_string());
+        assert!(matches!(outcome, ThumbnailRefreshOutcome::RetryLater(_)));
+        let after = queue.entries().expect("the entries are read");
+        assert_eq!(before, after);
+        assert!(after.iter().any(|other| other.id == entry.id));
     }
 
     #[test]

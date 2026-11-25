@@ -845,10 +845,7 @@ fn queue_list(app: &App) -> Vec<QueueListEntry> {
             position: entry.position as i32,
             title: entry.title,
             uploader: entry.uploader.unwrap_or_default(),
-            thumbnail: entry
-                .thumbnail
-                .as_deref()
-                .and_then(|thumbnail| app.queue_thumbnail(thumbnail)),
+            thumbnail: app.queue_thumbnail(entry.thumbnail.as_deref(), &entry.url),
             current: entry.current,
             url: entry.url,
         })

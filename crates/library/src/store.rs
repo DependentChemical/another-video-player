@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use app_logging;
 use database::{Database, rusqlite};
 use media_model::video_id_hash;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -181,6 +182,7 @@ impl Queue {
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         thumbnail_id TEXT NOT NULL UNIQUE,
                         source_url TEXT,
+                        thumbnail_urls TEXT,
                         created_at INTEGER NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS history (
@@ -303,12 +305,14 @@ impl Queue {
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
-        let thumbnail = thumbnail.map(str::to_string);
+        let thumbnail =
+            normalize_thumbnail_ref(thumbnail, &url).or_else(|| Some(default_thumbnail_id(&url)));
         let (thumbnail_url, thumbnail_urls) =
             normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 let count: i64 =
@@ -324,7 +328,7 @@ impl Queue {
                     id: 0,
                     position,
                     url: url.clone(),
-                    title,
+                    title: title.clone(),
                     thumbnail,
                     thumbnail_url,
                     thumbnail_urls,
@@ -340,9 +344,22 @@ impl Queue {
                 insert_entry(connection, &table, &entry)?;
                 entry.id = connection.last_insert_rowid();
                 touch_current(connection, &table)?;
-                Ok(entry)
+                Ok((table, entry))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry)) => {
+                log_queue_edit("push", &table, Some(&entry), "mode=end");
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=push url={url} title=\"{}\" error={error}",
+                    title.replace('"', "'")
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Inserts an entry right after the one playing now, or appends it when
@@ -358,12 +375,14 @@ impl Queue {
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
-        let thumbnail = thumbnail.map(str::to_string);
+        let thumbnail =
+            normalize_thumbnail_ref(thumbnail, &url).or_else(|| Some(default_thumbnail_id(&url)));
         let (thumbnail_url, thumbnail_urls) =
             normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 let count: i64 =
@@ -400,7 +419,7 @@ impl Queue {
                     id: 0,
                     position,
                     url: url.clone(),
-                    title,
+                    title: title.clone(),
                     thumbnail,
                     thumbnail_url,
                     thumbnail_urls,
@@ -416,9 +435,22 @@ impl Queue {
                 insert_entry(connection, &table, &entry)?;
                 entry.id = connection.last_insert_rowid();
                 touch_current(connection, &table)?;
-                Ok(entry)
+                Ok((table, entry))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry)) => {
+                log_queue_edit("push_next", &table, Some(&entry), "mode=next");
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=push_next url={url} title=\"{}\" error={error}",
+                    title.replace('"', "'")
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Replaces the whole queue with a single, current entry.
@@ -436,20 +468,22 @@ impl Queue {
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
-        let thumbnail = thumbnail.map(str::to_string);
+        let thumbnail =
+            normalize_thumbnail_ref(thumbnail, &url).or_else(|| Some(default_thumbnail_id(&url)));
         let (thumbnail_url, thumbnail_urls) =
             normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                connection.execute(&format!("DELETE FROM {table}"), [])?;
+                let deleted = connection.execute(&format!("DELETE FROM {table}"), [])?;
                 let mut entry = QueueEntry {
                     id: 0,
                     position: 0,
                     url: url.clone(),
-                    title,
+                    title: title.clone(),
                     thumbnail,
                     thumbnail_url,
                     thumbnail_urls,
@@ -465,9 +499,22 @@ impl Queue {
                 insert_entry(connection, &table, &entry)?;
                 entry.id = connection.last_insert_rowid();
                 touch_current(connection, &table)?;
-                Ok(entry)
+                Ok((table, deleted, entry))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, deleted, entry)) => {
+                log_queue_edit("replace_with", &table, Some(&entry), &format!("deleted={deleted}"));
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=replace_with url={url} title=\"{}\" error={error}",
+                    title.replace('"', "'")
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Moves the current mark to the next entry and returns it.
@@ -477,7 +524,8 @@ impl Queue {
     /// When the last entry was current, the mark is cleared and `None` is
     /// returned: the queue has been played to its end.
     pub fn advance(&self) -> Result<Option<QueueEntry>, Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 let current: Option<(i64, i64)> = connection
@@ -499,14 +547,15 @@ impl Queue {
                         )
                         .optional()?;
                     let Some(first) = first else {
-                        return Ok(None);
+                        return Ok((table, None));
                     };
                     connection.execute(
                         &format!("UPDATE {table} SET current = 1 WHERE id = ?1"),
                         params![first],
                     )?;
                     touch_current(connection, &table)?;
-                    return current_in(connection, &table);
+                    let current = current_in(connection, &table)?;
+                    return Ok((table, current));
                 };
 
                 let next: Option<i64> = connection
@@ -522,16 +571,27 @@ impl Queue {
                 connection.execute(&format!("UPDATE {table} SET current = 0"), [])?;
                 let Some(next) = next else {
                     touch_current(connection, &table)?;
-                    return Ok(None);
+                    return Ok((table, None));
                 };
                 connection.execute(
                     &format!("UPDATE {table} SET current = 1 WHERE id = ?1"),
                     params![next],
                 )?;
                 touch_current(connection, &table)?;
-                current_in(connection, &table)
+                let current = current_in(connection, &table)?;
+                Ok((table, current))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry)) => {
+                log_queue_edit("advance", &table, entry.as_ref(), "mode=next-or-first");
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!("queue edit failed: op=advance error={error}"));
+                Err(error)
+            }
+        }
     }
 
     /// Moves the current mark to the entry with `id`.
@@ -541,62 +601,128 @@ impl Queue {
     /// the queue never loses track of what plays. An id that is not in the
     /// queue leaves the mark untouched.
     pub fn set_current(&self, id: i64) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                let exists: Option<i64> = connection
-                    .query_row(
-                        &format!("SELECT id FROM {table} WHERE id = ?1"),
-                        params![id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if exists.is_some() {
+                let entry = entry_by_id(connection, &table, id)?;
+                let changed = if entry.is_some() {
                     connection.execute(&format!("UPDATE {table} SET current = 0"), [])?;
                     connection.execute(
                         &format!("UPDATE {table} SET current = 1 WHERE id = ?1"),
                         params![id],
                     )?;
                     touch_current(connection, &table)?;
-                }
-                Ok(())
+                    true
+                } else {
+                    false
+                };
+                Ok((table, entry, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry, changed)) => {
+                log_queue_edit(
+                    "set_current",
+                    &table,
+                    entry.as_ref(),
+                    &format!("target_id={id} changed={changed}"),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=set_current target_id={id} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Replaces the thumbnail of an entry.
+    ///
+    /// This is a queue mutation and is logged with metadata. Background
+    /// thumbnail workers must not use it; thumbnails are referenced by
+    /// deterministic cache IDs and cache files are refreshed separately.
     pub fn set_thumbnail(&self, position: i64, thumbnail: Option<&str>) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                connection.execute(
+                let entry = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!("UPDATE {table} SET thumbnail = ?2 WHERE position = ?1"),
                     params![position, thumbnail],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, entry, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry, changed)) => {
+                log_queue_edit(
+                    "set_thumbnail",
+                    &table,
+                    entry.as_ref(),
+                    &format!(
+                        "position={position} changed={changed} new_thumbnail={}",
+                        opt_str(thumbnail)
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=set_thumbnail position={position} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Replaces the thumbnail of an entry in a specific playlist.
+    ///
+    /// This is a queue mutation and is logged with metadata. Background
+    /// thumbnail workers must not use it.
     pub fn set_thumbnail_for_playlist(
         &self,
         playlist_id: &str,
         position: i64,
         thumbnail: Option<&str>,
     ) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = table_for_playlist(connection, playlist_id)?;
-                connection.execute(
+                let entry = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!("UPDATE {table} SET thumbnail = ?2 WHERE position = ?1"),
                     params![position, thumbnail],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, entry, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry, changed)) => {
+                log_queue_edit(
+                    "set_thumbnail_for_playlist",
+                    &table,
+                    entry.as_ref(),
+                    &format!(
+                        "playlist_id={playlist_id} position={position} changed={changed} new_thumbnail={}",
+                        opt_str(thumbnail)
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=set_thumbnail_for_playlist playlist_id={playlist_id} position={position} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Updates the displayed details of a queue entry after URL resolution.
@@ -611,20 +737,47 @@ impl Queue {
     ) -> Result<(), Error> {
         let (thumbnail_url, thumbnail_urls) =
             normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
-        let thumbnail_urls = serialize_thumbnail_urls(&thumbnail_urls);
-        self.db
+        let thumbnail_urls_json = serialize_thumbnail_urls(&thumbnail_urls);
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                connection.execute(
+                let before = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!(
                         "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, thumbnail_urls = ?5, uploader = ?6 WHERE position = ?1"
                     ),
-                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls, uploader],
+                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls_json, uploader],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, before, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, before, changed)) => {
+                log_queue_edit(
+                    "update_details",
+                    &table,
+                    before.as_ref(),
+                    &format!(
+                        "position={position} changed={changed} new_title=\"{}\" new_thumbnail={} new_thumbnail_url={} new_thumbnail_urls={} new_uploader={}",
+                        title.replace('"', "'"),
+                        opt_str(thumbnail),
+                        opt_str(thumbnail_url.as_deref()),
+                        thumbnail_urls.len(),
+                        opt_str(uploader)
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=update_details position={position} title=\"{}\" error={error}",
+                    title.replace('"', "'")
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Updates displayed details for an entry in a specific playlist.
@@ -641,20 +794,47 @@ impl Queue {
     ) -> Result<(), Error> {
         let (thumbnail_url, thumbnail_urls) =
             normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
-        let thumbnail_urls = serialize_thumbnail_urls(&thumbnail_urls);
-        self.db
+        let thumbnail_urls_json = serialize_thumbnail_urls(&thumbnail_urls);
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = table_for_playlist(connection, playlist_id)?;
-                connection.execute(
+                let before = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!(
                         "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, thumbnail_urls = ?5, uploader = ?6 WHERE position = ?1"
                     ),
-                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls, uploader],
+                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls_json, uploader],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, before, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, before, changed)) => {
+                log_queue_edit(
+                    "update_details_for_playlist",
+                    &table,
+                    before.as_ref(),
+                    &format!(
+                        "playlist_id={playlist_id} position={position} changed={changed} new_title=\"{}\" new_thumbnail={} new_thumbnail_url={} new_thumbnail_urls={} new_uploader={}",
+                        title.replace('"', "'"),
+                        opt_str(thumbnail),
+                        opt_str(thumbnail_url.as_deref()),
+                        thumbnail_urls.len(),
+                        opt_str(uploader)
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=update_details_for_playlist playlist_id={playlist_id} position={position} title=\"{}\" error={error}",
+                    title.replace('"', "'")
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Saves or clears the resolver result associated with an entry.
@@ -664,10 +844,12 @@ impl Queue {
         source: Option<&str>,
         resolved_at: Option<i64>,
     ) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                connection.execute(
+                let before = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!(
                         "UPDATE {table}
                      SET resolved_source = ?2, resolved_at = ?3 WHERE position = ?1"
@@ -675,9 +857,31 @@ impl Queue {
                     params![position, source, resolved_at],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, before, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, before, changed)) => {
+                log_queue_edit(
+                    "set_resolved_source",
+                    &table,
+                    before.as_ref(),
+                    &format!(
+                        "position={position} changed={changed} resolved_at={} has_source={}",
+                        opt_i64(resolved_at),
+                        source.is_some()
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=set_resolved_source position={position} resolved_at={} error={error}",
+                    opt_i64(resolved_at)
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Updates the selected streams for an entry.
@@ -688,10 +892,12 @@ impl Queue {
         audio: Option<&str>,
         muxed: Option<&str>,
     ) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
-                connection.execute(
+                let before = entry_at_position(connection, &table, position)?;
+                let changed = connection.execute(
                     &format!(
                         "UPDATE {table}
                      SET selected_video = ?2, selected_audio = ?3, selected_muxed = ?4 WHERE position = ?1"
@@ -699,9 +905,31 @@ impl Queue {
                     params![position, video, audio, muxed],
                 )?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, before, changed))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, before, changed)) => {
+                log_queue_edit(
+                    "set_selected_sources",
+                    &table,
+                    before.as_ref(),
+                    &format!(
+                        "position={position} changed={changed} video={} audio={} muxed={}",
+                        opt_str(video),
+                        opt_str(audio),
+                        opt_str(muxed)
+                    ),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=set_selected_sources position={position} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// How many entries the active playlist holds.
@@ -716,14 +944,29 @@ impl Queue {
 
     /// Empties the active playlist.
     pub fn clear(&self) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
+                let count: i64 =
+                    connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })?;
                 connection.execute(&format!("DELETE FROM {table}"), [])?;
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok((table, count))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, count)) => {
+                app_logging::notice(format!("queue edit: op=clear table={table} deleted={count}"));
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!("queue edit failed: op=clear error={error}"));
+                Err(error)
+            }
+        }
     }
 
     /// Removes a single entry from the queue by its database id.
@@ -732,7 +975,8 @@ impl Queue {
     /// entries ever happen to share a position. The removed entry is returned
     /// so the caller can decide how the current mark and playback move.
     pub fn remove_entry(&self, id: i64) -> Result<Option<QueueEntry>, Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 let entry = connection
@@ -747,9 +991,21 @@ impl Queue {
                         .execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
                     touch_current(connection, &table)?;
                 }
-                Ok(entry)
+                Ok((table, entry))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, entry)) => {
+                log_queue_edit("remove_entry", &table, entry.as_ref(), &format!("target_id={id}"));
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=remove_entry target_id={id} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Reorders the queue so the entries play in the given id order.
@@ -759,7 +1015,8 @@ impl Queue {
     /// because it is tracked by id, not by position, so reordering never
     /// requires moving a current-position reference.
     pub fn reorder(&self, ordered_ids: &[i64]) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 for (index, id) in ordered_ids.iter().enumerate() {
@@ -769,9 +1026,27 @@ impl Queue {
                     )?;
                 }
                 touch_current(connection, &table)?;
-                Ok(())
+                Ok(table)
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok(table) => {
+                app_logging::notice(format!(
+                    "queue edit: op=reorder table={table} count={} ordered_ids={:?}",
+                    ordered_ids.len(),
+                    ordered_ids
+                ));
+                Ok(())
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=reorder count={} ordered_ids={:?} error={error}",
+                    ordered_ids.len(),
+                    ordered_ids
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// The entry that plays directly after `position`, if there is one.
@@ -869,7 +1144,8 @@ impl Queue {
     /// [`ACTIVE_QUEUE_ID`] selects the built-in active queue again. An unknown
     /// id is rejected so the player never points at a table that is not there.
     pub fn select_playlist(&self, playlist_id: &str) -> Result<(), Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let target = if playlist_id == ACTIVE_QUEUE_ID {
                     None
@@ -886,7 +1162,16 @@ impl Queue {
                 )?;
                 Ok(())
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match &result {
+            Ok(()) => app_logging::notice(format!(
+                "queue edit: op=select_playlist playlist_id={playlist_id}"
+            )),
+            Err(error) => app_logging::error(format!(
+                "queue edit failed: op=select_playlist playlist_id={playlist_id} error={error}"
+            )),
+        }
+        result
     }
 
     /// Creates a user playlist with its own table and returns its metadata.
@@ -904,7 +1189,8 @@ impl Queue {
                 "\"{ACTIVE_QUEUE_NAME}\" is reserved for the active queue"
             )));
         }
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let id = new_playlist_id(connection)?;
                 let table = format!("playlist_{id}");
@@ -929,7 +1215,20 @@ impl Queue {
                     is_active_queue: false,
                 })
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match &result {
+            Ok(info) => app_logging::notice(format!(
+                "queue edit: op=create_playlist playlist_id={} name=\"{}\" table={}",
+                info.id,
+                info.name.replace('"', "'"),
+                info.table
+            )),
+            Err(error) => app_logging::error(format!(
+                "queue edit failed: op=create_playlist name=\"{}\" error={error}",
+                name.replace('"', "'")
+            )),
+        }
+        result
     }
 
     /// Copies one entry into another playlist.
@@ -943,7 +1242,21 @@ impl Queue {
         playlist_id: &str,
         entry: &QueueEntry,
     ) -> Result<QueueEntry, Error> {
-        self.db
+        let mut normalized = entry.clone();
+        normalized.thumbnail =
+            normalize_thumbnail_ref(normalized.thumbnail.as_deref(), &normalized.url)
+                .or_else(|| Some(default_thumbnail_id(&normalized.url)));
+        let (thumbnail_url, thumbnail_urls) = normalize_thumbnail_urls(
+            normalized.thumbnail_url.as_deref(),
+            &normalized.thumbnail_urls,
+        );
+        normalized.thumbnail_url = thumbnail_url;
+        normalized.thumbnail_urls = thumbnail_urls;
+        if normalized.id_hash.trim().is_empty() {
+            normalized.id_hash = video_id_hash(&normalized.url);
+        }
+        let result = self
+            .db
             .with_connection(|connection| {
                 let table = playlist_table_in(connection, playlist_id)?;
                 let count: i64 =
@@ -955,13 +1268,31 @@ impl Queue {
                     [],
                     |row| row.get(0),
                 )?;
-                let mut copy = QueueEntry { id: 0, position, current: count == 0, ..entry.clone() };
+                let mut copy = QueueEntry { id: 0, position, current: count == 0, ..normalized };
                 insert_entry(connection, &table, &copy)?;
                 copy.id = connection.last_insert_rowid();
                 touch_current(connection, &table)?;
-                Ok(copy)
+                Ok((table, copy))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((table, copy)) => {
+                log_queue_edit(
+                    "push_entry_to_playlist",
+                    &table,
+                    Some(&copy),
+                    &format!("playlist_id={playlist_id}"),
+                );
+                Ok(copy)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=push_entry_to_playlist playlist_id={playlist_id} url={} error={error}",
+                    entry.url
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Moves one entry from the active playlist into another playlist.
@@ -974,7 +1305,8 @@ impl Queue {
         entry_id: i64,
         playlist_id: &str,
     ) -> Result<Option<QueueEntry>, Error> {
-        self.db
+        let result = self
+            .db
             .with_connection(|connection| {
                 let source = active_table(connection)?;
                 let target = playlist_table_in(connection, playlist_id)?;
@@ -989,8 +1321,8 @@ impl Queue {
                         entry_from_row,
                     )
                     .optional()?;
-                let Some(entry) = entry else {
-                    return Ok(None);
+                let Some(mut entry) = entry else {
+                    return Ok((source, target, None));
                 };
                 let count: i64 = transaction.query_row(
                     &format!("SELECT COUNT(*) FROM {target}"),
@@ -1002,6 +1334,8 @@ impl Queue {
                     [],
                     |row| row.get(0),
                 )?;
+                entry.thumbnail = normalize_thumbnail_ref(entry.thumbnail.as_deref(), &entry.url)
+                    .or_else(|| Some(default_thumbnail_id(&entry.url)));
                 let copy = QueueEntry { id: 0, position, current: count == 0, ..entry.clone() };
                 insert_entry(&transaction, &target, &copy)?;
                 touch_current(&transaction, &target)?;
@@ -1009,9 +1343,34 @@ impl Queue {
                     .execute(&format!("DELETE FROM {source} WHERE id = ?1"), params![entry_id])?;
                 touch_current(&transaction, &source)?;
                 transaction.commit()?;
-                Ok(Some(entry))
+                Ok((source, target, Some(entry)))
             })
-            .map_err(Error::from)
+            .map_err(Error::from);
+        match result {
+            Ok((source, target, entry)) => {
+                if let Some(entry) = entry.as_ref() {
+                    log_queue_edit(
+                        "move_entry_to_playlist",
+                        &source,
+                        Some(entry),
+                        &format!(
+                            "target_table={target} playlist_id={playlist_id} target_id={entry_id}"
+                        ),
+                    );
+                } else {
+                    app_logging::warning(format!(
+                        "queue edit: op=move_entry_to_playlist source={source} target={target} playlist_id={playlist_id} target_id={entry_id} missing=true"
+                    ));
+                }
+                Ok(entry)
+            }
+            Err(error) => {
+                app_logging::error(format!(
+                    "queue edit failed: op=move_entry_to_playlist playlist_id={playlist_id} target_id={entry_id} error={error}"
+                ));
+                Err(error)
+            }
+        }
     }
 
     /// Gets a history entry by its id_hash.
@@ -1280,6 +1639,64 @@ fn current_in(connection: &Connection, table: &str) -> Result<Option<QueueEntry>
         .optional()
 }
 
+fn entry_at_position(
+    connection: &Connection,
+    table: &str,
+    position: i64,
+) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    connection
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM {table} WHERE position = ?1 LIMIT 1"),
+            params![position],
+            entry_from_row,
+        )
+        .optional()
+}
+
+fn entry_by_id(
+    connection: &Connection,
+    table: &str,
+    id: i64,
+) -> Result<Option<QueueEntry>, rusqlite::Error> {
+    connection
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM {table} WHERE id = ?1"),
+            params![id],
+            entry_from_row,
+        )
+        .optional()
+}
+
+fn log_queue_edit(op: &str, table: &str, entry: Option<&QueueEntry>, details: &str) {
+    if let Some(entry) = entry {
+        app_logging::notice(format!(
+            "queue edit: op={op} table={table} id={} position={} url={} title=\"{}\" id_hash={} current={} thumbnail={} thumbnail_url={} uploader={} resolved_at={} {details}",
+            entry.id,
+            entry.position,
+            entry.url,
+            entry.title.replace('"', "'"),
+            entry.id_hash,
+            entry.current,
+            opt_str(entry.thumbnail.as_deref()),
+            opt_str(entry.thumbnail_url.as_deref()),
+            opt_str(entry.uploader.as_deref()),
+            opt_i64(entry.resolved_at),
+        ));
+    } else {
+        app_logging::notice(format!("queue edit: op={op} table={table} entry=<none> {details}"));
+    }
+}
+
+fn opt_str(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", value.replace('"', "'")))
+        .unwrap_or_else(|| "<none>".to_string())
+}
+
+fn opt_i64(value: Option<i64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_else(|| "<none>".to_string())
+}
+
 /// Adds a column to an existing queue database when an older app created it.
 fn ensure_column(
     connection: &Connection,
@@ -1360,6 +1777,29 @@ fn normalize_thumbnail_urls(
     (normalized.first().cloned(), normalized)
 }
 
+fn default_thumbnail_id(url: &str) -> String {
+    crate::cache::ThumbnailCache::thumbnail_id_for(url)
+}
+
+fn normalize_thumbnail_ref(thumbnail: Option<&str>, url: &str) -> Option<String> {
+    let value = thumbnail.map(str::trim).filter(|value| !value.is_empty());
+    match value {
+        Some(value) if crate::cache::ThumbnailCache::is_thumbnail_id(value) => {
+            Some(value.to_string())
+        }
+        Some(value) => {
+            app_logging::warning(format!(
+                "queue thumbnail ref was not a cache id; normalizing to deterministic id: url={url} old_thumbnail=\"{}\" new_thumbnail=\"{}\"",
+                value.replace('"', "'"),
+                default_thumbnail_id(url)
+            ));
+            Some(default_thumbnail_id(url))
+        }
+        None if !url.trim().is_empty() => Some(default_thumbnail_id(url)),
+        None => None,
+    }
+}
+
 fn parse_thumbnail_urls(raw: Option<&str>) -> Vec<String> {
     let Some(raw) = raw else { return Vec::new() };
     let trimmed = raw.trim();
@@ -1426,7 +1866,9 @@ mod tests {
 
         assert_eq!(second.position, 1);
         assert!(!second.current);
-        assert_eq!(second.thumbnail.as_deref(), Some("/tmp/b.jpg"));
+        let expected_thumb =
+            crate::cache::ThumbnailCache::thumbnail_id_for("https://example.com/b");
+        assert_eq!(second.thumbnail.as_deref(), Some(expected_thumb.as_str()));
         assert_eq!(second.thumbnail_url.as_deref(), Some("http://thumb/b"));
         assert_eq!(second.uploader.as_deref(), Some("Uploader"));
         assert!(!second.id_hash.is_empty());
