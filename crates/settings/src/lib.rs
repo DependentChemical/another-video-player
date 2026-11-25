@@ -579,6 +579,7 @@ mod tests {
             uploader: None,
             duration: None,
             thumbnail: None,
+            thumbnails: Vec::new(),
             webpage_url: None,
             extractor: None,
             is_live: false,

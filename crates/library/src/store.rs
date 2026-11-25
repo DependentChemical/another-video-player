@@ -9,7 +9,7 @@ use crate::Error;
 
 /// The columns every queue query reads, in the order [`entry_from_row`]
 /// expects.
-const COLUMNS: &str = "id, position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current, resolved_source, resolved_at, selected_video, selected_audio, selected_muxed";
+const COLUMNS: &str = "id, position, url, title, thumbnail, thumbnail_url, thumbnail_urls, uploader, id_hash, current, resolved_source, resolved_at, selected_video, selected_audio, selected_muxed";
 
 /// The table the built-in active queue lives in.
 const ACTIVE_QUEUE_TABLE: &str = "active_queue";
@@ -72,6 +72,8 @@ pub struct QueueEntry {
     pub thumbnail: Option<String>,
     /// The remote thumbnail URL as reported by the extractor.
     pub thumbnail_url: Option<String>,
+    /// Remote thumbnail URLs reported by the extractor, in fallback order.
+    pub thumbnail_urls: Vec<String>,
     /// The uploader / channel name as reported by the extractor.
     pub uploader: Option<String>,
     /// Stable MD5 hash of the cleaned video URL, used as a history key.
@@ -165,6 +167,7 @@ impl Queue {
                         title TEXT NOT NULL DEFAULT '',
                         thumbnail TEXT,
                         thumbnail_url TEXT,
+                        thumbnail_urls TEXT,
                         uploader TEXT,
                         id_hash TEXT NOT NULL DEFAULT '',
                         current INTEGER NOT NULL DEFAULT 0,
@@ -204,6 +207,7 @@ impl Queue {
                 )?;
                 // Add missing columns for older schemas
                 ensure_column(connection, "thumbnail_url", "TEXT")?;
+                ensure_column(connection, "thumbnail_urls", "TEXT")?;
                 ensure_column(connection, "uploader", "TEXT")?;
                 ensure_column(connection, "id_hash", "TEXT NOT NULL DEFAULT ''")?;
                 ensure_column(connection, "resolved_source", "TEXT")?;
@@ -240,6 +244,7 @@ impl Queue {
                 for table in tables {
                     if is_safe_table_name(&table) {
                         create_queue_table(connection, &table)?;
+                        ensure_table_column(connection, &table, "thumbnail_urls", "TEXT")?;
                     }
                 }
                 Ok(())
@@ -293,12 +298,14 @@ impl Queue {
         title: impl Into<String>,
         thumbnail: Option<&str>,
         thumbnail_url: Option<&str>,
+        thumbnail_urls: &[String],
         uploader: Option<&str>,
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
         let thumbnail = thumbnail.map(str::to_string);
-        let thumbnail_url = thumbnail_url.map(str::to_string);
+        let (thumbnail_url, thumbnail_urls) =
+            normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
         self.db
@@ -320,6 +327,7 @@ impl Queue {
                     title,
                     thumbnail,
                     thumbnail_url,
+                    thumbnail_urls,
                     uploader,
                     id_hash: id_hash.clone(),
                     current: count == 0,
@@ -345,12 +353,14 @@ impl Queue {
         title: impl Into<String>,
         thumbnail: Option<&str>,
         thumbnail_url: Option<&str>,
+        thumbnail_urls: &[String],
         uploader: Option<&str>,
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
         let thumbnail = thumbnail.map(str::to_string);
-        let thumbnail_url = thumbnail_url.map(str::to_string);
+        let (thumbnail_url, thumbnail_urls) =
+            normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
         self.db
@@ -393,6 +403,7 @@ impl Queue {
                     title,
                     thumbnail,
                     thumbnail_url,
+                    thumbnail_urls,
                     uploader,
                     id_hash: id_hash.clone(),
                     current: count == 0,
@@ -420,12 +431,14 @@ impl Queue {
         title: impl Into<String>,
         thumbnail: Option<&str>,
         thumbnail_url: Option<&str>,
+        thumbnail_urls: &[String],
         uploader: Option<&str>,
     ) -> Result<QueueEntry, Error> {
         let url = url.into();
         let title = title.into();
         let thumbnail = thumbnail.map(str::to_string);
-        let thumbnail_url = thumbnail_url.map(str::to_string);
+        let (thumbnail_url, thumbnail_urls) =
+            normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
         let uploader = uploader.map(str::to_string);
         let id_hash = video_id_hash(&url);
         self.db
@@ -439,6 +452,7 @@ impl Queue {
                     title,
                     thumbnail,
                     thumbnail_url,
+                    thumbnail_urls,
                     uploader,
                     id_hash: id_hash.clone(),
                     current: true,
@@ -592,16 +606,20 @@ impl Queue {
         title: &str,
         thumbnail: Option<&str>,
         thumbnail_url: Option<&str>,
+        thumbnail_urls: &[String],
         uploader: Option<&str>,
     ) -> Result<(), Error> {
+        let (thumbnail_url, thumbnail_urls) =
+            normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
+        let thumbnail_urls = serialize_thumbnail_urls(&thumbnail_urls);
         self.db
             .with_connection(|connection| {
                 let table = active_table(connection)?;
                 connection.execute(
                     &format!(
-                        "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, uploader = ?5 WHERE position = ?1"
+                        "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, thumbnail_urls = ?5, uploader = ?6 WHERE position = ?1"
                     ),
-                    params![position, title, thumbnail, thumbnail_url, uploader],
+                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls, uploader],
                 )?;
                 touch_current(connection, &table)?;
                 Ok(())
@@ -610,6 +628,7 @@ impl Queue {
     }
 
     /// Updates displayed details for an entry in a specific playlist.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_details_for_playlist(
         &self,
         playlist_id: &str,
@@ -617,16 +636,20 @@ impl Queue {
         title: &str,
         thumbnail: Option<&str>,
         thumbnail_url: Option<&str>,
+        thumbnail_urls: &[String],
         uploader: Option<&str>,
     ) -> Result<(), Error> {
+        let (thumbnail_url, thumbnail_urls) =
+            normalize_thumbnail_urls(thumbnail_url, thumbnail_urls);
+        let thumbnail_urls = serialize_thumbnail_urls(&thumbnail_urls);
         self.db
             .with_connection(|connection| {
                 let table = table_for_playlist(connection, playlist_id)?;
                 connection.execute(
                     &format!(
-                        "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, uploader = ?5 WHERE position = ?1"
+                        "UPDATE {table} SET title = ?2, thumbnail = ?3, thumbnail_url = ?4, thumbnail_urls = ?5, uploader = ?6 WHERE position = ?1"
                     ),
-                    params![position, title, thumbnail, thumbnail_url, uploader],
+                    params![position, title, thumbnail, thumbnail_url, thumbnail_urls, uploader],
                 )?;
                 touch_current(connection, &table)?;
                 Ok(())
@@ -1076,6 +1099,7 @@ fn create_queue_table(connection: &Connection, table: &str) -> rusqlite::Result<
             title TEXT NOT NULL DEFAULT '',
             thumbnail TEXT,
             thumbnail_url TEXT,
+            thumbnail_urls TEXT,
             uploader TEXT,
             id_hash TEXT NOT NULL DEFAULT '',
             current INTEGER NOT NULL DEFAULT 0,
@@ -1099,12 +1123,13 @@ fn is_safe_table_name(name: &str) -> bool {
 
 /// Inserts a queue entry into an already resolved playlist table.
 fn insert_entry(connection: &Connection, table: &str, entry: &QueueEntry) -> rusqlite::Result<()> {
+    let thumbnail_urls = serialize_thumbnail_urls(&entry.thumbnail_urls);
     connection.execute(
         &format!(
             "INSERT INTO {table}
-             (position, url, title, thumbnail, thumbnail_url, uploader, id_hash, current,
+             (position, url, title, thumbnail, thumbnail_url, thumbnail_urls, uploader, id_hash, current,
               resolved_source, resolved_at, selected_video, selected_audio, selected_muxed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
         ),
         params![
             entry.position,
@@ -1112,6 +1137,7 @@ fn insert_entry(connection: &Connection, table: &str, entry: &QueueEntry) -> rus
             entry.title,
             entry.thumbnail,
             entry.thumbnail_url,
+            thumbnail_urls,
             entry.uploader,
             entry.id_hash,
             entry.current as i64,
@@ -1260,33 +1286,49 @@ fn ensure_column(
     name: &str,
     definition: &str,
 ) -> Result<(), rusqlite::Error> {
-    let mut statement = connection.prepare("PRAGMA table_info(active_queue)")?;
+    ensure_table_column(connection, "active_queue", name, definition)
+}
+
+fn ensure_table_column(
+    connection: &Connection,
+    table: &str,
+    name: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     for column in columns {
         if column? == name {
             return Ok(());
         }
     }
-    connection.execute_batch(&format!("ALTER TABLE active_queue ADD COLUMN {name} {definition}"))
+    connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"))
 }
 
 /// Turns a row of [`COLUMNS`] into an entry.
 fn entry_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueEntry> {
+    let thumbnail_url: Option<String> = row.get(5)?;
+    let thumbnail_urls_raw: Option<String> = row.get(6)?;
+    let (thumbnail_url, thumbnail_urls) = normalize_thumbnail_urls(
+        thumbnail_url.as_deref(),
+        &parse_thumbnail_urls(thumbnail_urls_raw.as_deref()),
+    );
     Ok(QueueEntry {
         id: row.get(0)?,
         position: row.get(1)?,
         url: row.get(2)?,
         title: row.get(3)?,
         thumbnail: row.get(4)?,
-        thumbnail_url: row.get(5)?,
-        uploader: row.get(6)?,
-        id_hash: row.get(7)?,
-        current: row.get::<_, i64>(8)? != 0,
-        resolved_source: row.get(9)?,
-        resolved_at: row.get(10)?,
-        selected_video: row.get(11)?,
-        selected_audio: row.get(12)?,
-        selected_muxed: row.get(13)?,
+        thumbnail_url,
+        thumbnail_urls,
+        uploader: row.get(7)?,
+        id_hash: row.get(8)?,
+        current: row.get::<_, i64>(9)? != 0,
+        resolved_source: row.get(10)?,
+        resolved_at: row.get(11)?,
+        selected_video: row.get(12)?,
+        selected_audio: row.get(13)?,
+        selected_muxed: row.get(14)?,
     })
 }
 
@@ -1301,6 +1343,34 @@ fn history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
         position_seconds: row.get(5)?,
         updated_at: row.get(6)?,
     })
+}
+
+fn normalize_thumbnail_urls(
+    primary: Option<&str>,
+    urls: &[String],
+) -> (Option<String>, Vec<String>) {
+    let mut normalized = Vec::new();
+    for url in primary.into_iter().chain(urls.iter().map(String::as_str)) {
+        let trimmed = url.trim();
+        if trimmed.is_empty() || normalized.iter().any(|existing: &String| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    (normalized.first().cloned(), normalized)
+}
+
+fn parse_thumbnail_urls(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else { return Vec::new() };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_else(|_| vec![trimmed.to_string()])
+}
+
+fn serialize_thumbnail_urls(urls: &[String]) -> Option<String> {
+    if urls.is_empty() { None } else { serde_json::to_string(urls).ok() }
 }
 
 /// Seconds since the Unix epoch for timestamps.
@@ -1329,7 +1399,8 @@ mod tests {
     #[test]
     fn the_first_pushed_entry_becomes_current() {
         let queue = queue();
-        let entry = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let entry =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         assert_eq!(entry.position, 0);
         assert!(entry.current);
         assert_eq!(
@@ -1341,13 +1412,14 @@ mod tests {
     #[test]
     fn later_entries_are_appended_without_taking_over() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let second = queue
             .push(
                 "https://example.com/b",
                 "B",
                 Some("/tmp/b.jpg"),
                 Some("http://thumb/b"),
+                &[],
                 Some("Uploader"),
             )
             .expect("push works");
@@ -1368,10 +1440,12 @@ mod tests {
     #[test]
     fn push_next_inserts_after_current_entry() {
         let queue = queue();
-        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        let third = queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        let first =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        let third =
+            queue.push("https://example.com/c", "C", None, None, &[], None).expect("push works");
         let second = queue
-            .push_next("https://example.com/b", "B", None, None, None)
+            .push_next("https://example.com/b", "B", None, None, &[], None)
             .expect("push next works");
 
         assert_eq!(second.position, 1);
@@ -1390,11 +1464,11 @@ mod tests {
     #[test]
     fn replace_with_drops_the_old_queue() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
 
         let entry = queue
-            .replace_with("https://example.com/c", "C", None, None, None)
+            .replace_with("https://example.com/c", "C", None, None, &[], None)
             .expect("replace works");
         assert_eq!(entry.position, 0);
         assert!(entry.current);
@@ -1408,8 +1482,8 @@ mod tests {
     #[test]
     fn advance_moves_the_current_mark_forward() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
 
         let next = queue.advance().expect("advance works").expect("a next entry");
         assert_eq!(next.url, "https://example.com/b");
@@ -1420,7 +1494,7 @@ mod tests {
     #[test]
     fn advance_past_the_last_entry_clears_the_mark() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
 
         assert!(queue.advance().expect("advance works").is_none());
         assert!(queue.current().expect("current works").is_none());
@@ -1430,8 +1504,8 @@ mod tests {
     #[test]
     fn advance_on_a_queue_without_a_mark_starts_at_the_head() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
         queue
             .db
             .with_connection(|connection| {
@@ -1448,9 +1522,9 @@ mod tests {
     #[test]
     fn set_current_moves_the_mark_to_the_chosen_entry() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let second =
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
 
         queue.set_current(second.id).expect("set current works");
         assert_eq!(
@@ -1463,7 +1537,7 @@ mod tests {
     #[test]
     fn set_current_ignores_a_position_that_is_not_in_the_queue() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
 
         queue.set_current(99).expect("set current works");
         assert_eq!(
@@ -1475,7 +1549,7 @@ mod tests {
     #[test]
     fn thumbnails_can_be_filled_in_later() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         queue.set_thumbnail(0, Some("/cache/a.jpg")).expect("set works");
         assert_eq!(
             queue.entries().expect("entries work")[0].thumbnail.as_deref(),
@@ -1486,7 +1560,7 @@ mod tests {
     #[test]
     fn a_resolved_source_is_saved_with_its_freshness_time() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         queue.set_resolved_source(0, Some("{\"title\":\"A\"}"), Some(1234)).expect("source saves");
 
         let current = queue.current().expect("current works").expect("one entry");
@@ -1513,7 +1587,7 @@ mod tests {
         .expect("legacy schema created");
         let queue = Queue { db };
         queue.migrate().expect("legacy schema migrates");
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         queue
             .set_resolved_source(0, Some("source"), Some(1234))
             .expect("new columns are available");
@@ -1526,7 +1600,7 @@ mod tests {
     #[test]
     fn clear_empties_the_queue() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         queue.clear().expect("clear works");
         assert_eq!(queue.count().expect("count works"), 0);
     }
@@ -1534,10 +1608,10 @@ mod tests {
     #[test]
     fn remove_entry_removes_only_the_row_with_the_id() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let second =
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
-        queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/c", "C", None, None, &[], None).expect("push works");
         assert_eq!(queue.count().expect("count works"), 3);
 
         let removed =
@@ -1551,9 +1625,10 @@ mod tests {
     #[test]
     fn next_after_finds_the_following_entry_without_moving_the_mark() {
         let queue = queue();
-        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
-        queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+        let first =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/c", "C", None, None, &[], None).expect("push works");
 
         queue.remove_entry(first.id).expect("remove works");
 
@@ -1566,10 +1641,12 @@ mod tests {
     #[test]
     fn reorder_replays_entries_in_the_given_id_order() {
         let queue = queue();
-        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let first =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let second =
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
-        let third = queue.push("https://example.com/c", "C", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
+        let third =
+            queue.push("https://example.com/c", "C", None, None, &[], None).expect("push works");
         queue.set_current(second.id).expect("set current works");
 
         queue.reorder(&[third.id, first.id, second.id]).expect("reorder works");
@@ -1585,7 +1662,7 @@ mod tests {
     #[test]
     fn removing_a_missing_id_reports_nothing() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
 
         assert!(queue.remove_entry(999).expect("remove works").is_none());
         assert_eq!(queue.count().expect("count works"), 1);
@@ -1601,8 +1678,8 @@ mod tests {
 
         {
             let queue = Queue::open(&path).expect("the queue opens");
-            queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
             queue.advance().expect("advance works");
         }
 
@@ -1662,13 +1739,13 @@ mod tests {
     #[test]
     fn switching_playlists_keeps_their_entries_apart() {
         let queue = queue();
-        queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let playlist = queue.create_playlist("Later").expect("create works");
 
         queue.select_playlist(&playlist.id).expect("select works");
         assert_eq!(queue.active_playlist_id().expect("active id works"), Some(playlist.id.clone()));
         assert_eq!(queue.count().expect("count works"), 0);
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
 
         queue.select_playlist(ACTIVE_QUEUE_ID).expect("select works");
         let entries = queue.entries().expect("entries work");
@@ -1693,6 +1770,7 @@ mod tests {
                 "A",
                 Some("thumb_a"),
                 Some("http://thumb/a"),
+                &[],
                 Some("Uploader"),
             )
             .expect("push works");
@@ -1732,8 +1810,9 @@ mod tests {
     #[test]
     fn moving_an_entry_copies_it_and_removes_the_original() {
         let queue = queue();
-        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
-        queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+        let first =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
+        queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
         let playlist = queue.create_playlist("Elsewhere").expect("create works");
 
         let moved = queue
@@ -1759,12 +1838,12 @@ mod tests {
         let playlist = queue.create_playlist("Elsewhere").expect("create works");
         queue.select_playlist(&playlist.id).expect("select works");
         let existing =
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
         queue.set_current(existing.id).expect("current works");
 
         queue.select_playlist(ACTIVE_QUEUE_ID).expect("select works");
         let moving =
-            queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         queue
             .move_entry_to_playlist(moving.id, &playlist.id)
             .expect("move works")
@@ -1782,7 +1861,8 @@ mod tests {
     #[test]
     fn moving_an_entry_to_its_own_playlist_is_rejected() {
         let queue = queue();
-        let entry = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let entry =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
 
         assert!(
             queue.move_entry_to_playlist(entry.id, ACTIVE_QUEUE_ID).is_err(),
@@ -1796,9 +1876,10 @@ mod tests {
         let queue = queue();
         let playlist = queue.create_playlist("Mix").expect("create works");
         queue.select_playlist(&playlist.id).expect("select works");
-        let first = queue.push("https://example.com/a", "A", None, None, None).expect("push works");
+        let first =
+            queue.push("https://example.com/a", "A", None, None, &[], None).expect("push works");
         let second =
-            queue.push("https://example.com/b", "B", None, None, None).expect("push works");
+            queue.push("https://example.com/b", "B", None, None, &[], None).expect("push works");
 
         let info = |queue: &Queue| {
             queue
@@ -1819,7 +1900,7 @@ mod tests {
     fn id_hash_is_stable_for_same_video() {
         let queue = queue();
         let entry1 = queue
-            .push("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Video 1", None, None, None)
+            .push("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "Video 1", None, None, &[], None)
             .expect("push works");
         let entry2 = queue
             .push(
@@ -1827,6 +1908,7 @@ mod tests {
                 "Video 2",
                 None,
                 None,
+                &[],
                 None,
             )
             .expect("push works");

@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use database::Database;
 use media_model::video_id_hash;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use app_logging;
 
@@ -47,7 +47,7 @@ const MID_MAX_HEIGHT: u32 = 360;
 
 /// A thumbnail is a preview, not the media: it must never keep a resolution
 /// waiting on a stalled server.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Scratch files older than this were left behind by an interrupted
 /// download; no healthy fetch keeps one around that long.
@@ -173,57 +173,125 @@ impl ThumbnailCache {
         (path.is_file() && is_renderable_jpeg(&path)).then_some(path)
     }
 
-    /// Returns the cached thumbnail for `video_url`, downloading it from
-    /// `thumbnail_url` when needed.
+    /// Returns the cached thumbnail for `video_url`, downloading it from the
+    /// first working URL in `thumbnail_urls`.
     ///
     /// The same video always yields the same id, so a queue that lists the
     /// video twice downloads the thumbnail only once. When a thumbnail is
     /// already cached the network is never touched. Returns the thumbnail id
-    /// the active queue should store.
-    pub fn fetch(&self, video_url: &str, thumbnail_url: Option<&str>) -> Result<String, Error> {
+    /// and the URL that succeeded.
+    pub fn fetch(
+        &self,
+        video_url: &str,
+        thumbnail_urls: &[String],
+    ) -> Result<(String, String), Error> {
         let id = ThumbnailCache::thumbnail_id_for(video_url);
-        // If a row exists but the files are gone, treat it as missing so we re-download.
         if self.thumbnail_exists(&id)? && self.full_path(&id).is_some() {
-            return Ok(id);
+            let source_url = self.thumbnail_source_url(&id)?.unwrap_or_default();
+            return Ok((id, source_url));
         }
-        // Remove any broken row/files before re-downloading.
         if self.thumbnail_exists(&id)? {
             app_logging::warning(format!(
                 "thumbnail cache row broken for {id}; deleting before re-download"
             ));
             let _ = self.delete_thumbnail(&id);
         }
-        let Some(thumbnail_url) = thumbnail_url else {
+
+        let candidates = thumbnail_candidate_urls(thumbnail_urls);
+        if candidates.is_empty() {
             app_logging::warning(format!(
-                "thumbnail download skipped for {video_url}: no thumbnail URL"
+                "thumbnail download skipped for {video_url}: no thumbnail URL candidates"
             ));
             return Err(Error::Http("missing thumbnail URL".to_string()));
-        };
+        }
 
         let full_path = self.full_file(&id);
         let mid_path = self.mid_file(&id);
         let small_path = self.small_file(&id);
-
         fs::create_dir_all(&self.directory)?;
         self.remove_stale_partials();
 
-        // The download is format-agnostic: the scratch name has no meaning,
-        // because the normalizer guesses the real format from the bytes.
+        let mut last_error = None;
+        for (index, thumbnail_url) in candidates.iter().enumerate() {
+            app_logging::debug(format!(
+                "thumbnail candidate {}/{} for {video_url}: {thumbnail_url}",
+                index + 1,
+                candidates.len()
+            ));
+            match self.download_thumbnail_candidate(thumbnail_url) {
+                Ok(temporary) => {
+                    if let Err(error) = self.install_thumbnail_files(
+                        &temporary,
+                        &full_path,
+                        &mid_path,
+                        &small_path,
+                        thumbnail_url,
+                    ) {
+                        last_error = Some(error.to_string());
+                        continue;
+                    }
+                    let now = unix_time();
+                    self.db
+                        .with_connection(|connection| {
+                            connection.execute(
+                                "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
+                                 VALUES (?1, ?2, ?3)
+                                 ON CONFLICT(thumbnail_id) DO UPDATE SET source_url = excluded.source_url",
+                                params![id, thumbnail_url, now],
+                            )?;
+                            Ok(())
+                        })
+                        .map_err(Error::from)?;
+                    app_logging::debug(format!(
+                        "thumbnail download cached: {thumbnail_url} -> {id}"
+                    ));
+                    return Ok((id, thumbnail_url.clone()));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+
+        Err(Error::Http(last_error.unwrap_or_else(|| "missing thumbnail URL".to_string())))
+    }
+
+    fn thumbnail_source_url(&self, id: &str) -> Result<Option<String>, Error> {
+        self.db
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT source_url FROM thumbnail_cache WHERE thumbnail_id = ?1",
+                        params![id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map(Option::flatten)
+            })
+            .map_err(Error::from)
+    }
+
+    fn download_thumbnail_candidate(&self, thumbnail_url: &str) -> Result<PathBuf, Error> {
         let temp_name = format!("{:016x}.part", fnv1a(thumbnail_url.as_bytes()));
         let temporary = self.directory.join(temp_name);
-
-        let mut last_error: Option<String> = None;
-        for attempt in 1..=5u32 {
+        let mut last_error = None;
+        for (attempt, force_ipv4) in [(1u32, false), (1u32, true)] {
+            let mode = if force_ipv4 { "ipv4" } else { "default" };
             let _scratch = ScratchFile(&temporary);
             app_logging::debug(format!(
-                "thumbnail download started (attempt {attempt}/5): {thumbnail_url}"
+                "thumbnail download started (attempt {attempt}/1, {mode}): {thumbnail_url}"
             ));
             let result = (|| -> Result<(), Error> {
-                let mut response = ureq::get(thumbnail_url)
-                    .header("User-Agent", USER_AGENT)
-                    .config()
+                let agent = ureq::Agent::config_builder()
                     .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                    .ip_family(if force_ipv4 {
+                        ureq::config::IpFamily::Ipv4Only
+                    } else {
+                        ureq::config::IpFamily::Any
+                    })
                     .build()
+                    .new_agent();
+                let mut response = agent
+                    .get(thumbnail_url)
+                    .header("User-Agent", USER_AGENT)
                     .call()
                     .map_err(|error| Error::Http(error.to_string()))?;
                 let mut file = fs::File::create(&temporary)?;
@@ -233,45 +301,41 @@ impl ThumbnailCache {
                 Ok(())
             })();
             match result {
-                Ok(()) => {
-                    last_error = None;
-                    break;
-                }
+                Ok(()) => return Ok(temporary.clone()),
                 Err(error) => {
                     let message = error.to_string();
                     app_logging::warning(format!(
-                        "thumbnail download attempt {attempt}/5 failed for {thumbnail_url}: {message}"
+                        "thumbnail download attempt {attempt}/1 ({mode}) failed for {thumbnail_url}: {message}"
                     ));
                     last_error = Some(message);
                     let _ = fs::remove_file(&temporary);
-                    if attempt < 5 {
-                        std::thread::sleep(Duration::from_millis(500 * u64::from(attempt)));
-                    }
                 }
             }
         }
-        if let Some(message) = last_error {
-            return Err(Error::Http(message));
-        }
+        Err(Error::Http(last_error.unwrap_or_else(|| "missing thumbnail URL".to_string())))
+    }
 
-        // Normalize to full-size JPEG, then derive the mid and small copies
-        // by fitting each inside its target dimensions without distorting the
-        // aspect ratio. The source download is removed by the normalizer.
-        normalize_to_jpeg(&temporary, &full_path).map_err(|error| {
+    fn install_thumbnail_files(
+        &self,
+        temporary: &Path,
+        full_path: &Path,
+        mid_path: &Path,
+        small_path: &Path,
+        thumbnail_url: &str,
+    ) -> Result<(), Error> {
+        normalize_to_jpeg(temporary, full_path).map_err(|error| {
             app_logging::warning(format!(
                 "thumbnail normalize failed for {thumbnail_url}: {error}"
             ));
             Error::from(error)
         })?;
-        write_scaled_jpeg(&full_path, &mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT).map_err(
-            |error| {
-                app_logging::warning(format!(
-                    "thumbnail mid resize failed for {thumbnail_url}: {error}"
-                ));
-                Error::from(error)
-            },
-        )?;
-        write_scaled_jpeg(&full_path, &small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT).map_err(
+        write_scaled_jpeg(full_path, mid_path, MID_MAX_WIDTH, MID_MAX_HEIGHT).map_err(|error| {
+            app_logging::warning(format!(
+                "thumbnail mid resize failed for {thumbnail_url}: {error}"
+            ));
+            Error::from(error)
+        })?;
+        write_scaled_jpeg(full_path, small_path, SMALL_MAX_WIDTH, SMALL_MAX_HEIGHT).map_err(
             |error| {
                 app_logging::warning(format!(
                     "thumbnail small resize failed for {thumbnail_url}: {error}"
@@ -279,22 +343,7 @@ impl ThumbnailCache {
                 Error::from(error)
             },
         )?;
-
-        let now = unix_time();
-        self.db
-            .with_connection(|connection| {
-                connection.execute(
-                    "INSERT INTO thumbnail_cache (thumbnail_id, source_url, created_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(thumbnail_id) DO UPDATE SET source_url = excluded.source_url",
-                    params![id, thumbnail_url, now],
-                )?;
-                Ok(())
-            })
-            .map_err(Error::from)?;
-
-        app_logging::debug(format!("thumbnail download cached: {thumbnail_url} -> {id}"));
-        Ok(id)
+        Ok(())
     }
 
     /// Imports an old-style direct file path into the new cache.
@@ -666,6 +715,60 @@ fn looks_like_local_path(value: &str) -> bool {
         || value.starts_with('\\')
         || value.starts_with("file://")
         || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'))
+}
+
+fn thumbnail_candidate_urls(urls: &[String]) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for url in urls {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        push_thumbnail_candidate(&mut candidates, trimmed);
+        for fallback in youtube_thumbnail_fallbacks(trimmed) {
+            push_thumbnail_candidate(&mut candidates, &fallback);
+        }
+    }
+    candidates
+}
+
+fn push_thumbnail_candidate(candidates: &mut Vec<String>, url: &str) {
+    if !candidates.iter().any(|existing| existing == url) {
+        candidates.push(url.to_string());
+    }
+}
+
+fn youtube_thumbnail_fallbacks(url: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(url) else { return Vec::new() };
+    let Some(host) = parsed.host_str() else { return Vec::new() };
+    if host != "i.ytimg.com" && host != "img.youtube.com" {
+        return Vec::new();
+    }
+    let segments = parsed.path_segments().map(|s| s.collect::<Vec<_>>()).unwrap_or_default();
+    if segments.len() < 2 {
+        return Vec::new();
+    }
+    let kind = segments[0];
+    if kind != "vi" && kind != "vi_webp" {
+        return Vec::new();
+    }
+    let id = segments[1];
+    if id.is_empty() {
+        return Vec::new();
+    }
+    let names = ["maxresdefault", "sddefault", "hqdefault", "mqdefault", "default", "0"];
+    let exts = ["jpg", "webp"];
+    let mut out = Vec::new();
+    for name in names {
+        for ext in exts {
+            let mut candidate = parsed.clone();
+            candidate.set_path(&format!("/{kind}/{id}/{name}.{ext}"));
+            candidate.set_query(None);
+            candidate.set_fragment(None);
+            out.push(candidate.to_string());
+        }
+    }
+    out
 }
 
 /// The thumbnail id encoded in a cache file name.

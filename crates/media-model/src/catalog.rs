@@ -22,6 +22,9 @@ pub struct MediaSource {
     /// URL of a preview thumbnail.
     #[serde(default)]
     pub thumbnail: Option<String>,
+    /// Preview thumbnail URLs reported by the extractor, best first when possible.
+    #[serde(default)]
+    pub thumbnails: Vec<String>,
     /// Canonical page the media was resolved from.
     #[serde(default)]
     pub webpage_url: Option<String>,
