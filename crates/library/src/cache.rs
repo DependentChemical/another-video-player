@@ -47,10 +47,6 @@ const SMALL_MAX_HEIGHT: u32 = 180;
 const MID_MAX_WIDTH: u32 = 640;
 const MID_MAX_HEIGHT: u32 = 360;
 
-/// A thumbnail is a preview, not the media: it must never keep a resolution
-/// waiting on a stalled server.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Scratch files older than this were left behind by an interrupted
 /// download; no healthy fetch keeps one around that long.
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
@@ -363,7 +359,6 @@ impl ThumbnailCache {
             ));
             let result = (|| -> Result<(), Error> {
                 let agent = ureq::Agent::config_builder()
-                    .timeout_global(Some(DOWNLOAD_TIMEOUT))
                     .ip_family(if force_ipv4 {
                         ureq::config::IpFamily::Ipv4Only
                     } else {
