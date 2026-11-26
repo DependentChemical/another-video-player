@@ -14,6 +14,7 @@
 pub mod deno;
 pub mod locate;
 pub mod platform;
+pub mod proxy;
 pub mod update;
 pub mod version;
 
@@ -25,6 +26,7 @@ use std::path::Path;
 pub use fetch::{FetchDocument, FetchRequest, FetchResult, fetch_with_cancel, is_update_required};
 pub use locate::{ToolPaths, YtDlp, kill_all};
 pub use platform::Platform;
+pub use proxy::{ProxyOutcome, ProxyPool};
 pub use update::ToolUpdate;
 
 /// Everything that can go wrong while managing or running `yt-dlp`.

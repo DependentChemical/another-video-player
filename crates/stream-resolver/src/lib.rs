@@ -8,9 +8,10 @@
 //! singular `ytdlp-tool` access point, which delegates to the `yt-dlp` crate.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use media_model::{MediaSource, Service};
-use ytdlp_tool::FetchRequest;
+use ytdlp_tool::{FetchRequest, ProxyPool};
 
 pub mod parse;
 pub mod plan;
@@ -143,6 +144,7 @@ pub struct Resolver {
     args: Vec<String>,
     service_args: BTreeMap<Service, Vec<String>>,
     site_args: Vec<(regex::Regex, Vec<String>)>,
+    proxy_pool: Option<Arc<ProxyPool>>,
 }
 
 impl Resolver {
@@ -154,7 +156,17 @@ impl Resolver {
             args: Vec::new(),
             service_args: BTreeMap::new(),
             site_args: Vec::new(),
+            proxy_pool: None,
         }
+    }
+
+    /// Uses a shared proxy pool for yt-dlp network requests.
+    ///
+    /// The pool is only consulted for services that benefit from it; the
+    /// actual resolved media stream is still handed to the player directly.
+    pub fn with_proxy_pool(mut self, pool: Arc<ProxyPool>) -> Self {
+        self.proxy_pool = Some(pool);
+        self
     }
 
     /// Supplies a Netscape cookie file for URLs of one service.
@@ -294,8 +306,13 @@ impl Resolver {
         if is_playlist_url(url) && !args.iter().any(|arg| arg == "--flat-playlist") {
             args.push("--flat-playlist".to_string());
         }
-        let request =
-            FetchRequest { tool: Some(self.tool.clone()), url: url.to_string(), cookies, args };
+        let request = FetchRequest {
+            tool: Some(self.tool.clone()),
+            url: url.to_string(),
+            cookies,
+            args,
+            proxy_pool: self.proxy_pool.clone(),
+        };
 
         let result =
             ytdlp_tool::fetch_with_cancel(request, cancel, pid).await.map_err(map_tool_error)?;

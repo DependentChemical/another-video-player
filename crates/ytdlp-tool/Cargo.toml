@@ -1,7 +1,7 @@
 [package]
 name = "ytdlp-tool"
 description = "Discovery, provisioning and self-update of the yt-dlp executable."
-version = "0.4.80"
+version = "0.4.81"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,10 +10,12 @@ authors.workspace = true
 # Layer 1: standalone capability. Knows nothing about any other Flatline crate.
 [dependencies]
 app-logging = { workspace = true }
+fastrand = "2"
 media-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 ureq = { workspace = true }
+url = { workspace = true }
 yt-dlp = { workspace = true }
 zip = { workspace = true }

@@ -263,7 +263,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-core"
-version = "0.4.83"
+version = "0.4.84"
 dependencies = [
  "app-logging",
  "image",
@@ -7139,7 +7139,7 @@ version = "0.4.80"
 
 [[package]]
 name = "stream-resolver"
-version = "0.4.81"
+version = "0.4.82"
 dependencies = [
  "app-logging",
  "media-model",
@@ -9812,14 +9812,16 @@ dependencies = [
 
 [[package]]
 name = "ytdlp-tool"
-version = "0.4.80"
+version = "0.4.81"
 dependencies = [
  "app-logging",
+ "fastrand",
  "media-model",
  "serde",
  "serde_json",
  "tokio",
  "ureq",
+ "url",
  "yt-dlp",
  "zip 8.6.0",
 ]

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use stream_resolver::Resolver;
 use ui_kit::{SourceLists, SourceOption};
-use ytdlp_tool::YtDlp;
+use ytdlp_tool::{ProxyPool, YtDlp};
 
 use crate::paths::AppPaths;
 use crate::session::Session;
@@ -690,6 +690,8 @@ pub struct App {
     /// The media the user still has to decide about.
     pending: Mutex<Option<PendingMedia>>,
     pending_playlist: Mutex<Option<PendingPlaylist>>,
+    /// Shared proxy pool for yt-dlp metadata resolution.
+    proxy_pool: Arc<ProxyPool>,
     /// The last application release version shown to the user.
     /// Whether -4 was auto-enabled for the current playback retry sequence.
     auto_force_ipv4: AtomicBool,
@@ -715,7 +717,8 @@ impl App {
         let session = Session::new(paths.session_helper(), paths.cookies(), paths.user_data());
         let settings =
             Settings::load(paths.settings()).map_err(|error| Error::Settings(error.to_string()))?;
-        let resolver = build_resolver(ytdlp, &paths.cookies(), &settings);
+        let proxy_pool = Arc::new(ProxyPool::new());
+        let resolver = build_resolver(ytdlp, &paths.cookies(), &settings, proxy_pool.clone());
         let pre_buffer_seconds = settings.pre_buffer_seconds().0;
         app_logging::notice(format!(
             "settings loaded from {}; pre-buffer={pre_buffer_seconds}s log_level={}",
@@ -754,6 +757,7 @@ impl App {
             stream_buffer,
             pending: Mutex::new(None),
             pending_playlist: Mutex::new(None),
+            proxy_pool,
             url_entry: Mutex::new(UrlEntryState::default()),
             auto_force_ipv4: AtomicBool::new(false),
             notified_app_update: Mutex::new(None),
@@ -2691,7 +2695,12 @@ impl App {
     /// `service`, and tells the user the cookies are being regenerated.
     fn regenerate_cookies(&self, service: Service) {
         let tool = self.ytdlp.tool();
-        let mut resolver = build_resolver(&tool, self.session.cookies_dir(), &self.settings);
+        let mut resolver = build_resolver(
+            &tool,
+            self.session.cookies_dir(),
+            &self.settings,
+            self.proxy_pool.clone(),
+        );
         if self.auto_force_ipv4.load(Ordering::SeqCst) {
             resolver = resolver.with_force_ipv4();
         }
@@ -3058,7 +3067,12 @@ impl App {
         self.ytdlp.cancel_all();
         self.ytdlp.replace_tool(ytdlp.clone());
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
-        *resolver = build_resolver(ytdlp, self.session.cookies_dir(), &self.settings);
+        *resolver = build_resolver(
+            ytdlp,
+            self.session.cookies_dir(),
+            &self.settings,
+            self.proxy_pool.clone(),
+        );
     }
 
     /// Starts background checks for application and `yt-dlp` updates at startup and then periodically.
@@ -3259,6 +3273,7 @@ impl App {
         let cookies = self.session.cookies_dir().to_path_buf();
         let settings = self.settings.clone();
         let paths = self.paths.clone();
+        let proxy_pool = Arc::clone(&self.proxy_pool);
         self.runtime.handle().spawn(async move {
             app_logging::notice(format!(
                 "downloading yt-dlp update via yt-dlp crate: latest={} url={}",
@@ -3275,7 +3290,7 @@ impl App {
                     let tool = ytdlp_tool::locate::at(&managed, tools.clone());
                     ytdlp.replace_tool(tool.clone());
                     if let Ok(mut resolver) = resolver.lock() {
-                        *resolver = build_resolver(&tool, &cookies, &settings);
+                        *resolver = build_resolver(&tool, &cookies, &settings, proxy_pool.clone());
                     }
                     app_logging::notice(format!("yt-dlp update applied: latest={version}"));
                     let _ = outbox
@@ -4152,7 +4167,12 @@ fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
 }
 
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
-fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings) -> Resolver {
+fn build_resolver(
+    ytdlp: &YtDlp,
+    cookies: &std::path::Path,
+    settings: &Settings,
+    proxy_pool: Arc<ProxyPool>,
+) -> Resolver {
     let deno_path = ensure_deno(ytdlp, settings);
     let extra_args = settings.ytdlp_extra_args(deno_path.as_deref());
     if !extra_args.is_empty() {
@@ -4167,7 +4187,10 @@ fn build_resolver(ytdlp: &YtDlp, cookies: &std::path::Path, settings: &Settings)
             site_args.len()
         ));
     }
-    let mut resolver = Resolver::new(ytdlp.clone()).with_args(extra_args).with_site_args(site_args);
+    let mut resolver = Resolver::new(ytdlp.clone())
+        .with_args(extra_args)
+        .with_site_args(site_args)
+        .with_proxy_pool(proxy_pool);
     let services: Vec<Service> = web_session::Sources::installed()
         .map(|sources| sources.all().iter().map(|source| source.service()).collect())
         .unwrap_or_else(|| vec![Service::YouTube, Service::Twitch]);

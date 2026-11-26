@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{Error, RESOLUTION_TIMEOUT, SOCKET_TIMEOUT, YtDlp};
+use crate::{Error, ProxyOutcome, ProxyPool, RESOLUTION_TIMEOUT, SOCKET_TIMEOUT, YtDlp};
 
 /// Metadata resolution request.
 #[derive(Debug, Clone, Default)]
@@ -20,6 +20,8 @@ pub struct FetchRequest {
     pub cookies: Vec<(String, PathBuf)>,
     /// Extra arguments passed to `yt-dlp`.
     pub args: Vec<String>,
+    /// Optional proxy pool used for yt-dlp network requests.
+    pub proxy_pool: Option<Arc<ProxyPool>>,
 }
 
 /// Metadata returned from `yt-dlp`.
@@ -55,6 +57,7 @@ pub async fn fetch_with_cancel(
     let url = request.url.clone();
     let cookies = normalize_cookies(request.cookies);
     let args = normalize_args(request.args);
+    let proxy_pool = request.proxy_pool.clone();
     let tool_for_task = tool.clone();
     let cancel_flag = cancel.clone();
     let pid_flag = pid.clone();
@@ -63,7 +66,16 @@ pub async fn fetch_with_cancel(
     let task_url = url.clone();
     let budget = Budget::start();
     let result = tokio::task::spawn_blocking(move || {
-        run_fetch(&tool_for_task, &task_url, &cookies, &args, &cancel_flag, &pid_flag, budget)
+        run_fetch(
+            &tool_for_task,
+            &task_url,
+            &cookies,
+            &args,
+            proxy_pool.as_deref(),
+            &cancel_flag,
+            &pid_flag,
+            budget,
+        )
     })
     .await
     .map_err(|error| Error::YtDlp(format!("yt-dlp task failed: {error}")))?;
@@ -131,11 +143,13 @@ impl Budget {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_fetch(
     tool: &YtDlp,
     url: &str,
     cookies: &[(String, PathBuf)],
     args: &[String],
+    proxy_pool: Option<&ProxyPool>,
     cancel: &AtomicBool,
     pid: &AtomicU32,
     budget: Budget,
@@ -145,8 +159,9 @@ fn run_fetch(
     // starting a process that would be killed right away.
     budget.may_start(cancel)?;
 
+    let proxy = proxy_pool.and_then(|pool| pool.proxy_for(url));
     let mut command = tool.command();
-    command.args(common_args(args));
+    command.args(common_args(args, proxy.as_deref()));
     for (_, cookie) in cookies {
         command.arg("--cookies");
         command.arg(cookie);
@@ -156,6 +171,9 @@ fn run_fetch(
     command.arg("--");
     command.arg(url);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(proxy) = proxy.as_deref() {
+        app_logging::notice(format!("yt-dlp using proxy: url={url} proxy={proxy}"));
+    }
 
     let mut child = command.spawn().map_err(|error| {
         Error::YtDlp(format!(
@@ -257,13 +275,34 @@ fn run_fetch(
         let message = if stderr.is_empty() { output_excerpt(&stdout_capture) } else { stderr };
         let detail =
             if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
+        if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
+            pool.report(proxy, ProxyOutcome::Failure);
+        }
         return Err(Error::YtDlp(detail));
     }
 
-    let value = parse_document(&stdout)
-        .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
-    deserialize_document_lenient(value)
-        .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))
+    let value = match parse_document(&stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
+                pool.report(proxy, ProxyOutcome::Failure);
+            }
+            return Err(Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")));
+        }
+    };
+    let document = match deserialize_document_lenient(value) {
+        Ok(document) => document,
+        Err(error) => {
+            if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
+                pool.report(proxy, ProxyOutcome::Failure);
+            }
+            return Err(Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")));
+        }
+    };
+    if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
+        pool.report(proxy, ProxyOutcome::Success);
+    }
+    Ok(document)
 }
 
 /// Parses the first JSON value in `stdout`.
@@ -336,7 +375,7 @@ fn spawn_output_reader<R: Read + Send + 'static>(
     })
 }
 
-fn common_args(extra: &[String]) -> Vec<String> {
+fn common_args(extra: &[String], proxy: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "--no-warnings".to_string(),
         "--no-progress".to_string(),
@@ -344,6 +383,7 @@ fn common_args(extra: &[String]) -> Vec<String> {
         "-v".to_string(),
     ];
     let mut has_socket_timeout = false;
+    let mut has_proxy = false;
     let mut iter = extra.iter();
     while let Some(arg) = iter.next() {
         if !args.iter().any(|existing| existing == arg) {
@@ -357,10 +397,25 @@ fn common_args(extra: &[String]) -> Vec<String> {
                 args.push(value.clone());
             }
         }
+        if arg == "--proxy" {
+            has_proxy = true;
+            if let Some(value) = iter.next()
+                && !args.iter().any(|existing| existing == value)
+            {
+                args.push(value.clone());
+            }
+        }
     }
     if !has_socket_timeout {
         args.insert(3, SOCKET_TIMEOUT.as_secs().to_string());
         args.insert(3, "--socket-timeout".to_string());
+    }
+    if !has_proxy && let Some(proxy) = proxy {
+        let proxy = proxy.trim();
+        if !proxy.is_empty() {
+            args.push("--proxy".to_string());
+            args.push(proxy.to_string());
+        }
     }
     args
 }
@@ -854,11 +909,29 @@ mod tests {
 
     #[test]
     fn common_args_include_socket_timeout_once() {
-        let args =
-            common_args(&["-4".to_string(), "--socket-timeout".to_string(), "20".to_string()]);
+        let args = common_args(
+            &["-4".to_string(), "--socket-timeout".to_string(), "20".to_string()],
+            None,
+        );
         assert_eq!(args.iter().filter(|a| a.as_str() == "--socket-timeout").count(), 1);
         assert!(args.windows(2).any(|w| w[0] == "--socket-timeout" && w[1] == "20"));
         assert!(args.iter().any(|a| a == "-4"));
+    }
+
+    #[test]
+    fn common_args_add_proxy_when_requested() {
+        let args = common_args(&[], Some("socks5://127.0.0.1:1080"));
+        assert!(args.windows(2).any(|w| w[0] == "--proxy" && w[1] == "socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn common_args_keep_explicit_proxy() {
+        let args = common_args(
+            &["--proxy".to_string(), "http://1.2.3.4:8080".to_string()],
+            Some("socks5://127.0.0.1:1080"),
+        );
+        assert_eq!(args.iter().filter(|a| a.as_str() == "--proxy").count(), 1);
+        assert!(args.windows(2).any(|w| w[0] == "--proxy" && w[1] == "http://1.2.3.4:8080"));
     }
 
     #[test]
