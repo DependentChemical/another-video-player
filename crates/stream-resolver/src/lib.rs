@@ -80,17 +80,6 @@ pub enum Error {
     NoStream,
     /// The resolver process did not finish before its deadline.
     Timeout(u64),
-    /// The resolver process did not answer before its hard deadline.
-    ///
-    /// The deadline belongs to Flatline: the process was killed because it
-    /// ran out of time. A network failure that `yt-dlp` reports itself is
-    /// not a timeout and stays an [`Error::Tool`].
-    HardTimeout {
-        /// The deadline that was reached, in seconds.
-        seconds: u64,
-        /// What the process had written when it was killed.
-        detail: String,
-    },
     /// The resolver's captured output could not be read.
     Output(std::io::Error),
     /// A resolver output reader stopped unexpectedly.
@@ -117,13 +106,6 @@ impl std::fmt::Display for Error {
             Error::NoStream => write!(f, "no stream was selected"),
             Error::Timeout(seconds) => {
                 write!(f, "yt-dlp did not respond within {seconds} seconds")
-            }
-            Error::HardTimeout { seconds, detail } => {
-                if detail.is_empty() {
-                    write!(f, "yt-dlp did not respond within {seconds} seconds")
-                } else {
-                    write!(f, "yt-dlp did not respond within {seconds} seconds; {detail}")
-                }
             }
             Error::Output(error) => write!(f, "yt-dlp output could not be read: {error}"),
             Error::OutputReaderPanicked => write!(f, "yt-dlp output reader stopped unexpectedly"),
@@ -347,10 +329,7 @@ fn is_playlist_url(url: &str) -> bool {
 
 fn map_tool_error(error: ytdlp_tool::Error) -> Error {
     match error {
-        // A cancellation and a hard timeout are Flatline's own decisions, so
-        // they keep their own kind instead of hiding in a message.
         ytdlp_tool::Error::Cancelled => Error::Cancelled,
-        ytdlp_tool::Error::Timeout { seconds, detail } => Error::HardTimeout { seconds, detail },
         other => Error::Tool(other.to_string()),
     }
 }
@@ -431,22 +410,6 @@ mod tests {
         );
 
         assert!(resolver.args_for("https://example.org/video.mp4").is_empty());
-    }
-
-    #[test]
-    fn the_hard_timeout_keeps_its_own_kind() {
-        let error = map_tool_error(ytdlp_tool::Error::Timeout {
-            seconds: 20,
-            detail: "last output: stderr=\"\"".to_string(),
-        });
-
-        match error {
-            Error::HardTimeout { seconds, detail } => {
-                assert_eq!(seconds, 20);
-                assert!(detail.contains("last output"));
-            }
-            other => panic!("expected the hard timeout, got {other:?}"),
-        }
     }
 
     #[test]

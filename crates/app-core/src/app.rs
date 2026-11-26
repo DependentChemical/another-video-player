@@ -40,12 +40,6 @@ pub enum Message {
         url: String,
         /// The error message.
         error: String,
-        /// The hard deadline that was reached, when the resolver hit one.
-        ///
-        /// A timeout is the only failure a different network stack can
-        /// still fix, so it is the only one that is retried. Every other
-        /// failure ends the entry with the error modal.
-        timeout_seconds: Option<u64>,
         /// The entry generation the failure belongs to.
         epoch: u64,
     },
@@ -148,6 +142,9 @@ pub struct ResolvedMedia {
     pub sponsorblock_segments: Vec<source_youtube::sponsorblock::Segment>,
 }
 
+/// Maximum number of URL entry attempts before showing the final error.
+const URL_ENTRY_MAX_ATTEMPTS: u32 = 6;
+
 /// The state of the URL the user submitted.
 ///
 /// Only one URL is processed at a time. The generation tells the results
@@ -159,8 +156,10 @@ struct UrlEntryState {
     url: Option<String>,
     /// The generation of the entry that is running.
     epoch: u64,
-    /// Whether the one-shot IPv4 retry was already used for this URL.
-    ipv4_retry_used: bool,
+    /// How many attempts have been made for the current URL.
+    attempts: u32,
+    /// Whether IPv4 fallback has been enabled for the current URL.
+    force_ipv4: bool,
 }
 
 impl UrlEntryState {
@@ -168,7 +167,8 @@ impl UrlEntryState {
     fn begin(&mut self, url: &str, epoch: u64) {
         self.url = Some(url.to_string());
         self.epoch = epoch;
-        self.ipv4_retry_used = false;
+        self.attempts = 1;
+        self.force_ipv4 = false;
     }
 
     /// Whether `epoch` is the generation of the entry that is running.
@@ -176,29 +176,29 @@ impl UrlEntryState {
         epoch != 0 && self.epoch == epoch
     }
 
-    /// Whether the IPv4 retry may still be used for `url`.
-    fn may_retry_with_ipv4(&self, url: &str) -> bool {
-        !self.ipv4_retry_used && self.url.as_deref() == Some(url)
+    /// Whether another attempt may still be made for `url`.
+    fn may_retry(&self, url: &str) -> bool {
+        self.url.as_deref() == Some(url) && self.attempts < URL_ENTRY_MAX_ATTEMPTS
     }
 
-    /// Notes that the IPv4 retry was used for this URL.
-    fn mark_ipv4_retry(&mut self) {
-        self.ipv4_retry_used = true;
+    /// Notes a retry attempt for `url` and enables IPv4 after the first error.
+    fn mark_retry(&mut self, url: &str) -> bool {
+        if !self.may_retry(url) {
+            return false;
+        }
+        self.attempts += 1;
+        self.force_ipv4 = true;
+        true
     }
 }
 
 /// A resolve that failed.
-///
-/// The failure carries whether the resolver hit its hard deadline, so the
-/// caller does not have to guess from the wording of the message.
 #[derive(Debug, Clone)]
 pub struct ResolveFailure {
     /// The URL that failed.
     pub url: String,
     /// The message shown to the user.
     pub message: String,
-    /// Whether the resolver hit its hard deadline.
-    pub hard_timeout: bool,
 }
 /// A URL that was resolved while another media plays.
 #[derive(Debug, Clone)]
@@ -298,11 +298,8 @@ const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
 
-/// Base delay before the first retry. Hard timeouts grow from here but stay capped.
+/// Delay before the next retry.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(0);
-
-/// Upper bound for retry backoff so playback recovery stays responsive.
-const RETRY_MAX_DELAY: Duration = Duration::from_secs(16);
 
 /// How long the background thumbnail pass waits between downloads or retries.
 const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
@@ -444,7 +441,7 @@ impl RetryState {
         Some((url, kind))
     }
 
-    /// Schedules the next retry with bounded backoff for hard network timeouts.
+    /// Schedules the next retry.
     fn schedule_next(&mut self, kind: RetryErrorKind, message: &str) {
         self.next_retry = Some(Instant::now() + retry_delay(kind, message, self.attempt));
     }
@@ -969,20 +966,11 @@ impl App {
                     })
                 }
                 Err(error) => {
-                    let timeout_seconds = match &error {
-                        stream_resolver::Error::HardTimeout { seconds, .. } => Some(*seconds),
-                        _ => None,
-                    };
-                    let raw = error.to_string();
-                    let mapped = if timeout_seconds.is_some() {
-                        format!("Failed to process URL, timeout: {raw}")
-                    } else {
-                        format!("Failed to process URL: {raw}")
-                    };
+                    let mapped = format!("Failed to process URL: {error}");
                     app_logging::warning(format!(
-                        "url entry failed: url={url} epoch={epoch} timeout_seconds={timeout_seconds:?} error={mapped}"
+                        "url entry failed: url={url} epoch={epoch} error={mapped}"
                     ));
-                    Message::UrlEntryFailed { url, error: mapped, timeout_seconds, epoch }
+                    Message::UrlEntryFailed { url, error: mapped, epoch }
                 }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
@@ -1118,17 +1106,11 @@ impl App {
                     }))
                 }
                 Err(error) => {
-                    let hard_timeout =
-                        matches!(error, stream_resolver::Error::HardTimeout { .. });
                     app_logging::warning(format!(
-                        "playback source could not be resolved: url={url} reason={} hard_timeout={hard_timeout} error={error}",
+                        "playback source could not be resolved: url={url} reason={} error={error}",
                         reason.as_str()
                     ));
-                    Message::Resolved(Err(ResolveFailure {
-                        url,
-                        message: error.to_string(),
-                        hard_timeout,
-                    }))
+                    Message::Resolved(Err(ResolveFailure { url, message: error.to_string() }))
                 }
             };
             let _ = outbox.lock().map(|sender| sender.send(Box::new(message)));
@@ -2558,11 +2540,6 @@ impl App {
 
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
-        if self.handle_ytdlp_timeout(&error) {
-            self.recover_from_timeout(&url);
-            self.clear_retry();
-            return;
-        }
         self.notify_tool_update_if_needed(&error);
         self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
     }
@@ -2578,13 +2555,8 @@ impl App {
     }
 
     /// Handles a resolver error by scheduling a retry.
-    ///
-    /// A playback resolve keeps the regular retries: the IPv4 fallback is
-    /// enabled once and the retry is scheduled with its backoff. A URL the
-    /// user submitted does not come through here; it ends in the error
-    /// modal instead.
     pub fn handle_resolver_error(&self, failure: ResolveFailure) {
-        let ResolveFailure { url, message, hard_timeout } = failure;
+        let ResolveFailure { url, message } = failure;
         if !self.expects_resolved_url(&url) {
             return;
         }
@@ -2594,125 +2566,25 @@ impl App {
                 state.resolving_url = None;
             }
         }
-        if hard_timeout || self.handle_ytdlp_timeout(&message) {
-            if !self.auto_force_ipv4.swap(true, Ordering::SeqCst) {
-                self.enable_playback_ipv4_fallback(&url);
-            }
-            self.recover_from_timeout(&url);
-            self.schedule_retry(
-                url,
-                RetryErrorKind::Resolver,
-                RetryKind::Resolver,
-                format!("Failed to process URL, timeout: {message}"),
-            );
-            return;
-        }
         self.notify_tool_update_if_needed(&message);
+        self.enable_resolver_ipv4_fallback(&url);
         self.schedule_retry(url, RetryErrorKind::Resolver, RetryKind::Resolver, message);
     }
 
-    /// Enables `-4` for subsequent playback retries in the current sequence.
-    fn enable_playback_ipv4_fallback(&self, url: &str) {
+    /// Enables `-4` for subsequent playback resolves in the current sequence.
+    fn enable_resolver_ipv4_fallback(&self, url: &str) {
         let mut resolver = self.resolver.lock().expect("the resolver is not poisoned");
         if resolver.forces_ipv4() {
             return;
         }
         *resolver = resolver.clone().with_force_ipv4();
-        drop(resolver);
+        self.auto_force_ipv4.store(true, Ordering::SeqCst);
         app_logging::warning(format!(
-            "playback resolver hard timeout; enabling -4 for subsequent retries: url={url}"
+            "playback resolver error; enabling -4 for subsequent retries: url={url}"
         ));
         let _ = self.outbox.lock().map(|sender| {
-            sender.send(Box::new(Message::Toast(
-                "Connection timed out; retrying with IPv4...".to_string(),
-            )))
+            sender.send(Box::new(Message::Toast("Retrying with IPv4...".to_string())))
         });
-    }
-
-    /// Runs the timeout recovery before a retry: the sign-in check, with the
-    /// cookie regeneration the retry uses.
-    ///
-    /// The procedure belongs to the YouTube and Twitch sources: for any other
-    /// target nothing runs and the plain timeout handling applies. A
-    /// signed-in profile regenerates its cookies; an unsigned one is offered
-    /// the sign-in, and the cookies are regenerated once the user signs in.
-    /// A decline is allowed and the retry proceeds as before.
-    fn recover_from_timeout(&self, url: &str) {
-        let Some(service) = web_session::registry::service_from_url(url) else {
-            return;
-        };
-        let signed_in = self.session.has_signed_in_cookies(service);
-        let asks_sign_in = match service {
-            Service::YouTube => {
-                source_youtube::timeout_recovery(signed_in)
-                    == source_youtube::TimeoutRecovery::SignInThenRegenerate
-            }
-            Service::Twitch => {
-                source_twitch::timeout_recovery(signed_in)
-                    == source_twitch::TimeoutRecovery::SignInThenRegenerate
-            }
-        };
-        app_logging::notice(format!(
-            "timeout recovery after a yt-dlp timeout: service={} url={url} signed_in={signed_in}",
-            service.name()
-        ));
-        if asks_sign_in {
-            self.sign_in_then_regenerate_cookies(service, url);
-        } else {
-            self.regenerate_cookies(service);
-        }
-    }
-
-    /// Asks the user to sign in for `service`, then regenerates the cookies
-    /// the retry uses.
-    ///
-    /// A declined sign-in is not an error: the retry proceeds without the
-    /// new cookies.
-    fn sign_in_then_regenerate_cookies(&self, service: Service, url: &str) {
-        app_logging::notice(format!(
-            "the profile is not signed in; asking the user to sign in: service={} url={url}",
-            service.name()
-        ));
-        let notice = self.outbox.lock().expect("the outbox is not poisoned").clone();
-        match self.session.sign_in(service, url, &notice) {
-            Ok(()) => self.regenerate_cookies(service),
-            Err(crate::session::Error::Declined) => {
-                app_logging::notice(format!(
-                    "the user declined the sign-in; the retry proceeds without the new cookies: service={}",
-                    service.name()
-                ));
-            }
-            Err(problem) => {
-                app_logging::warning(format!(
-                    "the sign-in after the timeout did not finish: service={} error={problem}",
-                    service.name()
-                ));
-            }
-        }
-    }
-
-    /// Rebuilds the resolver so the retry uses the current cookies of
-    /// `service`, and tells the user the cookies are being regenerated.
-    fn regenerate_cookies(&self, service: Service) {
-        let tool = self.ytdlp.tool();
-        let mut resolver = build_resolver(
-            &tool,
-            self.session.cookies_dir(),
-            &self.settings,
-            self.proxy_pool.clone(),
-        );
-        if self.auto_force_ipv4.load(Ordering::SeqCst) {
-            resolver = resolver.with_force_ipv4();
-        }
-        *self.resolver.lock().expect("the resolver is not poisoned") = resolver;
-        app_logging::notice(format!(
-            "the cookies used by the retry are regenerated: service={}",
-            service.name()
-        ));
-        let _ = self
-            .outbox
-            .lock()
-            .map(|sender| sender.send(Box::new(Message::RegeneratingCookies(service))));
     }
 
     /// Schedules another attempt immediately, or reports failure when exhausted.
@@ -2746,9 +2618,8 @@ impl App {
         let error = message.clone();
         drop(state);
         app_logging::warning(format!(
-            "retry scheduled: kind={kind:?} attempt={attempt} delay={}s timeout_class={} error={message}",
-            delay_seconds,
-            is_hard_timeout(kind, &message)
+            "retry scheduled: kind={kind:?} attempt={attempt} delay={}s error={message}",
+            delay_seconds
         ));
         let _ = self.outbox.lock().map(|sender| {
             sender.send(Box::new(Message::RetryScheduled {
@@ -3102,24 +2973,6 @@ impl App {
     /// Whether a `yt-dlp` run started for `epoch` has been superseded.
     fn is_ytdlp_stale(&self, epoch: u64) -> bool {
         self.ytdlp_epoch.load(Ordering::SeqCst) != epoch
-    }
-
-    /// Reacts to a timeout in the playback work.
-    ///
-    /// Only the playback and the thumbnail refresh are stopped: the URL the
-    /// user submitted is processed on its own terms and keeps running, so a
-    /// playback timeout never cancels the entry the user is waiting for.
-    fn handle_ytdlp_timeout(&self, error: &str) -> bool {
-        let lower = error.to_ascii_lowercase();
-        if !(lower.contains("timed out") || lower.contains("did not respond within")) {
-            return false;
-        }
-        app_logging::warning(format!(
-            "yt-dlp timeout detected; cancelling the active playback work: {error}"
-        ));
-        self.ytdlp.cancel_playback();
-        self.ytdlp.cancel_thumbnail();
-        true
     }
 
     fn poll_app_update_background(self: Arc<Self>) {
@@ -3554,45 +3407,41 @@ impl App {
         let _ = self.outbox.lock().map(|sender| sender.send(Box::new(Message::Problem(text))));
     }
 
-    /// Retries a URL entry once with IPv4 when the hard timeout was hit.
+    /// Retries a failed URL entry with bounded attempts and IPv4 fallback.
     ///
-    /// The hard timeout is the only failure a different network stack can
-    /// still fix, so it is the only one that is retried. The retry happens
-    /// once per URL: a second failure ends the entry with the error modal.
-    ///
-    /// The resolver is copied for the retry, so the playback resolver keeps
-    /// its own behaviour.
-    ///
-    /// Returns true when the retry was started.
-    pub fn retry_url_entry_with_force_ipv4(&self, url: &str, epoch: u64, seconds: u64) -> bool {
+    /// Returns true when another attempt was scheduled.
+    pub fn retry_url_entry(&self, url: &str, epoch: u64, error: &str) -> bool {
         let normalized = url.trim().to_string();
         if normalized.is_empty() {
             return false;
         }
-        let forced = {
-            let resolver = self.resolver.lock().expect("the resolver is not poisoned");
-            if resolver.forces_ipv4() {
-                return false;
-            }
-            resolver.clone().with_force_ipv4()
-        };
-        {
+        let (attempt, force_ipv4) = {
             let mut state = self.url_entry.lock().expect("the url entry state is not poisoned");
-            if !state.may_retry_with_ipv4(&normalized) {
+            if !state.is_current(epoch) || !state.mark_retry(&normalized) {
                 return false;
             }
-            state.mark_ipv4_retry();
-        }
+            (state.attempts, state.force_ipv4)
+        };
+
+        let resolver = {
+            let resolver = self.resolver.lock().expect("the resolver is not poisoned").clone();
+            if force_ipv4 && !resolver.forces_ipv4() {
+                resolver.with_force_ipv4()
+            } else {
+                resolver
+            }
+        };
 
         app_logging::warning(format!(
-            "url entry hit the hard timeout; retrying once with IPv4: url={normalized} epoch={epoch} timeout_seconds={seconds}"
+            "url entry failed; retrying: url={normalized} epoch={epoch} attempt={attempt}/{URL_ENTRY_MAX_ATTEMPTS} error={error}"
         ));
-        // The error comes first, the retry that follows it second.
-        self.toast(format!(
-            "Could not process the URL: it did not answer within {seconds} seconds"
-        ));
-        self.toast("Retrying once with IPv4...".to_string());
-        self.start_url_entry(normalized, epoch, forced);
+        self.toast(format!("Could not process the URL: {error}"));
+        if attempt == 2 {
+            self.toast("Retrying with IPv4...".to_string());
+        } else {
+            self.toast(format!("Retrying ({}/{})...", attempt - 1, URL_ENTRY_MAX_ATTEMPTS - 1));
+        }
+        self.start_url_entry(normalized, epoch, resolver);
         true
     }
 
@@ -4141,29 +3990,9 @@ fn sponsorblock_color(category: &str) -> [u8; 3] {
     }
 }
 
-/// Retry delay for a failure class. Hard network timeouts get bounded backoff.
-fn retry_delay(kind: RetryErrorKind, message: &str, attempt: u32) -> Duration {
-    if !is_hard_timeout(kind, message) {
-        return RETRY_BASE_DELAY;
-    }
-    let secs = match attempt {
-        0 => 2,
-        1 => 4,
-        2 => 8,
-        _ => 16,
-    };
-    Duration::from_secs(secs).min(RETRY_MAX_DELAY)
-}
-
-/// Whether a failure is the hard yt-dlp/network timeout class that should back off.
-fn is_hard_timeout(kind: RetryErrorKind, message: &str) -> bool {
-    if !matches!(kind, RetryErrorKind::Resolver | RetryErrorKind::SourceSelection) {
-        return false;
-    }
-    let lower = message.to_ascii_lowercase();
-    lower.contains("did not respond within")
-        || lower.contains("timed out")
-        || lower.contains("downloading webpage")
+/// Retry delay for a failure class.
+fn retry_delay(_kind: RetryErrorKind, _message: &str, _attempt: u32) -> Duration {
+    RETRY_BASE_DELAY
 }
 
 /// Builds the resolver around the managed yt-dlp tool and known cookie files.
@@ -4534,33 +4363,29 @@ mod tests {
     }
 
     #[test]
-    fn the_ipv4_retry_is_used_once_per_url() {
+    fn url_entry_retries_enable_ipv4_and_stop_after_budget() {
         let mut state = UrlEntryState::default();
         state.begin("https://example.com/one", 1);
 
-        assert!(state.may_retry_with_ipv4("https://example.com/one"));
-        state.mark_ipv4_retry();
-
-        assert!(!state.may_retry_with_ipv4("https://example.com/one"));
+        for attempt in 2..=URL_ENTRY_MAX_ATTEMPTS {
+            assert!(state.mark_retry("https://example.com/one"));
+            assert_eq!(state.attempts, attempt);
+            assert!(state.force_ipv4);
+        }
+        assert!(!state.mark_retry("https://example.com/one"));
     }
 
     #[test]
-    fn the_ipv4_retry_only_belongs_to_the_url_that_is_running() {
+    fn a_new_url_entry_resets_retry_state() {
         let mut state = UrlEntryState::default();
         state.begin("https://example.com/one", 1);
-
-        assert!(!state.may_retry_with_ipv4("https://example.com/two"));
-    }
-
-    #[test]
-    fn a_new_url_may_retry_with_ipv4_again() {
-        let mut state = UrlEntryState::default();
-        state.begin("https://example.com/one", 1);
-        state.mark_ipv4_retry();
+        assert!(state.mark_retry("https://example.com/one"));
 
         state.begin("https://example.com/two", 2);
 
-        assert!(state.may_retry_with_ipv4("https://example.com/two"));
+        assert_eq!(state.attempts, 1);
+        assert!(!state.force_ipv4);
+        assert!(state.may_retry("https://example.com/two"));
     }
 
     #[test]
@@ -4609,34 +4434,8 @@ mod tests {
     }
 
     #[test]
-    fn hard_timeout_retry_is_backed_off_and_capped() {
-        let mut retry = RetryState::default();
-        assert!(retry.start(
-            "https://example.com/video".into(),
-            RetryErrorKind::Resolver,
-            "yt-dlp did not respond within 20 seconds; Downloading webpage"
-        ));
-        let first = retry.next_retry.expect("scheduled");
-        retry.take_due();
-        retry.start(
-            "https://example.com/video".into(),
-            RetryErrorKind::Resolver,
-            "yt-dlp did not respond within 20 seconds; Downloading webpage",
-        );
-        let second = retry.next_retry.expect("scheduled");
-        assert!(second.saturating_duration_since(first) <= Duration::from_secs(17));
-        assert_eq!(
-            retry_delay(RetryErrorKind::Resolver, "did not respond within 20 seconds", 3),
-            Duration::from_secs(16)
-        );
-    }
-
-    #[test]
-    fn non_timeout_retry_stays_immediate() {
-        assert_eq!(
-            retry_delay(RetryErrorKind::Resolver, "some other error", 0),
-            Duration::from_secs(0)
-        );
+    fn retry_delay_stays_immediate() {
+        assert_eq!(retry_delay(RetryErrorKind::Resolver, "any error", 0), Duration::from_secs(0));
         assert_eq!(retry_delay(RetryErrorKind::Playback, "timed out", 2), Duration::from_secs(0));
     }
 

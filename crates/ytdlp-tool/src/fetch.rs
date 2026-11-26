@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{Error, ProxyOutcome, ProxyPool, RESOLUTION_TIMEOUT, SOCKET_TIMEOUT, YtDlp};
+use crate::{Error, ProxyOutcome, ProxyPool, SOCKET_TIMEOUT, YtDlp};
 
 /// Metadata resolution request.
 #[derive(Debug, Clone, Default)]
@@ -103,41 +103,23 @@ pub async fn fetch_with_cancel(
     }
 }
 
-/// The budget of one `yt-dlp` invocation.
-///
-/// The deadline starts before the invocation, so the time the request
-/// spends waiting for a free worker and the time the process needs to
-/// start are part of the budget. A deadline that only counted the wait
-/// after the process existed would let a slow start stretch the timeout
-/// without a bound.
+/// The timing state of one `yt-dlp` invocation.
 #[derive(Debug, Clone, Copy)]
 struct Budget {
     /// The moment the invocation started.
     started: Instant,
-    /// The moment the invocation has to be over.
-    deadline: Instant,
 }
 
 impl Budget {
-    /// Starts a new budget.
+    /// Starts a new invocation timer.
     fn start() -> Self {
-        let started = Instant::now();
-        Budget { started, deadline: started + RESOLUTION_TIMEOUT }
+        Self { started: Instant::now() }
     }
 
     /// Whether the request may still start a process.
-    ///
-    /// A request that is cancelled or out of time never starts a process,
-    /// so there is no process that would have to be killed right away.
     fn may_start(&self, cancel: &AtomicBool) -> Result<(), Error> {
         if cancel.load(Ordering::SeqCst) {
             return Err(Error::Cancelled);
-        }
-        if Instant::now() >= self.deadline {
-            return Err(Error::Timeout {
-                seconds: RESOLUTION_TIMEOUT.as_secs(),
-                detail: "the request never started".to_string(),
-            });
         }
         Ok(())
     }
@@ -154,9 +136,7 @@ fn run_fetch(
     pid: &AtomicU32,
     budget: Budget,
 ) -> Result<FetchDocument, Error> {
-    // A request that is cancelled before it starts never spawns a process,
-    // and a request whose budget is already gone is refused instead of
-    // starting a process that would be killed right away.
+    // A request that is cancelled before it starts never spawns a process.
     budget.may_start(cancel)?;
 
     let proxy = proxy_pool.and_then(|pool| pool.proxy_for(url));
@@ -211,48 +191,12 @@ fn run_fetch(
                 if !socket_timeout_logged && elapsed >= SOCKET_TIMEOUT {
                     socket_timeout_logged = true;
                     app_logging::warning(format!(
-                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_tail=\"{}\" stdout_tail=\"{}\"",
+                        "yt-dlp exceeded socket timeout without exiting: url={url} socket_timeout={}s elapsed={}s stderr_tail=\"{}\" stdout_tail=\"{}\"",
                         SOCKET_TIMEOUT.as_secs(),
                         elapsed.as_secs(),
-                        RESOLUTION_TIMEOUT.as_secs(),
                         output_excerpt(&stderr_capture),
                         output_excerpt(&stdout_capture),
                     ));
-                }
-                if Instant::now() >= budget.deadline {
-                    let stderr_text = tail_text(&stderr_capture);
-                    let stdout_text = tail_text(&stdout_capture);
-                    let stderr_excerpt = last_chars(&stderr_text, 300);
-                    let stdout_excerpt = last_chars(&stdout_text, 300);
-                    crate::locate::terminate_child_process(&mut child);
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    let stage =
-                        if stderr_excerpt.to_ascii_lowercase().contains("downloading webpage") {
-                            "downloading_webpage"
-                        } else if stderr_excerpt.to_ascii_lowercase().contains("extracting url") {
-                            "extracting_url"
-                        } else {
-                            "unknown"
-                        };
-                    app_logging::warning(format!(
-                        "yt-dlp hard timeout reached; killing process: url={url} stage={stage} socket_timeout={}s elapsed={}s hard_timeout={}s stderr_len={} stdout_len={} stderr_tail=\"{}\" stdout_tail=\"{}\"",
-                        SOCKET_TIMEOUT.as_secs(),
-                        elapsed.as_secs(),
-                        RESOLUTION_TIMEOUT.as_secs(),
-                        stderr_text.len(),
-                        stdout_text.len(),
-                        stderr_excerpt,
-                        stdout_excerpt
-                    ));
-                    pid.store(0, Ordering::SeqCst);
-                    return Err(Error::Timeout {
-                        seconds: RESOLUTION_TIMEOUT.as_secs(),
-                        detail: format!(
-                            "last output: stderr=\"{}\" stdout=\"{}\"",
-                            stderr_excerpt, stdout_excerpt
-                        ),
-                    });
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -941,14 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_is_the_hard_timeout_and_starts_with_the_invocation() {
-        let budget = Budget::start();
-
-        assert_eq!(budget.deadline - budget.started, RESOLUTION_TIMEOUT);
-        assert_eq!(RESOLUTION_TIMEOUT, std::time::Duration::from_secs(20));
-    }
-
-    #[test]
     fn a_cancelled_request_never_starts_a_process() {
         let cancel = AtomicBool::new(true);
 
@@ -958,26 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_out_of_time_never_starts_a_process() {
-        let cancel = AtomicBool::new(false);
-        let budget = Budget {
-            started: Instant::now(),
-            deadline: Instant::now() - std::time::Duration::from_secs(1),
-        };
-
-        let error = budget.may_start(&cancel).expect_err("an expired request is refused");
-
-        match error {
-            Error::Timeout { seconds, detail } => {
-                assert_eq!(seconds, RESOLUTION_TIMEOUT.as_secs());
-                assert!(detail.contains("never started"));
-            }
-            other => panic!("expected the hard timeout, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_request_in_time_and_not_cancelled_may_start() {
+    fn a_request_not_cancelled_may_start() {
         let cancel = AtomicBool::new(false);
 
         assert!(Budget::start().may_start(&cancel).is_ok());

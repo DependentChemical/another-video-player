@@ -1135,22 +1135,16 @@ fn tick(
                 app.set_pending_playlist(pending);
                 loading.entry_finished();
             }
-            Message::UrlEntryFailed { url, error, timeout_seconds, epoch } => {
+            Message::UrlEntryFailed { url, error, epoch } => {
                 if !app.is_current_url_entry(epoch) {
                     app_logging::debug(format!(
                         "discarded the failure of a url entry that was replaced: url={url}"
                     ));
                     continue;
                 }
-                // Only the hard timeout is worth a second attempt, because it
-                // is the only failure a different network stack can fix.
-                if let Some(seconds) = timeout_seconds
-                    && app.retry_url_entry_with_force_ipv4(&url, epoch, seconds)
-                {
+                if app.retry_url_entry(&url, epoch, &error) {
                     continue;
                 }
-                // The entry ends here: its process is killed and the error is
-                // shown in the modal.
                 app.cancel_url_entry();
                 loading.entry_failed(error.clone());
                 ui.show_url_error(&error);
