@@ -139,9 +139,68 @@ fn run_fetch(
     // A request that is cancelled before it starts never spawns a process.
     budget.may_start(cancel)?;
 
-    let proxy = proxy_pool.and_then(|pool| pool.proxy_for(url));
+    let direct = run_fetch_once(tool, url, cookies, args, None, cancel, pid, budget);
+    let direct_error = match direct {
+        Ok(document) => return Ok(document),
+        Err(Error::Cancelled) => return Err(Error::Cancelled),
+        Err(error) => error,
+    };
+
+    let Some(pool) = proxy_pool else {
+        return Err(direct_error);
+    };
+    let Some(proxy) = pool.proxy_for(url) else {
+        return Err(direct_error);
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return Err(Error::Cancelled);
+    }
+
+    let detail = error_detail(&direct_error);
+    app_logging::warning(format!(
+        "yt-dlp direct resolve failed; retrying with proxy: url={url} proxy={proxy} error={detail}"
+    ));
+
+    match run_fetch_once(tool, url, cookies, args, Some(proxy.as_str()), cancel, pid, budget) {
+        Ok(document) => {
+            pool.report(&proxy, ProxyOutcome::Success);
+            app_logging::notice(format!(
+                "yt-dlp resolve succeeded via proxy fallback: url={url} proxy={proxy}"
+            ));
+            Ok(document)
+        }
+        Err(Error::Cancelled) => Err(Error::Cancelled),
+        Err(error) => {
+            pool.report(&proxy, ProxyOutcome::Failure);
+            let proxy_detail = error_detail(&error);
+            app_logging::warning(format!(
+                "yt-dlp proxy fallback failed; keeping direct error: url={url} proxy={proxy} proxy_error={proxy_detail} direct_error={detail}"
+            ));
+            Err(direct_error)
+        }
+    }
+}
+
+fn error_detail(error: &Error) -> String {
+    let detail = error.to_string();
+    if detail.len() > 300 { last_chars(&detail, 300) } else { detail }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fetch_once(
+    tool: &YtDlp,
+    url: &str,
+    cookies: &[(String, PathBuf)],
+    args: &[String],
+    proxy: Option<&str>,
+    cancel: &AtomicBool,
+    pid: &AtomicU32,
+    budget: Budget,
+) -> Result<FetchDocument, Error> {
+    budget.may_start(cancel)?;
+
     let mut command = tool.command();
-    command.args(common_args(args, proxy.as_deref()));
+    command.args(common_args(args, proxy));
     for (_, cookie) in cookies {
         command.arg("--cookies");
         command.arg(cookie);
@@ -151,7 +210,7 @@ fn run_fetch(
     command.arg("--");
     command.arg(url);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(proxy) = proxy.as_deref() {
+    if let Some(proxy) = proxy {
         app_logging::notice(format!("yt-dlp using proxy: url={url} proxy={proxy}"));
     }
 
@@ -219,33 +278,13 @@ fn run_fetch(
         let message = if stderr.is_empty() { output_excerpt(&stdout_capture) } else { stderr };
         let detail =
             if message.is_empty() { format!("yt-dlp failed ({})", status) } else { message };
-        if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
-            pool.report(proxy, ProxyOutcome::Failure);
-        }
         return Err(Error::YtDlp(detail));
     }
 
-    let value = match parse_document(&stdout) {
-        Ok(value) => value,
-        Err(error) => {
-            if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
-                pool.report(proxy, ProxyOutcome::Failure);
-            }
-            return Err(Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")));
-        }
-    };
-    let document = match deserialize_document_lenient(value) {
-        Ok(document) => document,
-        Err(error) => {
-            if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
-                pool.report(proxy, ProxyOutcome::Failure);
-            }
-            return Err(Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")));
-        }
-    };
-    if let (Some(pool), Some(proxy)) = (proxy_pool, proxy.as_deref()) {
-        pool.report(proxy, ProxyOutcome::Success);
-    }
+    let value = parse_document(&stdout)
+        .map_err(|error| Error::YtDlp(format!("yt-dlp returned invalid JSON: {error}")))?;
+    let document = deserialize_document_lenient(value)
+        .map_err(|error| Error::YtDlp(format!("yt-dlp returned unexpected metadata: {error}")))?;
     Ok(document)
 }
 
