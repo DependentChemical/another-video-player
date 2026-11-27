@@ -1,7 +1,7 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import {
-    CloseButton, FlatButton, Icon, PlayIcon, MoreIcon, ContentCopyIcon, DeleteIcon
+    CloseButton, FlatButton, Icon, PlayIcon, MoreIcon, ContentCopyIcon, RefreshIcon, DeleteIcon
 } from "../widgets.slint";
 import { PlaylistItem, QueueItem } from "types.slint";
 
@@ -34,6 +34,7 @@ export component QueueDialog inherits Rectangle {
     private property <bool> picker-moves: false;
     callback item-selected(int);
     callback copy-url(string);
+    callback refresh-sources(int);
     callback remove-entry(int);
     callback move-requested(int, int);
     callback queue-row-pressed(int);
@@ -417,6 +418,38 @@ export component QueueDialog inherits Rectangle {
                         menu-touch := TouchArea {
                             clicked => {
                                 root.copy-url(root.menu-url);
+                                root.menu-open = false;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 4px;
+                        background: refresh-touch.has-hover ? Theme.elevated : transparent;
+
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            cross-axis-alignment: center;
+
+                            RefreshIcon {
+                                ink: refresh-touch.has-hover ? Theme.accent : Theme.muted;
+                            }
+                            Text {
+                                text: "Refresh Sources";
+                                color: Theme.fg;
+                                font-size: 13px;
+                                horizontal-stretch: 1;
+                                horizontal-alignment: left;
+                            }
+                        }
+
+                        refresh-touch := TouchArea {
+                            clicked => {
+                                root.refresh-sources(root.menu-entry-id);
                                 root.menu-open = false;
                             }
                         }

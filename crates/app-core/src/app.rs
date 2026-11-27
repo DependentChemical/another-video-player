@@ -328,6 +328,11 @@ fn is_stale_source_error(message: &str) -> bool {
         || m.contains("timed out")
         || m.contains("connection refused")
         || m.contains("access denied")
+        || m.contains("loading failed")
+        || m.contains("mpv_error_loading_failed")
+        || m.contains("error code -13")
+        || m.contains("(-13)")
+        || m.contains("-13")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2340,6 +2345,55 @@ impl App {
         }
     }
 
+    /// Forces a fresh resolve for a queue entry's sources.
+    ///
+    /// Cached resolver output and selected streams are cleared so the next
+    /// playback resolves fresh URLs. If the entry is current, playback is
+    /// restarted through the normal resolve path.
+    pub fn refresh_queue_entry_sources(&self, id: i64) -> bool {
+        let entry = match self.queue.entries() {
+            Ok(entries) => entries.into_iter().find(|entry| entry.id == id),
+            Err(error) => {
+                app_logging::error(format!("the active queue could not be read: {error}"));
+                return false;
+            }
+        };
+        let Some(entry) = entry else {
+            app_logging::warning(format!("the queue entry to refresh was not found: id={id}"));
+            return false;
+        };
+
+        let title = entry.title.clone();
+        let url = entry.url.clone();
+        self.toast(format!("Refreshing Sources for video: {title}"));
+
+        if let Err(error) = self.queue.set_resolved_source(entry.position, None, None) {
+            app_logging::error(format!(
+                "the queue entry sources could not be cleared: id={id} url={url} error={error}"
+            ));
+            self.toast(format!("Could not refresh sources for video: {title}"));
+            return false;
+        }
+        if let Err(error) = self.queue.set_selected_sources(entry.position, None, None, None) {
+            app_logging::warning(format!(
+                "the queue entry selection could not be cleared: id={id} url={url} error={error}"
+            ));
+        }
+
+        if entry.current {
+            let epoch = self.preempt_ytdlp();
+            self.interrupt_playback();
+            self.resolve_play_with_epoch(url, epoch, PlaybackReason::Manual);
+        }
+
+        self.toast(format!("Refreshed Sources for video: {title}"));
+        app_logging::notice(format!(
+            "queue entry sources refreshed: id={id} url={} title=\"{}\" current={}",
+            entry.url, entry.title, entry.current
+        ));
+        true
+    }
+
     /// Handles the shared work after an entry left the active playlist.
     fn finish_removal(&self, removed: library::QueueEntry) -> QueueRemoval {
         // Deleting an entry drops its thumbnail when nothing else references it.
@@ -2487,17 +2541,23 @@ impl App {
         };
         // A late retry resolve must not interrupt playback that is already healthy.
         if reason == PlaybackReason::Retry {
-            let state = self.state.lock().expect("the state is not poisoned");
+            let mut state = self.state.lock().expect("the state is not poisoned");
             let same_url = state.current_url.as_deref() == Some(url);
             let playback_healthy = same_url && !self.engine.is_idle();
             let has_pending_restore = state.pending_restore.seek.is_some();
-            drop(state);
-            if playback_healthy || has_pending_restore {
+            if playback_healthy {
+                drop(state);
                 app_logging::debug(format!(
                     "discarding a stale retry resolve because playback is already active: url={url}"
                 ));
                 return None;
             }
+            if has_pending_restore && same_url {
+                // A failed load can leave a pending restore behind while the engine is idle.
+                // Clearing it lets the retry recover instead of stalling.
+                state.pending_restore = PendingRestore::default();
+            }
+            drop(state);
         }
         if let Err(error) = self.queue.update_details(
             current.position,
@@ -2706,6 +2766,9 @@ impl App {
             }
             let mut state = self.state.lock().expect("the state is not poisoned");
             state.retry.clear();
+            if state.current_url.as_deref() == Some(url.as_str()) {
+                state.pending_restore = PendingRestore::default();
+            }
             drop(state);
             let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
             self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
@@ -2814,7 +2877,13 @@ impl App {
                 RetryKind::Resolver
             }
             RetryErrorKind::Playback => {
-                self.consume_current_with_epoch(epoch, PlaybackReason::Retry);
+                if let Ok(Some(entry)) = self.queue.current()
+                    && entry.url == url
+                {
+                    let _ = self.queue.set_resolved_source(entry.position, None, None);
+                    let _ = self.queue.set_selected_sources(entry.position, None, None, None);
+                }
+                self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
                 RetryKind::Playback
             }
         })
@@ -4573,6 +4642,13 @@ mod tests {
         restore.file_started();
         assert!(matches!(restore.file_loaded(), Some(PendingSeek::Position(p)) if p == 42.0));
         assert!(restore.file_loaded().is_none());
+    }
+
+    #[test]
+    fn stale_source_error_treats_mpv_loading_failed_as_stale() {
+        assert!(is_stale_source_error("loading failed (-13)"));
+        assert!(is_stale_source_error("MPV_ERROR_LOADING_FAILED"));
+        assert!(!is_stale_source_error("permission denied"));
     }
 
     #[test]

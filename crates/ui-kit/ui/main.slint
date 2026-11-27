@@ -162,6 +162,7 @@ export component MainWindow inherits Window {
     callback history-requested();
     callback queue-item-selected(int);
     callback queue-copy-url(string);
+    callback queue-refresh-sources(int);
     callback queue-remove-entry(int);
     callback queue-move-requested(int, int);
     callback queue-row-pressed(int);
@@ -434,6 +435,7 @@ export component MainWindow inherits Window {
         open <=> root.queue-open;
         item-selected(position) => { root.queue-item-selected(position); }
         copy-url(url) => { root.queue-copy-url(url); }
+        refresh-sources(id) => { root.queue-refresh-sources(id); }
         remove-entry(id) => { root.queue-remove-entry(id); }
         move-requested(src, tgt) => { root.queue-move-requested(src, tgt); }
         queue-row-pressed(index) => { root.queue-row-pressed(index); }

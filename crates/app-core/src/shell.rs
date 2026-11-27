@@ -506,6 +506,20 @@ impl Shell {
         {
             let app = Arc::clone(&app);
             let loading = Rc::clone(&loading);
+            ui.on_queue_refresh_sources(move |id| {
+                if app.refresh_queue_entry_sources(id as i64)
+                    && app
+                        .queue_entries()
+                        .iter()
+                        .any(|entry| entry.id == id as i64 && entry.current)
+                {
+                    loading.borrow_mut().resolve_started();
+                }
+            });
+        }
+        {
+            let app = Arc::clone(&app);
+            let loading = Rc::clone(&loading);
             let ui_for_queue = Rc::clone(&ui);
             ui.on_queue_remove_entry(move |id| {
                 let removal = app.remove_queue_entry(id as i64);

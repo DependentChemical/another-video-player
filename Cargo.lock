@@ -263,7 +263,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-core"
-version = "0.4.88"
+version = "0.4.89"
 dependencies = [
  "app-logging",
  "image",
@@ -8224,7 +8224,7 @@ dependencies = [
 
 [[package]]
 name = "ui-kit"
-version = "0.4.80"
+version = "0.4.81"
 dependencies = [
  "arboard",
  "slint",

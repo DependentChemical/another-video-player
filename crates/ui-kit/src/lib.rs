@@ -1151,6 +1151,11 @@ impl PlayerUi {
         self.window.on_queue_copy_url(move |url| handler(url.to_string()));
     }
 
+    /// Called when the user asks to refresh the sources of a queue entry.
+    pub fn on_queue_refresh_sources(&self, handler: impl Fn(i32) + 'static) {
+        self.window.on_queue_refresh_sources(handler);
+    }
+
     /// Called when the user asks to remove an entry from the active queue.
     ///
     /// The argument is the stable id of the entry, so exactly one row is
