@@ -291,9 +291,6 @@ pub struct QueueRemoval {
     pub advanced: bool,
 }
 
-/// How long a persisted resolver result may be reused before it is refreshed.
-const RESOLVED_SOURCE_MAX_AGE: i64 = 10 * 60;
-
 /// How often a failing resolver, player or selection is retried before the
 /// failure is reported to the user instead of silently continuing.
 const MAX_RETRY_ATTEMPTS: u32 = 6;
@@ -306,12 +303,31 @@ const THUMBNAIL_REFRESH_DELAY: Duration = Duration::from_secs(5);
 /// How long the background thumbnail pass waits when there is no due work.
 const THUMBNAIL_REFRESH_IDLE_DELAY: Duration = Duration::from_secs(15);
 
+/// How often the background prefetcher scans the playlist for uncached items.
+const PREFETCH_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Seconds since the Unix epoch for persisted resolver freshness checks.
 fn unix_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
         .unwrap_or(0)
+}
+
+/// Whether a playback error indicates the cached/supplied stream URLs are stale or inaccessible.
+fn is_stale_source_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("403")
+        || m.contains("forbidden")
+        || m.contains("404")
+        || m.contains("not found")
+        || m.contains("http error")
+        || m.contains("failed to open")
+        || m.contains("unable to open")
+        || m.contains("server returned")
+        || m.contains("timed out")
+        || m.contains("connection refused")
+        || m.contains("access denied")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -697,6 +713,8 @@ pub struct App {
     notified_app_update: Mutex<Option<String>>,
     /// The last yt-dlp release version shown to the user.
     notified_tool_update: Mutex<Option<String>>,
+    /// Stop flag for background prefetch thread.
+    prefetch_stop: Arc<AtomicBool>,
 }
 
 impl App {
@@ -759,6 +777,7 @@ impl App {
             auto_force_ipv4: AtomicBool::new(false),
             notified_app_update: Mutex::new(None),
             notified_tool_update: Mutex::new(None),
+            prefetch_stop: Arc::new(AtomicBool::new(false)),
         };
         // Drop orphaned thumbnail files left by older runs, and migrate any
         // thumbnails that still point at a direct file path, in the
@@ -767,12 +786,138 @@ impl App {
         // Rebuild the thumbnail cache for the active queue in the background
         // so queued videos show their thumbnails without waiting for playback.
         app.refresh_queue_thumbnails();
+        app.start_prefetcher();
         Ok(app)
     }
 
     /// The player.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    fn start_prefetcher(&self) {
+        let stop = Arc::clone(&self.prefetch_stop);
+        let queue = self.queue.clone();
+        let resolver = Arc::clone(&self.resolver);
+        let session = self.session.clone();
+        let outbox = Arc::clone(&self.outbox);
+        let ytdlp = Arc::clone(&self.ytdlp);
+        self.runtime.handle().spawn(async move {
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(PREFETCH_INTERVAL).await;
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Higher priority than thumbnail: if playback or url_entry active, skip.
+                {
+                    let pb = ytdlp.playback.lock().expect("pb");
+                    if pb.active {
+                        continue;
+                    }
+                }
+                {
+                    let ue = ytdlp.url_entry.lock().expect("ue");
+                    if ue.active {
+                        continue;
+                    }
+                }
+                // Preempt thumbnail if running.
+                ytdlp.cancel_thumbnail();
+                // Find next item after current that has no resolved_source cached.
+                let entries = match queue.entries() {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        app_logging::warning(format!("prefetch: cannot read queue: {e}"));
+                        continue;
+                    }
+                };
+                if entries.is_empty() {
+                    continue;
+                }
+                let current_pos = queue.current().ok().flatten().map(|c| c.position).unwrap_or(-1);
+                let target = entries
+                    .iter()
+                    .find(|e| e.position > current_pos && e.resolved_source.is_none())
+                    .or_else(|| entries.iter().find(|e| e.resolved_source.is_none()));
+                let Some(target) = target else {
+                    app_logging::debug("prefetch: no uncached items in playlist");
+                    continue;
+                };
+                app_logging::debug(format!(
+                    "prefetch: resolving uncached entry pos={} url={}",
+                    target.position, target.url
+                ));
+                let res = {
+                    let resolver_guard = resolver.lock().expect("resolver poisoned").clone();
+                    let epoch_state = Arc::new(AtomicU64::new(1));
+                    if ytdlp.begin_url_entry(&epoch_state, 1).is_none() {
+                        continue;
+                    }
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let pid = Arc::new(AtomicU32::new(0));
+                    let notice = outbox.lock().expect("outbox poisoned").clone();
+                    let result = resolve_with_session(
+                        &resolver_guard,
+                        &session,
+                        &epoch_state,
+                        1,
+                        &cancel,
+                        &pid,
+                        &target.url,
+                        &notice,
+                    )
+                    .await;
+                    ytdlp.finish_url_entry(&cancel);
+                    result
+                };
+                match res {
+                    Ok(source) => {
+                        if let Ok(json) = serde_json::to_string(&source) {
+                            let _ = queue.set_resolved_source(
+                                target.position,
+                                Some(&json),
+                                Some(unix_time()),
+                            );
+                            let quality = Quality::Best;
+                            if let Ok(plan) = stream_resolver::plan(&source, &quality) {
+                                let v = plan.video.as_ref().and_then(|v| {
+                                    format_saved_selection(&v.format_id, &source, false)
+                                });
+                                let a = plan.audio.as_ref().and_then(|a| {
+                                    format_saved_selection(&a.format_id, &source, true)
+                                });
+                                let m = if plan.video.as_ref().is_some_and(|v| v.has_audio) {
+                                    plan.video.as_ref().and_then(|v| {
+                                        format_saved_selection(&v.format_id, &source, false)
+                                    })
+                                } else {
+                                    None
+                                };
+                                let _ = queue.set_selected_sources(
+                                    target.position,
+                                    v.as_deref(),
+                                    a.as_deref(),
+                                    m.as_deref(),
+                                );
+                            }
+                            app_logging::notice(format!(
+                                "prefetch: cached source for pos={} url={}",
+                                target.position, target.url
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        app_logging::warning(format!(
+                            "prefetch: failed to resolve pos={} url={} error={e}",
+                            target.position, target.url
+                        ));
+                    }
+                }
+            }
+        });
     }
 
     /// Processes a URL the user submitted.
@@ -2133,10 +2278,9 @@ impl App {
     /// The tokio runtime is shut down when the App is dropped.
     pub fn shutdown(&self) {
         app_logging::notice("shutting down Flatline");
-
+        self.prefetch_stop.store(true, Ordering::SeqCst);
         self.interrupt_playback();
         self.ytdlp.cancel_all();
-
         app_logging::notice("Flatline shutdown complete");
     }
 
@@ -2285,16 +2429,13 @@ impl App {
         }
         match self.queue.current() {
             Ok(Some(entry)) => {
-                if let (Some(json), Some(resolved_at)) =
-                    (entry.resolved_source.as_deref(), entry.resolved_at)
-                    && unix_time().saturating_sub(resolved_at) <= RESOLVED_SOURCE_MAX_AGE
-                    && !source_youtube::matches_url(&entry.url)
+                if let Some(json) = entry.resolved_source.as_deref()
                     && let Ok(source) = serde_json::from_str::<MediaSource>(json)
                 {
+                    let resolved_at = entry.resolved_at.unwrap_or_else(unix_time);
                     app_logging::debug(format!(
-                        "using the cached resolved source for url={} age={}s reason={}",
+                        "using the cached resolved source for url={} reason={}",
                         entry.url,
-                        unix_time().saturating_sub(resolved_at),
                         reason.as_str()
                     ));
                     let message = Message::Resolved(Ok(ResolvedMedia {
@@ -2470,8 +2611,6 @@ impl App {
         let id_hash = media_model::video_id_hash(url);
 
         // Check history for saved playback position (only for non-live videos).
-        // A saved position that would land within 5 seconds of the end is treated
-        // as fully watched and reset so playback starts from the beginning.
         let mut history_position = if !source.is_live {
             self.queue.history_get(&id_hash).ok().flatten().map(|entry| entry.position_seconds)
         } else {
@@ -2491,13 +2630,12 @@ impl App {
 
         {
             let mut state = self.state.lock().expect("the state is not poisoned");
-            state.source = Some(source);
-            state.selected_video = video;
-            state.selected_audio = audio;
-            state.selected_muxed = muxed;
+            state.source = Some(source.clone());
+            state.selected_video = video.clone();
+            state.selected_audio = audio.clone();
+            state.selected_muxed = muxed.clone();
             state.is_live = loaded.is_live;
             state.pending_restore.begin(history_position.map(PendingSeek::Position));
-            // Store metadata for history tracking
             state.current_id_hash = Some(id_hash.clone());
             state.current_url = Some(url.to_string());
             state.current_title = Some(loaded.title.clone());
@@ -2506,11 +2644,25 @@ impl App {
             state.last_history_save = None;
             state.sponsorblock_segments = sponsorblock_segments;
             state.sponsorblock_suppressed = None;
-            // A successful resolution ends any prior retry cycle.
             state.resolving_url = None;
             if plan.is_some() && state.retry.error_kind != Some(RetryErrorKind::Playback) {
                 state.retry.clear();
             }
+        }
+        // Persist the chosen selection (saved or default) so it is reused next time.
+        if let Ok(Some(cur)) = self.queue.current() {
+            let video_formatted =
+                video.as_ref().and_then(|id| format_saved_selection(id, &source, false));
+            let audio_formatted =
+                audio.as_ref().and_then(|id| format_saved_selection(id, &source, true));
+            let muxed_formatted =
+                muxed.as_ref().and_then(|id| format_saved_selection(id, &source, false));
+            let _ = self.queue.set_selected_sources(
+                cur.position,
+                video_formatted.as_deref(),
+                audio_formatted.as_deref(),
+                muxed_formatted.as_deref(),
+            );
         }
         self.live.lock().expect("the live axis is not poisoned").reset();
 
@@ -2541,6 +2693,24 @@ impl App {
     /// Handles a playback error by scheduling a retry.
     pub fn handle_playback_error(&self, url: String, error: String) {
         self.notify_tool_update_if_needed(&error);
+        if is_stale_source_error(&error) {
+            app_logging::warning(format!(
+                "playback failed due to stale/inaccessible source for {url}; clearing cache and re-resolving: {error}"
+            ));
+            // Clear cached resolved source and selections for current entry.
+            if let Ok(Some(entry)) = self.queue.current()
+                && entry.url == url
+            {
+                let _ = self.queue.set_resolved_source(entry.position, None, None);
+                let _ = self.queue.set_selected_sources(entry.position, None, None, None);
+            }
+            let mut state = self.state.lock().expect("the state is not poisoned");
+            state.retry.clear();
+            drop(state);
+            let epoch = self.ytdlp_epoch.load(Ordering::SeqCst);
+            self.resolve_play_with_epoch(url, epoch, PlaybackReason::Retry);
+            return;
+        }
         self.schedule_retry(url, RetryErrorKind::Playback, RetryKind::Playback, error);
     }
 
