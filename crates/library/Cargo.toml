@@ -1,7 +1,7 @@
 ﻿[package]
 name = "library"
 description = "Flatline's on-disk library: the persistent queue and the cached assets."
-version = "0.4.84"
+version = "0.4.85"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

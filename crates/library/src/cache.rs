@@ -225,17 +225,23 @@ impl ThumbnailCache {
                 candidates.len()
             ));
             match self.download_thumbnail_candidate(thumbnail_url) {
-                Ok(temporary) => {
+                Ok(mut temporary) => {
                     if let Err(error) = self.install_thumbnail_files(
-                        &temporary,
+                        temporary.path(),
                         &full_path,
                         &mid_path,
                         &small_path,
                         thumbnail_url,
                     ) {
+                        // `normalize_to_jpeg` removes the source on success; on failure
+                        // we must clean it up ourselves to avoid orphan `.part` files.
+                        let _ = fs::remove_file(temporary.path());
+                        temporary.disarm();
                         last_error = Some(error.to_string());
                         continue;
                     }
+                    // Install succeeded and the normalizer consumed the source file.
+                    temporary.disarm();
                     let now = unix_time();
                     let candidates_json = serialize_thumbnail_urls(&candidates);
                     self.db
@@ -347,13 +353,13 @@ impl ThumbnailCache {
             .map_err(Error::from)
     }
 
-    fn download_thumbnail_candidate(&self, thumbnail_url: &str) -> Result<PathBuf, Error> {
+    fn download_thumbnail_candidate(&self, thumbnail_url: &str) -> Result<ScratchFile, Error> {
         let temp_name = format!("{:016x}.part", fnv1a(thumbnail_url.as_bytes()));
         let temporary = self.directory.join(temp_name);
         let mut last_error = None;
         for (attempt, force_ipv4) in [(1u32, false), (1u32, true)] {
             let mode = if force_ipv4 { "ipv4" } else { "default" };
-            let _scratch = ScratchFile(&temporary);
+            let mut scratch = ScratchFile::new(temporary.clone());
             app_logging::debug(format!(
                 "thumbnail download started (attempt {attempt}/1, {mode}): {thumbnail_url}"
             ));
@@ -378,14 +384,18 @@ impl ThumbnailCache {
                 Ok(())
             })();
             match result {
-                Ok(()) => return Ok(temporary.clone()),
+                Ok(()) => {
+                    // The caller owns the downloaded file from here. `normalize_to_jpeg`
+                    // removes it on success; on failure the guard cleans it up.
+                    scratch.disarm();
+                    return Ok(scratch);
+                }
                 Err(error) => {
                     let message = error.to_string();
                     app_logging::warning(format!(
                         "thumbnail download attempt {attempt}/1 ({mode}) failed for {thumbnail_url}: {message}"
                     ));
                     last_error = Some(message);
-                    let _ = fs::remove_file(&temporary);
                 }
             }
         }
@@ -932,13 +942,35 @@ fn referenced_thumbnail_ids(connection: &Connection) -> rusqlite::Result<HashSet
     Ok(ids)
 }
 
-/// Removes a partially downloaded thumbnail when a fetch ends, whether it
-/// succeeded or failed. A successful conversion has already removed it.
-struct ScratchFile<'a>(&'a Path);
+/// Removes a partially downloaded thumbnail when a fetch/install ends.
+///
+/// The guard owns the temporary path and deletes it on drop unless disarmed.
+/// This prevents `download -> normalize` handoff bugs from leaking `.part`
+/// files while still guaranteeing cleanup on failed attempts.
+struct ScratchFile {
+    path: PathBuf,
+    armed: bool,
+}
 
-impl Drop for ScratchFile<'_> {
+impl ScratchFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ScratchFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.0);
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1094,11 +1126,26 @@ mod tests {
         fs::write(&path, b"partial").unwrap();
 
         {
-            let _scratch = ScratchFile(&path);
+            let _scratch = ScratchFile::new(path.clone());
             assert!(path.exists());
         }
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn disarmed_scratch_file_is_left_for_the_caller() {
+        let (cache, _temp) = test_cache();
+        let path = cache.directory.join("thumbnail.part");
+        fs::write(&path, b"partial").unwrap();
+
+        {
+            let mut scratch = ScratchFile::new(path.clone());
+            scratch.disarm();
+        }
+
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1218,6 +1265,83 @@ mod tests {
         assert_eq!(moved_cache.full_path(&id), Some(moved_dir.join(format!("{id}.jpg"))));
         assert_eq!(moved_cache.mid_path(&id), Some(moved_dir.join(format!("{id}.mid.jpg"))));
         assert_eq!(moved_cache.small_path(&id), Some(moved_dir.join(format!("{id}.small.jpg"))));
+    }
+
+    #[test]
+    fn fetch_downloads_normalizes_and_caches_thumbnail() {
+        let (cache, temp) = test_cache();
+        let jpeg = valid_jpeg_bytes();
+        let (url, handle) = serve_once(jpeg.clone());
+
+        let video_url = "https://example.com/watch?v=abc";
+        let (id, used_url) =
+            cache.fetch(video_url, std::slice::from_ref(&url)).expect("thumbnail fetches");
+
+        assert_eq!(id, ThumbnailCache::thumbnail_id_for(video_url));
+        assert_eq!(used_url, url);
+        let full = cache.full_path(&id).expect("full thumbnail");
+        let mid = cache.mid_path(&id).expect("mid thumbnail");
+        let small = cache.small_path(&id).expect("small thumbnail");
+        assert!(is_renderable_jpeg(&full));
+        assert!(is_renderable_jpeg(&mid));
+        assert!(is_renderable_jpeg(&small));
+        assert_no_part_files(temp.path());
+
+        handle.join().expect("server thread joins");
+    }
+
+    #[test]
+    fn fetch_removes_temp_file_when_install_fails() {
+        let (cache, temp) = test_cache();
+        let (url, handle) = serve_once(b"not an image".to_vec());
+
+        let error =
+            cache.fetch("https://example.com/watch?v=broken", &[url]).expect_err("fetch fails");
+
+        assert!(error.to_string().contains("thumbnail"));
+        assert_no_part_files(temp.path());
+
+        handle.join().expect("server thread joins");
+    }
+
+    fn valid_jpeg_bytes() -> Vec<u8> {
+        let image = image::ImageBuffer::from_fn(2, 2, |_, _| image::Rgb([255u8, 0, 0]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .expect("a valid JPEG encodes");
+        bytes
+    }
+
+    fn assert_no_part_files(directory: &Path) {
+        let entries = fs::read_dir(directory).expect("cache directory readable");
+        let parts: Vec<_> = entries
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("part"))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(parts.is_empty(), "unexpected .part files left behind: {parts:?}");
+    }
+
+    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts connection");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("writes header");
+            stream.write_all(&body).expect("writes body");
+            stream.flush().expect("flushes response");
+        });
+        (format!("http://{addr}/thumb.jpg"), handle)
     }
 
     #[test]
